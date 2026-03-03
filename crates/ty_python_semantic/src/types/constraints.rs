@@ -87,7 +87,7 @@
 //!
 //! [duboc]: https://gldubc.github.io/#thesis
 
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
@@ -100,17 +100,20 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::types::class::GenericAlias;
-use crate::types::generics::InferableTypeVars;
-use crate::types::typevar::{BoundTypeVarIdentity, walk_bound_type_var_type};
+use crate::types::generics::{GenericContext, InferableTypeVars, Specialization};
+use crate::types::protocol_class::walk_protocol_interface;
+use crate::types::typevar::{
+    BoundTypeVarIdentity, TypeVarInstance, walk_bound_type_var_type, walk_type_var_type,
+};
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
     TypeCollector, TypeVisitor, any_over_type, walk_type_with_recursion_guard,
 };
 use crate::types::{
-    BoundTypeVarInstance, IntersectionType, Type, TypeVarBoundOrConstraints, TypeVarVariance,
-    UnionType,
+    BoundTypeVarInstance, IntersectionType, NegativeIntersectionElements, ProtocolInstanceType,
+    Type, TypeVarBoundOrConstraints, TypeVarVariance, UnionBuilder, UnionType,
 };
-use crate::{Db, FxIndexMap, FxIndexSet};
+use crate::{Db, FxIndexMap, FxIndexSet, FxOrderSet};
 
 /// An extension trait for building constraint sets from [`Option`] values.
 pub(crate) trait OptionConstraintsExtension<T> {
@@ -343,10 +346,16 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
     }
 
     fn is_cyclic_impl(self, db: &'db dyn Db, inferable: Option<InferableTypeVars<'db>>) -> bool {
+        const MAX_REACHABILITY_DEPTH: u32 = 64;
+
         #[derive(Default)]
         struct CollectReachability<'db> {
             reachable_typevars: RefCell<FxHashSet<BoundTypeVarIdentity<'db>>>,
+            visited_bound_typevars: RefCell<FxHashSet<BoundTypeVarIdentity<'db>>>,
+            visited_typevars: RefCell<FxHashSet<TypeVarInstance<'db>>>,
             recursion_guard: TypeCollector<'db>,
+            depth: Cell<u32>,
+            hit_depth_limit: Cell<bool>,
         }
 
         impl<'db> TypeVisitor<'db> for CollectReachability<'db> {
@@ -359,10 +368,25 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
                 db: &'db dyn Db,
                 bound_typevar: BoundTypeVarInstance<'db>,
             ) {
-                self.reachable_typevars
-                    .borrow_mut()
-                    .insert(bound_typevar.identity(db));
+                let identity = bound_typevar.identity(db);
+                self.reachable_typevars.borrow_mut().insert(identity);
+
+                // Reachability only depends on which bound typevars are mentioned, not on how
+                // many times we expand the same bound typevar's bounds/defaults. Re-walking the
+                // same bound typevar here can recurse forever through generic callable defaults.
+                if !self.visited_bound_typevars.borrow_mut().insert(identity) {
+                    return;
+                }
+
                 walk_bound_type_var_type(db, bound_typevar, self);
+            }
+
+            fn visit_type_var_type(&self, db: &'db dyn Db, typevar: TypeVarInstance<'db>) {
+                if !self.visited_typevars.borrow_mut().insert(typevar) {
+                    return;
+                }
+
+                walk_type_var_type(db, typevar, self);
             }
 
             fn visit_generic_alias_type(&self, db: &'db dyn Db, alias: GenericAlias<'db>) {
@@ -378,8 +402,34 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
                 }
             }
 
+            fn visit_protocol_instance_type(
+                &self,
+                db: &'db dyn Db,
+                protocol: ProtocolInstanceType<'db>,
+            ) {
+                // Reachability only depends on free typevars that appear in the instantiated
+                // protocol type. For class-based protocols, walking the full lazily-inferred
+                // interface explodes through every member signature and nested protocol, even
+                // though the only free typevars we care about live in the protocol's
+                // specialization. Treat those the same as nominal instances and only fall back
+                // to walking member interfaces for synthesized protocols.
+                if let Some(nominal) = protocol.to_nominal_instance() {
+                    self.visit_nominal_instance_type(db, nominal);
+                } else {
+                    walk_protocol_interface(db, protocol.interface(db), self);
+                }
+            }
+
             fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+                let current_depth = self.depth.get();
+                if current_depth >= MAX_REACHABILITY_DEPTH {
+                    self.hit_depth_limit.set(true);
+                    return;
+                }
+
+                self.depth.set(current_depth + 1);
                 walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
+                self.depth.set(current_depth);
             }
         }
 
@@ -415,6 +465,7 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
             BoundTypeVarIdentity<'db>,
             FxHashSet<BoundTypeVarIdentity<'db>>,
         > = FxHashMap::default();
+        let mut hit_depth_limit = false;
         self.node
             .for_each_constraint(self.builder, &mut |constraint, _| {
                 let constraint = self.builder.constraint_data(constraint);
@@ -425,6 +476,7 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
                 let visitor = CollectReachability::default();
                 visitor.visit_type(db, constraint.lower);
                 visitor.visit_type(db, constraint.upper);
+                hit_depth_limit |= visitor.hit_depth_limit.get();
                 let reachable = visitor.reachable_typevars.into_inner();
                 let entry = reachable_typevars.entry(identity).or_default();
                 if let Some(inferable) = inferable {
@@ -437,6 +489,10 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
                     entry.extend(reachable);
                 }
             });
+
+        if hit_depth_limit {
+            return true;
+        }
 
         // Then perform a depth-first search to see if there are any cycles.
         let mut discovered: FxHashSet<BoundTypeVarIdentity<'db>> = FxHashSet::default();
@@ -680,6 +736,47 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
     {
         self.node.display_graph(db, self.builder, prefix)
     }
+}
+
+fn union_from_elements_cycle_recovery<'db>(
+    db: &'db dyn Db,
+    elements: impl IntoIterator<Item = Type<'db>>,
+) -> Type<'db> {
+    elements
+        .into_iter()
+        .fold(UnionBuilder::new(db).cycle_recovery(true), |builder, ty| {
+            builder.add(ty)
+        })
+        .build()
+}
+
+fn intersection_from_elements_without_simplification<'db>(
+    db: &'db dyn Db,
+    elements: impl IntoIterator<Item = Type<'db>>,
+) -> Type<'db> {
+    let positive: FxOrderSet<_> = elements.into_iter().collect();
+    match positive.len() {
+        0 => Type::object(),
+        1 => positive
+            .iter()
+            .next()
+            .copied()
+            .expect("single-element intersection should have one element"),
+        _ => Type::Intersection(IntersectionType::new(
+            db,
+            positive,
+            NegativeIntersectionElements::Empty,
+        )),
+    }
+}
+
+fn is_constraint_set_assignable_to_all<'db>(
+    db: &'db dyn Db,
+    lhs: Type<'db>,
+    rhs: impl IntoIterator<Item = Type<'db>>,
+) -> bool {
+    rhs.into_iter()
+        .all(|upper| lhs.is_constraint_set_assignable_to(db, upper))
 }
 
 impl Debug for ConstraintSet<'_, '_> {
@@ -2893,8 +2990,8 @@ impl<'db> PathBounds<'db> {
                 .drain()
                 .map(|(bound_typevar, bounds)| TypeVarBounds {
                     bound_typevar,
-                    lower: UnionType::from_elements(db, bounds.lower),
-                    upper: IntersectionType::from_elements(db, bounds.upper),
+                    lower: union_from_elements_cycle_recovery(db, bounds.lower),
+                    upper: intersection_from_elements_without_simplification(db, bounds.upper),
                 })
                 .collect();
             result.push(path_bounds);
@@ -2989,10 +3086,7 @@ impl<'db> PathBounds<'db> {
                     return Ok(Some(lower));
                 }
 
-                let upper = IntersectionType::from_elements(
-                    db,
-                    std::iter::once(upper).chain(std::iter::once(bound)),
-                );
+                let upper = intersection_from_elements_without_simplification(db, [upper, bound]);
                 if upper != bound {
                     Ok(Some(upper))
                 } else {
@@ -6052,6 +6146,68 @@ impl<'db> BoundTypeVarInstance<'db> {
     }
 }
 
+impl<'db> GenericContext<'db> {
+    pub(crate) fn specialize_constrained<'c>(
+        self,
+        db: &'db dyn Db,
+        builder: &'c ConstraintSetBuilder<'db>,
+        constraints: ConstraintSet<'db, 'c>,
+    ) -> Result<Specialization<'db>, ()> {
+        tracing::trace!(
+            target: "ty_python_semantic::types::constraints::specialize_constrained",
+            generic_context = ?self,
+            constraints = %constraints.node.display(db, builder),
+            "create specialization for constraint set",
+        );
+
+        // If the constraint set is cyclic, don't even try to construct a specialization.
+        if constraints.is_cyclic(db) {
+            tracing::error!(
+                target: "ty_python_semantic::types::constraints::specialize_constrained",
+                constraints = %constraints.node.display(db, builder),
+                "constraint set is cyclic",
+            );
+            // TODO: Better error
+            return Err(());
+        }
+
+        let solutions = match constraints.solutions(db, builder) {
+            Solutions::Unsatisfiable => return Err(()),
+            Solutions::Unconstrained => {
+                return Ok(self.specialize_recursive(db, std::iter::repeat_n(None, self.len(db))));
+            }
+            Solutions::Constrained(solutions) => solutions,
+        };
+
+        let normalized_solutions: Vec<Vec<Option<Type<'db>>>> = solutions
+            .iter()
+            .map(|solution| {
+                let assignments: FxHashMap<_, _> = solution
+                    .iter()
+                    .map(|entry| (entry.bound_typevar.identity(db), entry.solution))
+                    .collect();
+                self.variables(db)
+                    .map(|bound_typevar| assignments.get(&bound_typevar.identity(db)).copied())
+                    .collect()
+            })
+            .collect();
+
+        let Some(first_solution) = normalized_solutions.first() else {
+            return Err(());
+        };
+
+        if !normalized_solutions.iter().all_equal() {
+            tracing::trace!(
+                target: "ty_python_semantic::types::constraints::specialize_constrained",
+                generic_context = ?self,
+                "constraint set has multiple distinct solutions",
+            );
+            return Err(());
+        }
+
+        Ok(self.specialize_recursive(db, first_solution.iter().copied()))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

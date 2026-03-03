@@ -479,6 +479,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             {
                 return result;
             }
+
+            if let Type::NominalInstance(source_nominal) = type_to_test
+                && source_nominal.class_literal(db) == nominal_instance.class_literal(db)
+            {
+                return result;
+            }
         }
 
         // `Generator` special case: Prior to 3.13, the `_ReturnT_co` type didn't appear in any
@@ -584,9 +590,7 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
         result.or(db, self.constraints, || {
             ConstraintSet::from_bool(
                 self.constraints,
-                !left
-                    .class(db)
-                    .could_coexist_in_mro_with(db, right.class(db), self.constraints),
+                !self.classes_could_coexist_in_mro(db, left.class(db), right.class(db)),
             )
         })
     }

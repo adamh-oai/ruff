@@ -706,6 +706,13 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         result
     }
 
+    pub(super) fn with_relation_guard(
+        &self,
+        work: impl FnOnce() -> ConstraintSet<'db, 'c>,
+    ) -> ConstraintSet<'db, 'c> {
+        self.relation_visitor.guard(work)
+    }
+
     fn with_recursion_guard(
         &self,
         source: Type<'db>,
@@ -1343,14 +1350,18 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             // applied to the signature. Different specializations of the same function literal are
             // only subtypes of each other if they result in the same signature.
             (Type::FunctionLiteral(source_function), Type::FunctionLiteral(target_function)) => {
-                self.check_function_pair(db, source_function, target_function)
+                self.with_recursion_guard(source, target, || {
+                    self.check_function_pair(db, source_function, target_function)
+                })
             }
-            (Type::BoundMethod(source_method), Type::BoundMethod(target_method)) => {
-                self.check_bound_method_pair(db, source_method, target_method)
-            }
-            (Type::KnownBoundMethod(source_method), Type::KnownBoundMethod(target_method)) => {
-                self.check_known_bound_method_pair(db, source_method, target_method)
-            }
+            (Type::BoundMethod(source_method), Type::BoundMethod(target_method)) => self
+                .with_recursion_guard(source, target, || {
+                    self.check_bound_method_pair(db, source_method, target_method)
+                }),
+            (Type::KnownBoundMethod(source_method), Type::KnownBoundMethod(target_method)) => self
+                .with_recursion_guard(source, target, || {
+                    self.check_known_bound_method_pair(db, source_method, target_method)
+                }),
 
             // All `StringLiteral` types are a subtype of `LiteralString`.
             (Type::LiteralValue(source), Type::LiteralValue(target))
@@ -1660,11 +1671,13 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
 
             // For generic aliases, we delegate to the underlying class type.
             (Type::GenericAlias(source_alias), Type::GenericAlias(target_alias)) => self
-                .check_class_pair(
-                    db,
-                    ClassType::Generic(source_alias),
-                    ClassType::Generic(target_alias),
-                ),
+                .with_recursion_guard(source, target, || {
+                    self.check_class_pair(
+                        db,
+                        ClassType::Generic(source_alias),
+                        ClassType::Generic(target_alias),
+                    )
+                }),
 
             (Type::GenericAlias(source_alias), Type::SubclassOf(target_subclass_ty)) => {
                 target_subclass_ty
@@ -1679,9 +1692,10 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             }
 
             // This branch asks: given two types `type[T]` and `type[S]`, is `type[T]` a subtype of `type[S]`?
-            (Type::SubclassOf(source), Type::SubclassOf(target)) => {
-                self.check_subclassof_pair(db, source, target)
-            }
+            (Type::SubclassOf(source_subclass), Type::SubclassOf(target_subclass)) => self
+                .with_recursion_guard(source, target, || {
+                    self.check_subclassof_pair(db, source_subclass, target_subclass)
+                }),
 
             // `Literal[str]` is a subtype of `type` because the `str` class object is an instance of its metaclass `type`.
             // `Literal[abc.ABC]` is a subtype of `abc.ABCMeta` because the `abc.ABC` class object
@@ -1940,6 +1954,23 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
         work: impl FnOnce() -> ConstraintSet<'db, 'c>,
     ) -> ConstraintSet<'db, 'c> {
         self.disjointness_visitor.visit((source, target), work)
+    }
+
+    pub(super) fn classes_could_coexist_in_mro(
+        &self,
+        db: &'db dyn Db,
+        left: ClassType<'db>,
+        right: ClassType<'db>,
+    ) -> bool {
+        left.could_coexist_in_mro_with(
+            db,
+            right,
+            self.constraints,
+            self.inferable,
+            self.relation_visitor,
+            self.disjointness_visitor,
+            self.materialization_visitor,
+        )
     }
 
     fn any_protocol_members_absent_or_disjoint(
@@ -2321,16 +2352,18 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
             }
 
             (Type::GenericAlias(left_alias), Type::GenericAlias(right_alias)) => {
-                ConstraintSet::from_bool(
-                    self.constraints,
-                    left_alias.origin(db) != right_alias.origin(db),
-                )
-                .or(db, self.constraints, || {
-                    self.check_specialization_pair(
-                        db,
-                        left_alias.specialization(db),
-                        right_alias.specialization(db),
+                self.disjointness_visitor.visit((left, right), || {
+                    ConstraintSet::from_bool(
+                        self.constraints,
+                        left_alias.origin(db) != right_alias.origin(db),
                     )
+                    .or(db, self.constraints, || {
+                        self.check_specialization_pair(
+                            db,
+                            left_alias.specialization(db),
+                            right_alias.specialization(db),
+                        )
+                    })
                 })
             }
 
@@ -2352,6 +2385,10 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                             db,
                             ClassType::NonGeneric(class_b),
                             self.constraints,
+                            self.inferable,
+                            self.relation_visitor,
+                            self.disjointness_visitor,
+                            self.materialization_visitor,
                         ),
                     ),
                     SubclassOfInner::TypeVar(_) => unreachable!(),
@@ -2368,15 +2405,21 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                             db,
                             ClassType::Generic(alias_b),
                             self.constraints,
+                            self.inferable,
+                            self.relation_visitor,
+                            self.disjointness_visitor,
+                            self.materialization_visitor,
                         ),
                     ),
                     SubclassOfInner::TypeVar(_) => unreachable!(),
                 }
             }
 
-            (Type::SubclassOf(left), Type::SubclassOf(right)) => {
-                self.check_subclassof_pair(db, left, right)
-            }
+            (Type::SubclassOf(left), Type::SubclassOf(right)) => self
+                .disjointness_visitor
+                .visit((left.into(), right.into()), || {
+                    self.check_subclassof_pair(db, left, right)
+                }),
 
             // for `type[Any]`/`type[Unknown]`/`type[Todo]`, we know the type cannot be any larger than `type`,
             // so although the type is dynamic we can still determine disjointedness in some situations

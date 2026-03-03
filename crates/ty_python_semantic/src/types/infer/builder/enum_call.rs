@@ -7,15 +7,17 @@ use ty_python_core::definition::Definition;
 use crate::{
     Db, Program,
     types::{
-        ClassLiteral, KnownClass, Type, TypeContext, UnionType,
+        ApplyTypeMappingVisitor, ClassLiteral, KnownClass, Type, TypeContext, UnionType,
         class::{DynamicEnumAnchor, DynamicEnumLiteral, EnumSpec},
         constraints::ConstraintSetBuilder,
         diagnostic::{
             INVALID_ARGUMENT_TYPE, INVALID_BASE, MISSING_ARGUMENT, PARAMETER_ALREADY_ASSIGNED,
             TOO_MANY_POSITIONAL_ARGUMENTS, UNKNOWN_ARGUMENT, report_mismatched_type_name,
         },
+        generics::InferableTypeVars,
         infer::TypeInferenceBuilder,
         infer::builder::dynamic_class::report_mro_error_kind,
+        relation::{HasRelationToVisitor, IsDisjointVisitor},
         subclass_of::SubclassOfType,
     },
 };
@@ -539,8 +541,18 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 return (Some(ty), true);
             };
             let constraints = ConstraintSetBuilder::new();
-            if !mixin_class.could_coexist_in_mro_with(db, enum_base, &constraints)
-                && let Some(builder) = self.context.report_lint(&INVALID_BASE, value)
+            let relation_visitor = HasRelationToVisitor::default(&constraints);
+            let disjointness_visitor = IsDisjointVisitor::default(&constraints);
+            let materialization_visitor = ApplyTypeMappingVisitor::default();
+            if !mixin_class.could_coexist_in_mro_with(
+                db,
+                enum_base,
+                &constraints,
+                InferableTypeVars::None,
+                &relation_visitor,
+                &disjointness_visitor,
+                &materialization_visitor,
+            ) && let Some(builder) = self.context.report_lint(&INVALID_BASE, value)
             {
                 builder.into_diagnostic(format_args!(
                     "Class `{}` cannot be used as an enum mixin with `{}`",

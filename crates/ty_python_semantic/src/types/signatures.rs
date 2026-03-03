@@ -351,6 +351,7 @@ impl<'db> CallableSignature<'db> {
         );
         checker.check_callable_signature_pair_inner(db, &self.overloads, &other.overloads)
     }
+
 }
 
 impl<'a, 'db> IntoIterator for &'a CallableSignature<'db> {
@@ -956,7 +957,9 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         source: &CallableSignature<'db>,
         target: &CallableSignature<'db>,
     ) -> ConstraintSet<'db, 'c> {
-        self.check_callable_signature_pair_inner(db, &source.overloads, &target.overloads)
+        self.with_relation_guard(|| {
+            self.check_callable_signature_pair_inner(db, &source.overloads, &target.overloads)
+        })
     }
 
     /// Implementation of subtyping and assignability between two, possible overloaded, callable
@@ -1071,7 +1074,9 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                             .as_paramspec_with_prefix()
                             .is_some())
                 {
-                    self.check_signature_pair_inner(db, source_signature, target_signature)
+                    self.with_relation_guard(|| {
+                        self.check_signature_pair_inner(db, source_signature, target_signature)
+                    })
                 } else {
                     self.check_signature_pair(db, source_signature, target_signature)
                 }
@@ -1093,11 +1098,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     source_overloads
                         .iter()
                         .when_any(db, self.constraints, |self_signature| {
-                            self.check_callable_signature_pair_inner(
-                                db,
-                                std::slice::from_ref(self_signature),
-                                target_overloads,
-                            )
+                            self.with_relation_guard(|| {
+                                self.check_callable_signature_pair_inner(
+                                    db,
+                                    std::slice::from_ref(self_signature),
+                                    target_overloads,
+                                )
+                            })
                         })
                 })
             }
@@ -1107,11 +1114,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 target_overloads
                     .iter()
                     .when_all(db, self.constraints, |target_signature| {
-                        self.check_callable_signature_pair_inner(
-                            db,
-                            source_overloads,
-                            std::slice::from_ref(target_signature),
-                        )
+                        self.with_relation_guard(|| {
+                            self.check_callable_signature_pair_inner(
+                                db,
+                                source_overloads,
+                                std::slice::from_ref(target_signature),
+                            )
+                        })
                     })
             }
 
@@ -1119,11 +1128,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             (_, _) => target_overloads
                 .iter()
                 .when_all(db, self.constraints, |target_signature| {
-                    self.check_callable_signature_pair_inner(
-                        db,
-                        source_overloads,
-                        std::slice::from_ref(target_signature),
-                    )
+                    self.with_relation_guard(|| {
+                        self.check_callable_signature_pair_inner(
+                            db,
+                            source_overloads,
+                            std::slice::from_ref(target_signature),
+                        )
+                    })
                 }),
         }
     }
@@ -1154,7 +1165,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
         // `inner` will create a constraint set that references these newly inferable typevars.
         let checker = self.with_inferable_typevars(inferable);
-        let when = checker.check_signature_pair_inner(db, source, target);
+        let when =
+            self.with_relation_guard(|| checker.check_signature_pair_inner(db, source, target));
 
         // But the caller does not need to consider those extra typevars. Whatever constraint set
         // we produce, we reduce it back down to the inferable set that the caller asked about.
