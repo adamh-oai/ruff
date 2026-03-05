@@ -1033,6 +1033,18 @@ def process_aliased_unpacking(data: RecordAlias) -> Record:
     return Record(**data)
 ```
 
+`TypedDict` values can also be copied into plain dictionaries with `dict(...)`:
+
+```py
+from typing import TypedDict
+
+class Params(TypedDict, total=False):
+    name: str
+
+def _(params: Params) -> None:
+    reveal_type(dict(params))  # revealed: dict[str, str]
+```
+
 Intersection types containing a TypedDict (e.g., from truthiness narrowing) are also supported. With
 `total=False`, TypedDicts can be empty (falsy), so truthiness narrowing creates an intersection:
 

@@ -950,6 +950,14 @@ def _(args: list[str]) -> None:
     # error: [invalid-argument-type]
     # error: [parameter-already-assigned]
     f(*args, **CKwargs(c=1.0))
+
+class Named(TypedDict):
+    name: str
+
+def takes_name(*, name: str) -> None: ...
+def _(params: Named) -> None:
+    params_copy = dict(params)
+    takes_name(**params_copy)
 ```
 
 ### Keyword argument, positional-or-keyword parameter
@@ -1244,7 +1252,6 @@ f(**Foo(a=1, b=2))
 
 ```py
 def f(*, a: int, b: str) -> None: ...
-
 def _() -> None:
     kwargs = {"a": 1, "b": "x"}
     f(**kwargs)

@@ -5830,8 +5830,46 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             ast::Expr::Named(named) => {
                 self.try_synthesize_kwargs_typed_dict(&named.value, definition, seen_definitions)
             }
+            ast::Expr::Call(call) => self.try_synthesize_kwargs_typed_dict_from_call(
+                call,
+                definition,
+                seen_definitions,
+            ),
             _ => None,
         }
+    }
+
+    fn try_synthesize_kwargs_typed_dict_from_call(
+        &mut self,
+        call: &ast::ExprCall,
+        definition: Option<Definition<'db>>,
+        seen_definitions: &mut FxHashSet<Definition<'db>>,
+    ) -> Option<TypedDictType<'db>> {
+        let ast::ExprCall {
+            func, arguments, ..
+        } = call;
+
+        if !self
+            .kwargs_expression_type(func, definition)
+            .as_class_literal()
+            .is_some_and(|class_literal| class_literal.is_known(self.db(), KnownClass::Dict))
+        {
+            return None;
+        }
+
+        if !arguments.keywords.is_empty() {
+            return None;
+        }
+
+        let [argument] = arguments.args.as_ref() else {
+            return None;
+        };
+        if argument.is_starred_expr() {
+            return None;
+        }
+
+        self.try_synthesize_kwargs_typed_dict(argument, definition, seen_definitions)
+            .or_else(|| self.kwargs_expression_type(argument, definition).as_typed_dict())
     }
 
     fn try_synthesize_kwargs_typed_dict_from_use(
@@ -7047,6 +7085,29 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return ty;
         }
 
+        let mut has_probed_single_dict_argument = false;
+        if callable_type
+            .as_class_literal()
+            .is_some_and(|class_literal| class_literal.is_known(self.db(), KnownClass::Dict))
+            && arguments.keywords.is_empty()
+            && let [argument] = arguments.args.as_ref()
+            && !argument.is_starred_expr()
+        {
+            has_probed_single_dict_argument = true;
+            let argument_type = self.infer_expression(argument, TypeContext::default());
+            if let Some(typed_dict) = argument_type.as_typed_dict() {
+                let mut value_types = UnionBuilder::new(self.db());
+                for field in typed_dict.items(self.db()).values() {
+                    value_types = value_types.add(field.declared_ty);
+                }
+
+                return KnownClass::Dict.to_specialized_instance(
+                    self.db(),
+                    &[KnownClass::Str.to_instance(self.db()), value_types.build()],
+                );
+            }
+        }
+
         // Handle 3-argument `type(name, bases, dict)`.
         if let Type::ClassLiteral(class) = callable_type
             && class.is_known(self.db(), KnownClass::Type)
@@ -7317,11 +7378,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             })
             .is_some();
 
+        let use_existing_argument_inference =
+            has_prepared_typed_dict_constructor || has_probed_single_dict_argument;
+
         let bindings_result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(arguments),
             &mut call_arguments,
             &mut |builder, (_, expr, tcx)| {
-                if has_prepared_typed_dict_constructor {
+                if use_existing_argument_inference {
                     builder.get_or_infer_expression(expr, tcx)
                 } else {
                     builder.infer_expression(expr, tcx)
