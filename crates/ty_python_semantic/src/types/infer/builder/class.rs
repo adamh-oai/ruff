@@ -1,7 +1,6 @@
 use crate::types::{
     CallArguments, DataclassParams, KnownClass, KnownInstanceType, SpecialFormType,
-    StaticClassLiteral, Type, TypeContext,
-    call::CallError,
+    StaticClassLiteral, SubclassOfType, Type, TypeContext,
     function::KnownFunction,
     infer::{
         TypeInferenceBuilder,
@@ -63,6 +62,35 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         class_node: &ast::StmtClassDef,
         definition: Definition<'db>,
     ) {
+        fn preserves_same_class_binding<'db>(
+            db: &'db dyn crate::Db,
+            original_class: Type<'db>,
+            decorated_class: Type<'db>,
+        ) -> bool {
+            let Type::ClassLiteral(original_literal) = original_class else {
+                return false;
+            };
+
+            match decorated_class {
+                Type::ClassLiteral(decorated_literal) => decorated_literal == original_literal,
+                Type::SubclassOf(subclass_of) => subclass_of
+                    .subclass_of()
+                    .into_class(db)
+                    .is_some_and(|class| class == original_literal.default_specialization(db)),
+                Type::TypeAlias(alias) => {
+                    preserves_same_class_binding(db, original_class, alias.value_type(db))
+                }
+                Type::Union(union) => union.elements(db).iter().all(|element| {
+                    element.is_divergent()
+                        || preserves_same_class_binding(db, original_class, *element)
+                }),
+                Type::Divergent(_) => true,
+                _ => SubclassOfType::try_from_type(db, original_class).is_some_and(
+                    |original_meta_type| decorated_class.is_equivalent_to(db, original_meta_type),
+                ),
+            }
+        }
+
         let ast::StmtClassDef {
             range: _,
             node_index: _,
@@ -174,7 +202,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             )
         };
 
-        let inferred_ty = match (maybe_known_class, &*name.id) {
+        let mut inferred_ty = match (maybe_known_class, &*name.id) {
             (None, "NamedTuple") if in_typing_module() => {
                 Type::SpecialForm(SpecialFormType::NamedTuple)
             }
@@ -195,13 +223,18 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             )),
         };
 
-        // Validate decorator calls (but don't use return types yet).
+        let original_class_ty = inferred_ty;
         for (decorator_ty, decorator_node) in decorator_types_and_nodes.iter().rev() {
-            if let Err(CallError(_, bindings)) =
-                decorator_ty.try_call(db, &CallArguments::positional([inferred_ty]))
+            let decorated_ty = self.apply_decorator(*decorator_ty, inferred_ty, decorator_node);
+            let preserves_unknown_factory_binding = decorated_ty.is_unknown()
+                && matches!(decorator_node.expression, ast::Expr::Call(_));
+            inferred_ty = if preserves_unknown_factory_binding
+                || preserves_same_class_binding(db, original_class_ty, decorated_ty)
             {
-                bindings.report_diagnostics(&self.context, (*decorator_node).into());
-            }
+                original_class_ty
+            } else {
+                decorated_ty
+            };
         }
 
         self.add_declaration_with_binding(

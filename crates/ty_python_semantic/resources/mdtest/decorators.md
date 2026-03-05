@@ -307,12 +307,10 @@ class AcceptsType:
     def __init__(self, cls: type) -> None:
         self.cls = cls
 
-# Decorator call is validated, but the type transformation isn't applied yet.
-# TODO: Class decorator return types should transform the class binding type.
 @AcceptsType
 class MyClass: ...
 
-reveal_type(MyClass)  # revealed: <class 'MyClass'>
+reveal_type(MyClass)  # revealed: AcceptsType
 ```
 
 ### Generic class, used as a decorator
@@ -378,6 +376,70 @@ def decorator(cls: type[int]) -> type[int]:
 @decorator
 class Baz: ...
 
-# TODO: the revealed type should ideally be `type[int]` (the decorator's return type)
-reveal_type(Baz)  # revealed: <class 'Baz'>
+reveal_type(Baz)  # revealed: type[int]
+```
+
+Class decorators can also replace the class object with an instance:
+
+```py
+from typing import Protocol
+
+class Backend(Protocol):
+    def get(self, key: str) -> bytes | None: ...
+
+class WrapBackend:
+    def __init__(self, cls: type[object]) -> None:
+        self.cls = cls
+
+    def get(self, key: str) -> bytes | None:
+        return None
+
+@WrapBackend
+class CacheClient: ...
+
+reveal_type(CacheClient)  # revealed: WrapBackend
+reveal_type(CacheClient.get("x"))  # revealed: bytes | None
+```
+
+If a class decorator returns the original class object, we preserve the class binding so it can
+still be used in annotations and as a base class:
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T", bound=object)
+
+def identity_class_decorator(cls: type[T]) -> type[T]:
+    return cls
+
+@identity_class_decorator
+class PreservedClass: ...
+
+reveal_type(PreservedClass)  # revealed: <class 'PreservedClass'>
+
+class DerivedPreservedClass(PreservedClass):
+    value: PreservedClass
+```
+
+Unannotated decorator factories are often too imprecise to recover a transformed class binding. In
+that case we preserve the original class object rather than degrading it to `Unknown`:
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T", bound=type)
+
+def unannotated_identity_decorator():
+    def decorator(cls: T) -> T:
+        return cls
+    return decorator
+
+@unannotated_identity_decorator()
+class PreservedUnknownClass:
+    pass
+
+reveal_type(PreservedUnknownClass)  # revealed: <class 'PreservedUnknownClass'>
+
+class DerivedUnknownClass(PreservedUnknownClass):
+    value: PreservedUnknownClass
 ```
