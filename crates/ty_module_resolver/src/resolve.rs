@@ -43,6 +43,7 @@ use ruff_python_ast::{
     self as ast, PySourceType, PythonVersion,
     visitor::{Visitor, walk_body},
 };
+use ruff_python_parser::parse_module;
 
 use crate::db::Db;
 use crate::module::{Module, ModuleKind};
@@ -925,35 +926,201 @@ struct PthFile<'db> {
     path: SystemPathBuf,
     contents: String,
     site_packages: &'db SystemPath,
+    system: &'db dyn System,
 }
 
 impl<'db> PthFile<'db> {
     /// Yield paths in this `.pth` file that appear to represent editable installations,
     /// and should therefore be added as module-resolution search paths.
-    fn items(&'db self) -> impl Iterator<Item = SystemPathBuf> + 'db {
+    fn items(&self) -> Vec<SystemPathBuf> {
         let PthFile {
             path: _,
             contents,
             site_packages,
+            system,
         } = self;
 
-        // Empty lines or lines starting with '#' are ignored by the Python interpreter.
-        // Lines that start with "import " or "import\t" do not represent editable installs at all;
-        // instead, these are lines that are executed by Python at startup.
-        // https://docs.python.org/3/library/site.html#module-site
-        contents.lines().filter_map(move |line| {
+        let mut items = Vec::new();
+
+        for line in contents.lines() {
             let line = line.trim_end();
-            if line.is_empty()
-                || line.starts_with('#')
-                || line.starts_with("import ")
-                || line.starts_with("import\t")
-            {
-                return None;
+            if line.is_empty() || line.starts_with('#') {
+                continue;
             }
 
-            Some(SystemPath::absolute(line, site_packages))
-        })
+            if let Some(editable_roots) =
+                setuptools_editable_install_roots(*system, site_packages, line)
+            {
+                items.extend(editable_roots);
+                continue;
+            }
+
+            // Lines that start with "import " or "import\t" are executed by Python at startup.
+            // We do not execute arbitrary code here, but we do recognize the setuptools-generated
+            // PEP 660 finder hook above so editable installs can still be resolved.
+            // https://docs.python.org/3/library/site.html#module-site
+            if line.starts_with("import ") || line.starts_with("import\t") {
+                continue;
+            }
+
+            items.push(SystemPath::absolute(line, site_packages));
+        }
+
+        items
     }
+}
+
+fn setuptools_editable_install_roots(
+    system: &dyn System,
+    site_packages: &SystemPath,
+    line: &str,
+) -> Option<Vec<SystemPathBuf>> {
+    let finder_module = setuptools_editable_finder_module(line)?;
+    let finder_path = site_packages.join(format!("{finder_module}.py"));
+    let finder_contents = match system.read_to_string(&finder_path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            tracing::debug!("Failed to read setuptools editable finder `{finder_path}`: {error}");
+            return None;
+        }
+    };
+
+    let roots = setuptools_editable_search_roots(&finder_contents);
+    if roots.is_empty() {
+        tracing::debug!(
+            "Setuptools editable finder `{finder_path}` did not declare any usable search roots"
+        );
+        return None;
+    }
+
+    Some(roots)
+}
+
+fn setuptools_editable_finder_module(line: &str) -> Option<&str> {
+    let import_statement = line
+        .strip_prefix("import ")
+        .or_else(|| line.strip_prefix("import\t"))?;
+    let (finder_module, install_statement) = import_statement.split_once(';')?;
+    let finder_module = finder_module.trim();
+
+    let is_valid_identifier = finder_module
+        .chars()
+        .enumerate()
+        .all(|(index, char)| match char {
+            'A'..='Z' | 'a'..='z' | '_' => true,
+            '0'..='9' => index > 0,
+            _ => false,
+        });
+    if !is_valid_identifier || install_statement.trim() != format!("{finder_module}.install()") {
+        return None;
+    }
+
+    Some(finder_module)
+}
+
+fn setuptools_editable_search_roots(finder_contents: &str) -> Vec<SystemPathBuf> {
+    let Ok(parsed) = parse_module(finder_contents) else {
+        return Vec::new();
+    };
+
+    let mut roots = Vec::new();
+
+    for statement in parsed.suite() {
+        let Some((assignment_name, value)) = assignment_name_and_value(statement) else {
+            continue;
+        };
+
+        match assignment_name {
+            "MAPPING" => roots.extend(setuptools_mapping_search_roots(value)),
+            "NAMESPACES" => roots.extend(setuptools_namespace_search_roots(value)),
+            _ => {}
+        }
+    }
+
+    roots
+}
+
+fn assignment_name_and_value<'a>(statement: &'a ast::Stmt) -> Option<(&'a str, &'a ast::Expr)> {
+    match statement {
+        ast::Stmt::Assign(ast::StmtAssign { targets, value, .. }) => match targets.as_slice() {
+            [ast::Expr::Name(name)] => Some((name.id.as_str(), value.as_ref())),
+            _ => None,
+        },
+        ast::Stmt::AnnAssign(ast::StmtAnnAssign {
+            target,
+            value: Some(value),
+            ..
+        }) => {
+            let ast::Expr::Name(name) = target.as_ref() else {
+                return None;
+            };
+            Some((name.id.as_str(), value.as_ref()))
+        }
+        _ => None,
+    }
+}
+
+fn setuptools_mapping_search_roots(value: &ast::Expr) -> Vec<SystemPathBuf> {
+    let ast::Expr::Dict(mapping) = value else {
+        return Vec::new();
+    };
+
+    mapping
+        .iter()
+        .filter_map(|item| string_literal_value(&item.value))
+        .filter_map(editable_search_root)
+        .collect()
+}
+
+fn setuptools_namespace_search_roots(value: &ast::Expr) -> Vec<SystemPathBuf> {
+    let ast::Expr::Dict(namespaces) = value else {
+        return Vec::new();
+    };
+
+    let mut roots = Vec::new();
+
+    for item in namespaces {
+        match &item.value {
+            ast::Expr::List(paths) => {
+                roots.extend(
+                    paths
+                        .elts
+                        .iter()
+                        .filter_map(string_literal_value)
+                        .filter_map(editable_search_root),
+                );
+            }
+            ast::Expr::Tuple(paths) => {
+                roots.extend(
+                    paths
+                        .elts
+                        .iter()
+                        .filter_map(string_literal_value)
+                        .filter_map(editable_search_root),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    roots
+}
+
+fn string_literal_value(expression: &ast::Expr) -> Option<&str> {
+    let ast::Expr::StringLiteral(string) = expression else {
+        return None;
+    };
+
+    Some(string.value.to_str())
+}
+
+fn editable_search_root(path: &str) -> Option<SystemPathBuf> {
+    let path = SystemPath::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+
+    path.parent().map(SystemPath::to_path_buf)
 }
 
 /// Iterator that yields a [`PthFile`] instance for every `.pth` file
@@ -1012,6 +1179,7 @@ impl<'db> Iterator for PthFileIterator<'db> {
                 path,
                 contents,
                 site_packages,
+                system,
             });
         }
     }
@@ -2693,6 +2861,94 @@ not_a_directory
         assert_eq!(
             spam_module.file(&db).unwrap().path(&db),
             &FilePath::System(site_packages.join("spam/spam.py"))
+        );
+    }
+
+    #[test]
+    fn editable_install_setuptools_finder_mapping() {
+        const SITE_PACKAGES: &[FileSpec] = &[
+            (
+                "__editable__.foo-0.0.1.pth",
+                "import __editable___foo_0_0_1_finder; __editable___foo_0_0_1_finder.install()",
+            ),
+            (
+                "__editable___foo_0_0_1_finder.py",
+                "\
+from __future__ import annotations
+MAPPING: dict[str, str] = {'foo': '/x/src/foo', 'bar': '/x/src/bar'}
+NAMESPACES: dict[str, list[str]] = {}
+",
+            ),
+        ];
+        let external_files = [
+            ("/x/src/foo/__init__.py", ""),
+            ("/x/src/foo/baz.py", ""),
+            ("/x/src/bar.py", ""),
+        ];
+
+        let TestCase { mut db, .. } = TestCaseBuilder::new()
+            .with_site_packages_files(SITE_PACKAGES)
+            .build();
+
+        db.write_files(external_files).unwrap();
+
+        let foo_module =
+            resolve_module_confident(&db, &ModuleName::new_static("foo").unwrap()).unwrap();
+        let foo_baz_module =
+            resolve_module_confident(&db, &ModuleName::new_static("foo.baz").unwrap()).unwrap();
+        let bar_module =
+            resolve_module_confident(&db, &ModuleName::new_static("bar").unwrap()).unwrap();
+
+        assert_eq!(
+            foo_module.file(&db).unwrap().path(&db),
+            &FilePath::system("/x/src/foo/__init__.py")
+        );
+        assert_eq!(
+            foo_baz_module.file(&db).unwrap().path(&db),
+            &FilePath::system("/x/src/foo/baz.py")
+        );
+        assert_eq!(
+            bar_module.file(&db).unwrap().path(&db),
+            &FilePath::system("/x/src/bar.py")
+        );
+    }
+
+    #[test]
+    fn editable_install_setuptools_finder_namespaces() {
+        const SITE_PACKAGES: &[FileSpec] = &[
+            (
+                "__editable__.namespace_pkg-0.0.1.pth",
+                "import __editable___namespace_pkg_0_0_1_finder; __editable___namespace_pkg_0_0_1_finder.install()",
+            ),
+            (
+                "__editable___namespace_pkg_0_0_1_finder.py",
+                "\
+from __future__ import annotations
+MAPPING: dict[str, str] = {}
+NAMESPACES: dict[str, list[str]] = {'namespace_pkg': ['/x/src/namespace_pkg']}
+",
+            ),
+        ];
+        let external_files = [("/x/src/namespace_pkg/foo.py", "")];
+
+        let TestCase { mut db, .. } = TestCaseBuilder::new()
+            .with_site_packages_files(SITE_PACKAGES)
+            .build();
+
+        db.write_files(external_files).unwrap();
+
+        let namespace_module =
+            resolve_module_confident(&db, &ModuleName::new_static("namespace_pkg").unwrap())
+                .unwrap();
+        let foo_module =
+            resolve_module_confident(&db, &ModuleName::new_static("namespace_pkg.foo").unwrap())
+                .unwrap();
+
+        assert_eq!(namespace_module.kind(&db), ModuleKind::Package);
+        assert_eq!(namespace_module.file(&db), None);
+        assert_eq!(
+            foo_module.file(&db).unwrap().path(&db),
+            &FilePath::system("/x/src/namespace_pkg/foo.py")
         );
     }
 
