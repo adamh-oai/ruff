@@ -71,7 +71,7 @@ impl<'db> Type<'db> {
                 Some(CallableTypes::one(bound_method.into_callable_type(db)))
             }
 
-            Type::NominalInstance(_) | Type::ProtocolInstance(_) => {
+            Type::NominalInstance(_) => {
                 let call_symbol = self
                     .member_lookup_with_policy(
                         db,
@@ -84,6 +84,39 @@ impl<'db> Type<'db> {
                     && place.is_definitely_defined()
                 {
                     place.ty.try_upcast_to_callable_with_policy(db, policy)
+                } else {
+                    None
+                }
+            }
+            Type::ProtocolInstance(protocol) => {
+                let call_symbol = if protocol.call_member_is_method(db) {
+                    self.member_lookup_with_policy(
+                        db,
+                        Name::new_static("__call__"),
+                        MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                    )
+                    .place
+                } else {
+                    protocol.instance_member(db, "__call__").place
+                };
+
+                if let Place::Defined(place) = call_symbol
+                    && place.is_definitely_defined()
+                {
+                    let upcast_callables =
+                        place.ty.try_upcast_to_callable_with_policy(db, policy)?;
+                    let upcast_callables = if protocol.call_member_is_method(db) {
+                        upcast_callables
+                    } else {
+                        upcast_callables.map(|callable| {
+                            CallableType::new(
+                                db,
+                                callable.signatures(db),
+                                CallableTypeKind::Regular,
+                            )
+                        })
+                    };
+                    Some(upcast_callables)
                 } else {
                     None
                 }

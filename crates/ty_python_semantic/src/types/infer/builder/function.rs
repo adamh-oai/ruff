@@ -437,9 +437,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let previous_typevar_binding_context = self.typevar_binding_context.replace(definition);
 
+        let function_body_scope = self
+            .index
+            .node_scope(NodeWithScopeRef::Function(function))
+            .to_scope_id(db, self.file());
+        let hide_self_name_in_annotations = function_body_scope.is_method_scope(db);
+
         if !has_type_params {
+            let previous_self_name = hide_self_name_in_annotations.then(|| {
+                self.deferred_function_annotation_self_name
+                    .replace(function.name.id.clone())
+            });
             self.infer_return_type_annotation(function.returns.as_deref());
             self.infer_parameters(function.parameters.as_ref());
+            if let Some(previous_self_name) = previous_self_name {
+                self.deferred_function_annotation_self_name = previous_self_name;
+            }
         }
 
         if has_defaults {
