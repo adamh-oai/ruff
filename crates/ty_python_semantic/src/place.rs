@@ -1324,9 +1324,7 @@ impl<'db> LoopHeaderReachability<'db> {
         };
 
         LoopHeaderReachability {
-            deleted_reachability: previous
-                .deleted_reachability
-                .or(self.deleted_reachability),
+            deleted_reachability: previous.deleted_reachability.or(self.deleted_reachability),
             reachable_bindings,
         }
     }

@@ -848,4 +848,8 @@ def capybara(top: Top[Invariant[Any]], bottom: Bottom[Invariant[Any]]) -> None:
 
     reveal_type(top.attr)  # revealed: object
     reveal_type(bottom.attr)  # revealed: Never
+
+def wombat(top: Top[dict[Any, Any]]) -> None:
+    reveal_type(top.get)  # revealed: Overload[(key: object, default: None = None, /) -> object, (key: object, default: Never, /) -> object, [_T](key: object, default: _T, /) -> object]
+    reveal_type(top.__getitem__)  # revealed: bound method Top[dict[Any, Any]].__getitem__(key: object, /) -> object
 ```

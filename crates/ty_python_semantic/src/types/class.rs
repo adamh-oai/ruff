@@ -37,8 +37,8 @@ use crate::types::signatures::{CallableSignature, Parameter, Parameters, Signatu
 use crate::types::tuple::TupleSpec;
 use crate::types::{
     ApplyTypeMappingVisitor, CallableType, CallableTypes, DataclassParams,
-    FindLegacyTypeVarsVisitor, IntersectionType, TypeContext, TypeMapping, UnionBuilder,
-    VarianceInferable,
+    FindLegacyTypeVarsVisitor, IntersectionType, MaterializationKind, TypeContext, TypeMapping,
+    UnionBuilder, VarianceInferable,
 };
 use crate::{
     Db, FxIndexMap, FxOrderSet,
@@ -1450,7 +1450,22 @@ impl<'db> ClassType<'db> {
         let fallback_member_lookup = || {
             class_literal
                 .own_class_member(db, inherited_generic_context, specialization, name)
-                .map_type(|ty| ty.apply_optional_specialization(db, specialization))
+                .map_type(|ty| {
+                    let ty = ty.apply_optional_specialization(db, specialization);
+                    if self.is_known(db, KnownClass::Dict)
+                        && matches!(
+                            specialization.map(|spec| spec.materialization_kind(db)),
+                            Some(Some(MaterializationKind::Top))
+                        )
+                        && matches!(name, "get" | "__getitem__")
+                    {
+                        StaticClassLiteral::rewrite_top_materialized_dict_lookup_member(
+                            db, name, ty,
+                        )
+                    } else {
+                        ty
+                    }
+                })
         };
 
         match name {

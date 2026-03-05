@@ -36,7 +36,7 @@ use crate::{
         diagnostic::INVALID_DATACLASS_OVERRIDE,
         enums::{enum_metadata, is_enum_class_by_inheritance, try_unwrap_nonmember_value},
         function::{
-            DataclassTransformerParams, KnownFunction, is_implicit_classmethod,
+            DataclassTransformerParams, FunctionType, KnownFunction, is_implicit_classmethod,
             is_implicit_staticmethod,
         },
         generics::Specialization,
@@ -110,6 +110,55 @@ impl<'db> StaticClassLiteral<'db> {
 
     pub(crate) fn is_tuple(self, db: &'db dyn Db) -> bool {
         self.is_known(db, KnownClass::Tuple)
+    }
+
+    pub(super) fn rewrite_top_materialized_dict_lookup_member(
+        db: &'db dyn Db,
+        name: &str,
+        ty: Type<'db>,
+    ) -> Type<'db> {
+        fn rewrite_signature<'db>(
+            db: &'db dyn Db,
+            name: &str,
+            signature: &Signature<'db>,
+        ) -> Signature<'db> {
+            let mut parameters: Vec<_> = signature.parameters().iter().cloned().collect();
+            if parameters.len() >= 2 && matches!(name, "get" | "__getitem__") {
+                parameters[1] = parameters[1].clone().with_annotated_type(Type::object());
+            }
+            signature
+                .clone()
+                .with_parameters(Parameters::new(db, parameters))
+        }
+
+        match ty {
+            Type::Callable(callable) => Type::Callable(CallableType::new(
+                db,
+                CallableSignature::from_overloads(
+                    callable
+                        .signatures(db)
+                        .iter()
+                        .map(|signature| rewrite_signature(db, name, signature)),
+                ),
+                callable.kind(db),
+            )),
+            Type::FunctionLiteral(function) => Type::FunctionLiteral(FunctionType::new(
+                db,
+                function.literal(db),
+                Some(CallableSignature::from_overloads(
+                    function
+                        .signature(db)
+                        .iter()
+                        .map(|signature| rewrite_signature(db, name, signature)),
+                )),
+                Some(rewrite_signature(
+                    db,
+                    name,
+                    &function.last_definition_signature(db),
+                )),
+            )),
+            _ => ty,
+        }
     }
 
     /// Returns `true` if this class inherits from a functional namedtuple

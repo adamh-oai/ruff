@@ -351,7 +351,6 @@ impl<'db> CallableSignature<'db> {
         );
         checker.check_callable_signature_pair_inner(db, &self.overloads, &other.overloads)
     }
-
 }
 
 impl<'a, 'db> IntoIterator for &'a CallableSignature<'db> {
@@ -835,6 +834,11 @@ impl<'db> Signature<'db> {
     /// Create a new signature with the given return type.
     pub(crate) fn with_return_type(self, return_ty: Type<'db>) -> Self {
         Self { return_ty, ..self }
+    }
+
+    /// Create a new signature with the given parameters.
+    pub(crate) fn with_parameters(self, parameters: Parameters<'db>) -> Self {
+        Self { parameters, ..self }
     }
 }
 
