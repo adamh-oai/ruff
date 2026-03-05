@@ -14,13 +14,13 @@ use crate::types::{
     Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnionBuilder, infer_expression_types,
 };
 use ty_python_core::expression::Expression;
-use ty_python_core::place::{PlaceExpr, PlaceTable, ScopedPlaceId};
+use ty_python_core::place::{PlaceExpr, PlaceTable, PlaceTableBuilder, ScopedPlaceId};
 use ty_python_core::predicate::{
     CallableAndCallExpr, ClassPatternKind, PatternPredicate, PatternPredicateKind, Predicate,
     PredicateNode,
 };
 use ty_python_core::scope::ScopeId;
-use ty_python_core::{NarrowingEvaluator, place_table};
+use ty_python_core::{NarrowingEvaluator, PossiblyNarrowedPlaces, place_table};
 
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::name::Name;
@@ -1281,11 +1281,24 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         // Importantly, `my_typeddict_union["tag"]` isn't the place we're going to constrain.
         // Instead, we're going to constrain `my_typeddict_union` itself.
         if matches!(&**ops, [ast::CmpOp::Eq | ast::CmpOp::NotEq]) {
+            fn insert_constraint<'db>(
+                constraints: &mut NarrowingConstraints<'db>,
+                place: ScopedPlaceId,
+                constraint: NarrowingConstraint<'db>,
+            ) {
+                constraints
+                    .entry(place)
+                    .and_modify(|existing| {
+                        *existing = existing.merge_constraint_and(constraint.clone());
+                    })
+                    .or_insert(constraint);
+            }
+
             // For `==`, we use equality semantics on the `if` branch (is_positive=true).
             // For `!=`, we use equality semantics on the `else` branch (is_positive=false).
             let constrain_with_equality = is_positive == (ops[0] == ast::CmpOp::Eq);
 
-            let mut narrow_subscript = |subscript: &ast::ExprSubscript, other_type: Type<'db>| {
+            if let ast::Expr::Subscript(subscript) = &**left {
                 let value_type = inference.expression_type(&*subscript.value);
                 let slice_type = inference.expression_type(&*subscript.slice);
 
@@ -1293,37 +1306,68 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                     value_type,
                     &subscript.value,
                     slice_type,
-                    other_type,
+                    inference.expression_type(&comparators[0]),
                     constrain_with_equality,
                 ) {
-                    constraints
-                        .entry(place)
-                        .and_modify(|existing| {
-                            *existing = existing.merge_constraint_and(constraint.clone());
-                        })
-                        .or_insert(constraint);
+                    insert_constraint(&mut constraints, place, constraint);
                 } else if let Some((place, constraint)) = self.narrow_tuple_subscript(
                     value_type,
                     &subscript.value,
                     slice_type,
-                    other_type,
+                    inference.expression_type(&comparators[0]),
                     constrain_with_equality,
                 ) {
-                    constraints
-                        .entry(place)
-                        .and_modify(|existing| {
-                            *existing = existing.merge_constraint_and(constraint.clone());
-                        })
-                        .or_insert(constraint);
+                    insert_constraint(&mut constraints, place, constraint);
                 }
-            };
+            }
+            if let ast::Expr::Attribute(attribute) = &**left {
+                let value_type = inference.expression_type(&*attribute.value);
 
-            if let ast::Expr::Subscript(subscript) = &**left {
-                narrow_subscript(subscript, inference.expression_type(&comparators[0]));
+                if let Some((place, constraint)) = self.narrow_union_attribute(
+                    value_type,
+                    &attribute.value,
+                    attribute.attr.as_str(),
+                    inference.expression_type(&comparators[0]),
+                    constrain_with_equality,
+                ) {
+                    insert_constraint(&mut constraints, place, constraint);
+                }
             }
 
             if let ast::Expr::Subscript(subscript) = &comparators[0] {
-                narrow_subscript(subscript, inference.expression_type(&**left));
+                let value_type = inference.expression_type(&*subscript.value);
+                let slice_type = inference.expression_type(&*subscript.slice);
+
+                if let Some((place, constraint)) = self.narrow_typeddict_subscript(
+                    value_type,
+                    &subscript.value,
+                    slice_type,
+                    inference.expression_type(&**left),
+                    constrain_with_equality,
+                ) {
+                    insert_constraint(&mut constraints, place, constraint);
+                } else if let Some((place, constraint)) = self.narrow_tuple_subscript(
+                    value_type,
+                    &subscript.value,
+                    slice_type,
+                    inference.expression_type(&**left),
+                    constrain_with_equality,
+                ) {
+                    insert_constraint(&mut constraints, place, constraint);
+                }
+            }
+            if let ast::Expr::Attribute(attribute) = &comparators[0] {
+                let value_type = inference.expression_type(&*attribute.value);
+
+                if let Some((place, constraint)) = self.narrow_union_attribute(
+                    value_type,
+                    &attribute.value,
+                    attribute.attr.as_str(),
+                    inference.expression_type(&**left),
+                    constrain_with_equality,
+                ) {
+                    insert_constraint(&mut constraints, place, constraint);
+                }
             }
         }
 
@@ -1784,6 +1828,17 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             ) {
                 constraints.insert(place, constraint);
             }
+        } else if let ast::Expr::Attribute(attribute) = subject_node {
+            let inference = infer_expression_types(self.db, subject, TypeContext::default());
+            if let Some((place, constraint)) = self.narrow_union_attribute(
+                inference.expression_type(&*attribute.value),
+                &attribute.value,
+                attribute.attr.as_str(),
+                value_ty,
+                is_positive,
+            ) {
+                constraints.insert(place, constraint);
+            }
         }
 
         Some(constraints)
@@ -2007,6 +2062,53 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             None
         }
     }
+
+    /// Narrow unions of nominal-ish instances based on a literal-valued attribute.
+    ///
+    /// Given an attribute expression like `content.kind` where `content` has a union type and
+    /// a comparison value like `"text"`, create a constraint on `content` (not `content.kind`)
+    /// that filters out union members whose attribute type cannot match the literal.
+    fn narrow_union_attribute(
+        &self,
+        attribute_value_type: Type<'db>,
+        attribute_value_expr: &ast::Expr,
+        attribute_name: &str,
+        rhs_type: Type<'db>,
+        constrain_with_equality: bool,
+    ) -> Option<(ScopedPlaceId, NarrowingConstraint<'db>)> {
+        let Type::Union(union) = attribute_value_type.resolve_type_alias(self.db) else {
+            return None;
+        };
+
+        if !is_supported_tag_literal(rhs_type) {
+            return None;
+        }
+
+        let attribute_place_expr = PlaceExpr::try_from_expr(attribute_value_expr)?;
+
+        if constrain_with_equality
+            && !all_matching_attribute_types_have_literal_types(self.db, union, attribute_name)
+        {
+            return None;
+        }
+
+        let filtered = union.filter(self.db, |elem| {
+            member_type_for_narrowing(self.db, *elem, attribute_name).is_none_or(|attribute_ty| {
+                if constrain_with_equality {
+                    !attribute_ty.is_disjoint_from(self.db, rhs_type)
+                } else {
+                    !attribute_ty.is_subtype_of(self.db, rhs_type)
+                }
+            })
+        });
+
+        if filtered != Type::Union(union) {
+            let place = self.expect_place(&attribute_place_expr);
+            Some((place, NarrowingConstraint::replacement(filtered)))
+        } else {
+            None
+        }
+    }
 }
 
 // Return true if the given type is a `TypedDict` or a union or intersection that includes at least
@@ -2183,6 +2285,27 @@ fn all_matching_tuple_elements_have_literal_types<'db>(
     })
 }
 
+fn member_type_for_narrowing<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+    attribute_name: &str,
+) -> Option<Type<'db>> {
+    ty.resolve_type_alias(db)
+        .member(db, attribute_name)
+        .place
+        .ignore_possibly_undefined()
+}
+
+fn all_matching_attribute_types_have_literal_types<'db>(
+    db: &'db dyn Db,
+    union: UnionType<'db>,
+    attribute_name: &str,
+) -> bool {
+    union.elements(db).iter().all(|elem| {
+        member_type_for_narrowing(db, *elem, attribute_name).is_none_or(is_supported_tag_literal)
+    })
+}
+
 pub(crate) trait NarrowingEvaluatorExtension<'db> {
     fn narrow(&self, db: &'db dyn Db, base_type: Type<'db>, place: ScopedPlaceId) -> Type<'db>;
 }
@@ -2196,5 +2319,191 @@ impl<'db> NarrowingEvaluatorExtension<'db> for NarrowingEvaluator<'_, 'db> {
             base_type,
             place,
         )
+    }
+}
+
+/// Builder for computing the conservative set of places that could possibly be narrowed.
+///
+/// This mirrors the structure of `NarrowingConstraintsBuilder` but only computes which places
+ /// *could* be narrowed, without performing type inference to determine the actual constraints.
+pub(crate) struct PossiblyNarrowedPlacesBuilder<'db, 'a> {
+    db: &'db dyn Db,
+    places: &'a PlaceTableBuilder,
+}
+
+impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
+    pub(crate) fn new(db: &'db dyn Db, places: &'a PlaceTableBuilder) -> Self {
+        Self { db, places }
+    }
+
+    /// Compute possibly narrowed places for an expression predicate.
+    pub(crate) fn expression(self, expr: &ast::Expr) -> PossiblyNarrowedPlaces {
+        self.expression_node(expr)
+    }
+
+    /// Compute possibly narrowed places for a pattern predicate.
+    pub(crate) fn pattern(
+        self,
+        pattern: PatternPredicate<'db>,
+        module: &ParsedModuleRef,
+    ) -> PossiblyNarrowedPlaces {
+        self.pattern_kind(pattern.kind(self.db), pattern.subject(self.db), module)
+    }
+
+    fn expression_node(&self, expr: &ast::Expr) -> PossiblyNarrowedPlaces {
+        match expr {
+            ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Subscript(_) => {
+                self.simple_expr(expr)
+            }
+            ast::Expr::Compare(expr_compare) => self.expr_compare(expr_compare),
+            ast::Expr::Call(expr_call) => self.expr_call(expr_call),
+            ast::Expr::UnaryOp(unary_op) if unary_op.op == ast::UnaryOp::Not => {
+                self.expression_node(&unary_op.operand)
+            }
+            ast::Expr::BoolOp(bool_op) => self.expr_bool_op(bool_op),
+            ast::Expr::If(expr_if) => self.expr_if(expr_if),
+            ast::Expr::Named(expr_named) => {
+                let mut places = self.simple_expr(&expr_named.target);
+                places.extend(self.expression_node(&expr_named.value));
+                places
+            }
+            _ => PossiblyNarrowedPlaces::default(),
+        }
+    }
+
+    fn simple_expr(&self, expr: &ast::Expr) -> PossiblyNarrowedPlaces {
+        let mut places = PossiblyNarrowedPlaces::default();
+        if let Some(place_expr) = PlaceExpr::try_from_expr(expr)
+            && let Some(place) = self.places.place_id((&place_expr).into())
+        {
+            places.insert(place);
+        }
+        places
+    }
+
+    fn expr_compare(&self, expr_compare: &ast::ExprCompare) -> PossiblyNarrowedPlaces {
+        let mut places = PossiblyNarrowedPlaces::default();
+
+        self.add_narrowing_target(&expr_compare.left, &mut places);
+        for comparator in &expr_compare.comparators {
+            self.add_narrowing_target(comparator, &mut places);
+        }
+
+        for expr in std::iter::once(&*expr_compare.left).chain(&expr_compare.comparators) {
+            if let ast::Expr::Subscript(subscript) = expr
+                && let Some(place_expr) = PlaceExpr::try_from_expr(&subscript.value)
+                && let Some(place) = self.places.place_id((&place_expr).into())
+            {
+                places.insert(place);
+            } else if let ast::Expr::Attribute(attribute) = expr
+                && let Some(place_expr) = PlaceExpr::try_from_expr(&attribute.value)
+                && let Some(place) = self.places.place_id((&place_expr).into())
+            {
+                places.insert(place);
+            }
+        }
+
+        places
+    }
+
+    fn expr_call(&self, expr_call: &ast::ExprCall) -> PossiblyNarrowedPlaces {
+        let mut places = PossiblyNarrowedPlaces::default();
+
+        for argument in expr_call.arguments.args.iter().take(2) {
+            if let Some(place_expr) = PlaceExpr::try_from_expr(argument)
+                && let Some(place) = self.places.place_id((&place_expr).into())
+            {
+                places.insert(place);
+            }
+        }
+
+        if let Some(first_arg) = expr_call.arguments.args.first()
+            && expr_call.arguments.args.len() == 1
+            && expr_call.arguments.keywords.is_empty()
+        {
+            places.extend(self.expression_node(first_arg));
+        }
+
+        places
+    }
+
+    fn expr_bool_op(&self, bool_op: &ast::ExprBoolOp) -> PossiblyNarrowedPlaces {
+        let mut places = PossiblyNarrowedPlaces::default();
+        for value in &bool_op.values {
+            places.extend(self.expression_node(value));
+        }
+        places
+    }
+
+    fn expr_if(&self, expr_if: &ast::ExprIf) -> PossiblyNarrowedPlaces {
+        let mut places = self.expression_node(&expr_if.test);
+        places.extend(self.expression_node(&expr_if.body));
+        places.extend(self.expression_node(&expr_if.orelse));
+        places
+    }
+
+    fn add_narrowing_target(&self, expr: &ast::Expr, places: &mut PossiblyNarrowedPlaces) {
+        match expr {
+            ast::Expr::Name(_)
+            | ast::Expr::Attribute(_)
+            | ast::Expr::Subscript(_)
+            | ast::Expr::Named(_) => {
+                if let Some(place_expr) = PlaceExpr::try_from_expr(expr)
+                    && let Some(place) = self.places.place_id((&place_expr).into())
+                {
+                    places.insert(place);
+                }
+            }
+            ast::Expr::Call(call) if call.arguments.args.len() == 1 => {
+                if let Some(first_arg) = call.arguments.args.first()
+                    && let Some(place_expr) = PlaceExpr::try_from_expr(first_arg)
+                    && let Some(place) = self.places.place_id((&place_expr).into())
+                {
+                    places.insert(place);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pattern_kind(
+        &self,
+        kind: &PatternPredicateKind<'db>,
+        subject: Expression<'db>,
+        module: &ParsedModuleRef,
+    ) -> PossiblyNarrowedPlaces {
+        let mut places = PossiblyNarrowedPlaces::default();
+
+        let subject_node = subject.node_ref(self.db).node(module);
+        if let Some(subject_place_expr) = PlaceExpr::try_from_expr(subject_node)
+            && let Some(place) = self.places.place_id((&subject_place_expr).into())
+        {
+            places.insert(place);
+        }
+
+        if let ast::Expr::Subscript(subscript) = subject_node {
+            if let Some(place_expr) = PlaceExpr::try_from_expr(&subscript.value)
+                && let Some(place) = self.places.place_id((&place_expr).into())
+            {
+                places.insert(place);
+            }
+        } else if let ast::Expr::Attribute(attribute) = subject_node
+            && let Some(place_expr) = PlaceExpr::try_from_expr(&attribute.value)
+            && let Some(place) = self.places.place_id((&place_expr).into())
+        {
+            places.insert(place);
+        }
+
+        if let PatternPredicateKind::Or(predicates) = kind {
+            for predicate in predicates {
+                places.extend(self.pattern_kind(predicate, subject, module));
+            }
+        }
+
+        if let PatternPredicateKind::As(Some(inner), _) = kind {
+            places.extend(self.pattern_kind(inner, subject, module));
+        }
+
+        places
     }
 }

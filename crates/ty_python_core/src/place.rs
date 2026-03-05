@@ -638,7 +638,7 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
     }
 
     /// Compare expressions can narrow places on either side of the comparison,
-    /// and can also narrow subscript bases (for `TypedDict` and tuple narrowing).
+    /// and can also narrow subscript or attribute bases.
     fn expr_compare(&self, expr_compare: &ast::ExprCompare) -> PossiblyNarrowedPlaces {
         let mut places = PossiblyNarrowedPlaces::default();
 
@@ -650,11 +650,15 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
             self.add_narrowing_target(comparator, &mut places);
         }
 
-        // For subscript expressions on either side, the subscript base can also be narrowed.
-        // (TypedDict and tuple discriminated union narrowing.)
+        // For subscript or attribute expressions on either side, the base can also be narrowed.
         for expr in std::iter::once(&*expr_compare.left).chain(&expr_compare.comparators) {
             if let ast::Expr::Subscript(subscript) = expr
                 && let Some(place_expr) = PlaceExpr::try_from_expr(&subscript.value)
+                && let Some(place) = self.places.place_id((&place_expr).into())
+            {
+                places.insert(place);
+            } else if let ast::Expr::Attribute(attribute) = expr
+                && let Some(place_expr) = PlaceExpr::try_from_expr(&attribute.value)
                 && let Some(place) = self.places.place_id((&place_expr).into())
             {
                 places.insert(place);
@@ -752,13 +756,18 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
             }
         }
 
-        // For subscript subjects, the subscript base can also be narrowed (TypedDict/tuple narrowing)
+        // For subscript or attribute subjects, the base can also be narrowed.
         if let ast::Expr::Subscript(subscript) = subject_node {
             if let Some(place_expr) = PlaceExpr::try_from_expr(&subscript.value) {
                 if let Some(place) = self.places.place_id((&place_expr).into()) {
                     places.insert(place);
                 }
             }
+        } else if let ast::Expr::Attribute(attribute) = subject_node
+            && let Some(place_expr) = PlaceExpr::try_from_expr(&attribute.value)
+            && let Some(place) = self.places.place_id((&place_expr).into())
+        {
+            places.insert(place);
         }
 
         // Handle Or patterns by recursing into each alternative

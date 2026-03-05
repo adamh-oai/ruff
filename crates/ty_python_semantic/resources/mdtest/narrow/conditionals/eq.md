@@ -155,6 +155,56 @@ def _(flag: bool):
         reveal_type(C)  # revealed: <class 'A'>
 ```
 
+## Tagged class unions via literal attributes
+
+```py
+from typing import Literal
+
+class Text:
+    content_type: Literal["text"]
+    parts: list[str]
+
+class Image:
+    content_type: Literal["image"]
+    width: int
+
+def _(content: Text | Image):
+    if content.content_type == "text":
+        reveal_type(content)  # revealed: Text
+        reveal_type(content.parts)  # revealed: list[str]
+    else:
+        reveal_type(content)  # revealed: Image
+
+    if content.content_type != "text":
+        reveal_type(content)  # revealed: Image
+    else:
+        reveal_type(content)  # revealed: Text
+```
+
+Positive equality narrowing is only safe if all relevant attributes are
+literal-typed:
+
+```py
+from typing import Literal
+
+class Tagged:
+    kind: Literal["tagged"]
+
+class Untagged:
+    kind: str
+
+def _(value: Tagged | Untagged):
+    if value.kind == "tagged":
+        reveal_type(value)  # revealed: Tagged | Untagged
+    else:
+        reveal_type(value)  # revealed: Untagged
+
+    if value.kind != "tagged":
+        reveal_type(value)  # revealed: Untagged
+    else:
+        reveal_type(value)  # revealed: Tagged | Untagged
+```
+
 ## `x != y` where `y` has multiple single-valued options
 
 ```py

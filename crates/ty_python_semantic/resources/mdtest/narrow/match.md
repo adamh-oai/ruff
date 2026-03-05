@@ -220,6 +220,28 @@ def _(x: Literal["foo", b"bar"] | int):
             pass
 ```
 
+## Value patterns on tagged class-union attributes
+
+```py
+from typing import Literal
+
+class Text:
+    content_type: Literal["text"]
+    parts: list[str]
+
+class Image:
+    content_type: Literal["image"]
+    width: int
+
+def _(content: Text | Image):
+    match content.content_type:
+        case "text":
+            reveal_type(content)  # revealed: Text
+            reveal_type(content.parts)  # revealed: list[str]
+        case _:
+            reveal_type(content)  # revealed: Image
+```
+
 ## Or patterns
 
 ```py
