@@ -5,6 +5,7 @@ use except_handlers::TryNodeContextStackManager;
 use itertools::Itertools;
 use ruff_python_ast::helpers::is_dotted_name;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use ruff_db::files::File;
 use ruff_db::parsed::ParsedModuleRef;
@@ -83,6 +84,12 @@ impl Loop {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PredicateAlias<'db> {
+    predicate: PredicateOrLiteral<'db>,
+    captured_bindings: FxHashMap<ScopedPlaceId, SmallVec<[ScopedDefinitionId; 1]>>,
+}
+
 struct ScopeInfo {
     file_scope_id: FileScopeId,
     /// Current loop state; None if we are not currently visiting a loop
@@ -103,6 +110,8 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     current_match_case: Option<CurrentMatchCase<'ast>>,
     /// The name of the first function parameter of the innermost function that we're currently visiting.
     current_first_parameter_name: Option<&'ast str>,
+    /// Boolean locals whose values preserve a predicate over other places.
+    predicate_aliases: FxHashMap<Definition<'db>, PredicateAlias<'db>>,
 
     /// Per-scope contexts regarding nested `try`/`except` statements
     try_node_context_stack_manager: TryNodeContextStackManager,
@@ -151,6 +160,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             current_assignments: vec![],
             current_match_case: None,
             current_first_parameter_name: None,
+            predicate_aliases: FxHashMap::default(),
             try_node_context_stack_manager: TryNodeContextStackManager::default(),
 
             has_future_annotations: false,
@@ -749,6 +759,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 );
 
                 self.add_dict_key_assignment_definitions(&node.targets, &node.value, assignment);
+
+                if place_id.is_symbol() && node.targets.len() == 1 && expr.is_name_expr() {
+                    self.record_predicate_alias(assignment, place_id, &node.value);
+                }
             }
             Some(CurrentAssignment::AnnAssign(ann_assign)) => {
                 self.add_standalone_type_expression(&ann_assign.annotation);
@@ -768,6 +782,13 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         value,
                         assignment,
                     );
+                }
+
+                if place_id.is_symbol()
+                    && expr.is_name_expr()
+                    && let Some(value) = ann_assign.value.as_deref()
+                {
+                    self.record_predicate_alias(assignment, place_id, value);
                 }
             }
             Some(CurrentAssignment::AugAssign(aug_assign)) => {
@@ -1123,6 +1144,22 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     }
 
     fn build_predicate(&mut self, predicate_node: &ast::Expr) -> PredicateOrLiteral<'db> {
+        self.build_predicate_impl(predicate_node, true, true)
+    }
+
+    fn build_predicate_without_alias_resolution(
+        &mut self,
+        predicate_node: &ast::Expr,
+    ) -> PredicateOrLiteral<'db> {
+        self.build_predicate_impl(predicate_node, false, true)
+    }
+
+    fn build_predicate_impl(
+        &mut self,
+        predicate_node: &ast::Expr,
+        allow_alias_resolution: bool,
+        track_expression: bool,
+    ) -> PredicateOrLiteral<'db> {
         // Some commonly used test expressions are eagerly evaluated as `true`
         // or `false` here for performance reasons. This list does not need to
         // be exhaustive. More complex expressions will still evaluate to the
@@ -1146,15 +1183,127 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             }
         }
 
-        let expression = self.add_standalone_expression(predicate_node);
+        // Control-flow tests are always inferred as standalone expressions, even when we later
+        // replay a predicate alias for narrowing.
+        if track_expression {
+            let _ = self.standalone_expression(predicate_node);
+        }
+
+        if allow_alias_resolution {
+            match predicate_node {
+                ast::Expr::Name(name) => {
+                    if let Some(alias) = self.try_resolve_predicate_alias(name) {
+                        return alias;
+                    }
+                }
+                ast::Expr::UnaryOp(ast::ExprUnaryOp {
+                    op: ast::UnaryOp::Not,
+                    operand,
+                    ..
+                }) => {
+                    return self
+                        .build_predicate_impl(operand, allow_alias_resolution, false)
+                        .negated();
+                }
+                _ => {}
+            }
+        } else if let ast::Expr::UnaryOp(ast::ExprUnaryOp {
+            op: ast::UnaryOp::Not,
+            operand,
+            ..
+        }) = predicate_node
+        {
+            return self
+                .build_predicate_impl(operand, allow_alias_resolution, false)
+                .negated();
+        }
 
         match resolve_to_literal(predicate_node) {
             Some(literal) => PredicateOrLiteral::Literal(literal),
             None => PredicateOrLiteral::Predicate(Predicate {
-                node: PredicateNode::Expression(expression),
+                node: PredicateNode::Expression(self.standalone_expression(predicate_node)),
                 is_positive: true,
             }),
         }
+    }
+
+    fn standalone_expression(&mut self, expression_node: &ast::Expr) -> Expression<'db> {
+        self.expressions_by_node
+            .get(&ExpressionNodeKey::from(expression_node))
+            .copied()
+            .unwrap_or_else(|| self.add_standalone_expression(expression_node))
+    }
+
+    fn current_live_binding_ids(&self, place: ScopedPlaceId) -> SmallVec<[ScopedDefinitionId; 1]> {
+        self.current_use_def_map()
+            .loop_back_bindings(place)
+            .map(|binding| binding.binding())
+            .collect()
+    }
+
+    fn try_build_predicate_alias(&mut self, value: &ast::Expr) -> Option<PredicateAlias<'db>> {
+        let predicate = self.build_predicate_without_alias_resolution(value);
+        let captured_places = self.compute_possibly_narrowed_places(&predicate);
+        if captured_places.is_empty() {
+            return None;
+        }
+
+        let captured_bindings = captured_places
+            .into_iter()
+            .map(|place| (place, self.current_live_binding_ids(place)))
+            .collect();
+
+        Some(PredicateAlias {
+            predicate,
+            captured_bindings,
+        })
+    }
+
+    fn record_predicate_alias(
+        &mut self,
+        definition: Definition<'db>,
+        target: ScopedPlaceId,
+        value: &ast::Expr,
+    ) {
+        let Some(alias) = self.try_build_predicate_alias(value) else {
+            return;
+        };
+
+        if alias.captured_bindings.contains_key(&target) {
+            return;
+        }
+
+        self.predicate_aliases.insert(definition, alias);
+    }
+
+    fn is_predicate_alias_applicable(&self, alias: &PredicateAlias<'db>) -> bool {
+        alias
+            .captured_bindings
+            .iter()
+            .all(|(&place, captured_bindings)| {
+                self.current_live_binding_ids(place)
+                    .into_iter()
+                    .all(|binding| captured_bindings.contains(&binding))
+            })
+    }
+
+    fn try_resolve_predicate_alias(
+        &mut self,
+        name: &ast::ExprName,
+    ) -> Option<PredicateOrLiteral<'db>> {
+        let symbol = self.current_place_table().symbol_id(name.id.as_str())?;
+        let place = symbol.into();
+        let live_binding = self
+            .current_use_def_map()
+            .loop_back_bindings(place)
+            .exactly_one()
+            .ok()?;
+        let definition = self
+            .current_use_def_map()
+            .binding_definition(live_binding.binding())?;
+        let alias = self.predicate_aliases.get(&definition)?;
+        self.is_predicate_alias_applicable(alias)
+            .then_some(alias.predicate)
     }
 
     /// Adds a new predicate to the list of all predicates, but does not record it. Returns the

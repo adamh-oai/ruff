@@ -1575,6 +1575,13 @@ impl<'db> UseDefMapBuilder<'db> {
         bindings.iter().copied()
     }
 
+    pub(super) fn binding_definition(
+        &self,
+        binding: ScopedDefinitionId,
+    ) -> Option<Definition<'db>> {
+        self.all_definitions[binding].definition()
+    }
+
     /// Restore the current builder places state to the given snapshot.
     pub(super) fn restore(&mut self, snapshot: FlowSnapshot) {
         // We never remove places from `place_states` (it's an IndexVec, and the place

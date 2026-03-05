@@ -88,3 +88,33 @@ def _(flag1: bool, flag2: bool):
 
     isinstance(x, A) or x is not None and reveal_type(x)  # revealed: Literal[1]
 ```
+
+## Direct boolean predicate aliases
+
+```py
+def _(flag: bool):
+    class A: ...
+
+    x: A | None = A() if flag else None
+    x_set = x is not None
+
+    if x_set:
+        reveal_type(x)  # revealed: A
+
+    if not x_set:
+        reveal_type(x)  # revealed: None
+```
+
+## Reassigned predicate aliases do not narrow
+
+```py
+def _(flag: bool):
+    class A: ...
+
+    x: A | None = A() if flag else None
+    x_set = x is not None
+    x = None
+
+    if x_set:
+        reveal_type(x)  # revealed: None
+```

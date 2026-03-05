@@ -5830,11 +5830,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             ast::Expr::Named(named) => {
                 self.try_synthesize_kwargs_typed_dict(&named.value, definition, seen_definitions)
             }
-            ast::Expr::Call(call) => self.try_synthesize_kwargs_typed_dict_from_call(
-                call,
-                definition,
-                seen_definitions,
-            ),
+            ast::Expr::Call(call) => {
+                self.try_synthesize_kwargs_typed_dict_from_call(call, definition, seen_definitions)
+            }
             _ => None,
         }
     }
@@ -5869,7 +5867,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         self.try_synthesize_kwargs_typed_dict(argument, definition, seen_definitions)
-            .or_else(|| self.kwargs_expression_type(argument, definition).as_typed_dict())
+            .or_else(|| {
+                self.kwargs_expression_type(argument, definition)
+                    .as_typed_dict()
+            })
     }
 
     fn try_synthesize_kwargs_typed_dict_from_use(
