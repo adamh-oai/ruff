@@ -1017,6 +1017,17 @@ fn cached_protocol_interface<'db>(
             let member = match ty {
                 Type::PropertyInstance(property) => ProtocolMemberKind::Property(property),
                 Type::Callable(callable)
+                    if name == "__call__"
+                        && bound_on_class.is_yes()
+                        && callable.is_function_like(db) =>
+                {
+                    ProtocolMemberKind::Other(Type::Callable(CallableType::new(
+                        db,
+                        callable.signatures(db),
+                        CallableTypeKind::Regular,
+                    )))
+                }
+                Type::Callable(callable)
                     if bound_on_class.is_yes() && callable.is_function_like(db) =>
                 {
                     ProtocolMemberKind::Method(callable)

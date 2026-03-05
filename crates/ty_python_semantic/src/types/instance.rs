@@ -771,6 +771,10 @@ impl<'db> ProtocolInstanceType<'db> {
         }
     }
 
+    pub(crate) fn call_member_is_method(self, db: &'db dyn Db) -> bool {
+        self.inner.interface(db).call_method(db).is_some()
+    }
+
     pub(super) fn apply_type_mapping_impl<'a>(
         self,
         db: &'db dyn Db,

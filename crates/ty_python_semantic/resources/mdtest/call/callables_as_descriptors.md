@@ -414,4 +414,35 @@ Parent().method(1)
 Child().method(1)
 ```
 
+## Decorators returning callable protocols
+
+Some decorators return a protocol that adds attributes to the original function while preserving its
+call signature. The decorated result should still be directly callable like a normal function.
+
+```py
+from collections.abc import Callable
+from typing import Protocol, TypeVar
+
+_F = TypeVar("_F", bound=Callable[..., object])
+_ET = TypeVar("_ET", bound=type[BaseException])
+
+class WithException(Protocol[_F, _ET]):
+    Exception: _ET
+    __call__: _F
+
+def with_exception(exception_type: _ET) -> Callable[[_F], WithException[_F, _ET]]:
+    raise NotImplementedError
+
+class Failed(Exception): ...
+
+@with_exception(Failed)
+def fail(reason: str = "", pytrace: bool = True) -> None:
+    pass
+
+reveal_type(fail.Exception)  # revealed: <class 'Failed'>
+
+fail("hello")
+fail(pytrace=False)
+```
+
 [`tensorbase`]: https://github.com/pytorch/pytorch/blob/f3913ea641d871f04fa2b6588a77f63efeeb9f10/torch/_tensor.py#L1084-L1092
