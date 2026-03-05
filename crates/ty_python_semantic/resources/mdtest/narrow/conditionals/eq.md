@@ -181,8 +181,38 @@ def _(content: Text | Image):
         reveal_type(content)  # revealed: Text
 ```
 
-Positive equality narrowing is only safe if all relevant attributes are
-literal-typed:
+Enum-member literals should work as discriminants too:
+
+```py
+from enum import Enum
+from typing import Literal
+
+class Kind(Enum):
+    TEXT = 1
+    IMAGE = 2
+
+class Text:
+    kind: Literal[Kind.TEXT]
+    parts: list[str]
+
+class Image:
+    kind: Literal[Kind.IMAGE]
+    width: int
+
+def _(content: Text | Image):
+    if content.kind == Kind.TEXT:
+        reveal_type(content)  # revealed: Text
+        reveal_type(content.parts)  # revealed: list[str]
+    else:
+        reveal_type(content)  # revealed: Image
+
+    if content.kind != Kind.TEXT:
+        reveal_type(content)  # revealed: Image
+    else:
+        reveal_type(content)  # revealed: Text
+```
+
+Positive equality narrowing is only safe if all relevant attributes are literal-typed:
 
 ```py
 from typing import Literal

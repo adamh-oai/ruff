@@ -89,6 +89,39 @@ reveal_type(Result.__init__)  # revealed: (self: Result, *, _meta: dict[str, obj
 Result(_meta=None)
 ```
 
+## Discriminated unions with enum-member tags
+
+Enum-valued discriminators should narrow the containing Pydantic union just like
+string-valued discriminators:
+
+```py
+from enum import Enum
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, Field
+
+class Kind(Enum):
+    TEXT = 1
+    IMAGE = 2
+
+class Text(BaseModel):
+    kind: Literal[Kind.TEXT] = Kind.TEXT
+    parts: list[str]
+
+class Image(BaseModel):
+    kind: Literal[Kind.IMAGE] = Kind.IMAGE
+    width: int
+
+Tagged = Annotated[Text | Image, Field(discriminator="kind")]
+
+def _(content: Tagged):
+    if content.kind == Kind.TEXT:
+        reveal_type(content)  # revealed: Text
+        reveal_type(content.parts)  # revealed: list[str]
+    else:
+        reveal_type(content)  # revealed: Image
+```
+
 ## Validator and serializer decorators with explicit `@classmethod`
 
 Pydantic [recommends](https://docs.pydantic.dev/latest/concepts/validators/#class-validators) using

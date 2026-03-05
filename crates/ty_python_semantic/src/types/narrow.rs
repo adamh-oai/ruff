@@ -1943,7 +1943,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         }
         let subscript_place_expr = PlaceExpr::try_from_expr(subscript_value_expr)?;
         let key_literal = subscript_key_type.as_string_literal()?;
-        if !is_supported_tag_literal(rhs_type) {
+        if !is_supported_tag_literal(self.db, rhs_type) {
             return None;
         }
 
@@ -2018,7 +2018,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         let index = i32::try_from(index).ok()?;
 
         // The comparison value must be a supported literal type.
-        if !is_supported_tag_literal(rhs_type) {
+        if !is_supported_tag_literal(self.db, rhs_type) {
             return None;
         }
 
@@ -2080,7 +2080,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             return None;
         };
 
-        if !is_supported_tag_literal(rhs_type) {
+        if !is_supported_tag_literal(self.db, rhs_type) {
             return None;
         }
 
@@ -2156,17 +2156,18 @@ fn is_or_contains_typeddict<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
     }
 }
 
-fn is_supported_tag_literal(ty: Type) -> bool {
-    matches!(
-        ty.as_literal_value_kind(),
-        // TODO: We'd like to support `EnumLiteral` also, but we have to be careful with types like
-        // `IntEnum` and `StrEnum` that have custom `__eq__` methods.
+fn is_supported_tag_literal<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
+    match ty.as_literal_value_kind() {
         Some(
             LiteralValueTypeKind::String(_)
-                | LiteralValueTypeKind::Bytes(_)
-                | LiteralValueTypeKind::Int(_)
-        )
-    )
+            | LiteralValueTypeKind::Bytes(_)
+            | LiteralValueTypeKind::Int(_),
+        ) => true,
+        // Enum literals are safe discriminants when their equality semantics are still
+        // single-valued; this excludes enums that override `__eq__` / `__ne__`.
+        Some(LiteralValueTypeKind::Enum(_)) => ty.is_single_valued(db),
+        _ => false,
+    }
 }
 
 // Return true if the given type is a `TypedDict` whose `field_name` field has a supported tag literal
@@ -2183,7 +2184,7 @@ fn all_matching_typeddict_fields_have_literal_types<'db>(
         typeddict
             .items(db)
             .get(field_name)
-            .is_none_or(|field| is_supported_tag_literal(field.declared_ty))
+            .is_none_or(|field| is_supported_tag_literal(db, field.declared_ty))
     };
 
     match ty {
@@ -2281,7 +2282,7 @@ fn all_matching_tuple_elements_have_literal_types<'db>(
         elem.as_nominal_instance()
             .and_then(|inst| inst.tuple_spec(db))
             .and_then(|spec| spec.py_index(db, index).ok())
-            .is_none_or(is_supported_tag_literal)
+            .is_none_or(|ty| is_supported_tag_literal(db, ty))
     })
 }
 
@@ -2302,7 +2303,8 @@ fn all_matching_attribute_types_have_literal_types<'db>(
     attribute_name: &str,
 ) -> bool {
     union.elements(db).iter().all(|elem| {
-        member_type_for_narrowing(db, *elem, attribute_name).is_none_or(is_supported_tag_literal)
+        member_type_for_narrowing(db, *elem, attribute_name)
+            .is_none_or(|ty| is_supported_tag_literal(db, ty))
     })
 }
 
@@ -2325,7 +2327,7 @@ impl<'db> NarrowingEvaluatorExtension<'db> for NarrowingEvaluator<'_, 'db> {
 /// Builder for computing the conservative set of places that could possibly be narrowed.
 ///
 /// This mirrors the structure of `NarrowingConstraintsBuilder` but only computes which places
- /// *could* be narrowed, without performing type inference to determine the actual constraints.
+/// *could* be narrowed, without performing type inference to determine the actual constraints.
 pub(crate) struct PossiblyNarrowedPlacesBuilder<'db, 'a> {
     db: &'db dyn Db,
     places: &'a PlaceTableBuilder,

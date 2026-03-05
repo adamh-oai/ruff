@@ -242,6 +242,33 @@ def _(content: Text | Image):
             reveal_type(content)  # revealed: Image
 ```
 
+Enum-member discriminants are also valid tagged-union attributes:
+
+```py
+from enum import Enum
+from typing import Literal
+
+class Kind(Enum):
+    TEXT = 1
+    IMAGE = 2
+
+class Text:
+    kind: Literal[Kind.TEXT]
+    parts: list[str]
+
+class Image:
+    kind: Literal[Kind.IMAGE]
+    width: int
+
+def _(content: Text | Image):
+    match content.kind:
+        case Kind.TEXT:
+            reveal_type(content)  # revealed: Text
+            reveal_type(content.parts)  # revealed: list[str]
+        case _:
+            reveal_type(content)  # revealed: Image
+```
+
 ## Or patterns
 
 ```py
