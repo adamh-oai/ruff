@@ -2242,6 +2242,21 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 return self.infer_map_impl(formal, actual_instance, polarity, f, seen);
             }
 
+            (formal @ Type::ProtocolInstance(_), Type::ProtocolInstance(_)) => {
+                // Keep protocol actuals on the structural path so protocol members that use
+                // `Self` still participate in constraint-set inference.
+                let when =
+                    actual.when_constraint_set_assignable_to(self.db, formal, constraints, self.inferable);
+                // For protocol inference via constraint sets, we currently treat
+                // unsatisfiable results as "no inference" instead of an immediate
+                // specialization error. This matches the previous behavior (where
+                // unsatisfied comparisons simply produced no type mappings), and avoids
+                // false positives for callable-wrapper patterns while this path is still
+                // a hybrid of old and new solver logic.
+                let _ = self.add_type_mappings_from_constraint_set(formal, when, &mut f);
+                return Ok(());
+            }
+
             (formal, Type::ProtocolInstance(actual_protocol)) => {
                 // TODO: This will only handle protocol classes that explicit inherit
                 // from other generic protocol classes by listing it as a base class.
