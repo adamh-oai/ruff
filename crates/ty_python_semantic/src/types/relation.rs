@@ -923,19 +923,15 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             (Type::KnownInstance(KnownInstanceType::Field(field)), _)
                 if self.relation.is_assignability() =>
             {
-                field
-                    .default_type(db)
-                    .when_none_or(db, self.constraints, |default_type| {
-                        self.check_type_pair(db, default_type, target)
-                    })
-                    .and(db, self.constraints, || {
-                        field
-                            .converter(db)
-                            .map(|(_, output_ty)| output_ty)
-                            .when_none_or(db, self.constraints, |converter_output_type| {
-                                self.check_type_pair(db, converter_output_type, target)
-                            })
-                    })
+                if let Some((_, converter_output_type)) = field.converter(db) {
+                    self.check_type_pair(db, converter_output_type, target)
+                } else {
+                    field
+                        .default_type(db)
+                        .when_none_or(db, self.constraints, |default_type| {
+                            self.check_type_pair(db, default_type, target)
+                        })
+                }
             }
 
             // Dynamic is only a subtype of `object` and only a supertype of `Never`; both were

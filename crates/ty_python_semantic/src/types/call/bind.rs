@@ -1480,26 +1480,28 @@ impl<'db> Bindings<'db> {
                     function @ Type::FunctionLiteral(_)
                         if dataclass_field_specifiers.contains(&function) =>
                     {
-                        // Helper to get the type of a keyword argument by name. We first try to get it from
-                        // the parameter binding (for explicit parameters), and then fall back to checking the
-                        // call site arguments (for field-specifier functions that use a `**kwargs` parameter,
-                        // instead of specifying `init`, `default` etc. explicitly).
+                        // Helper to get the type of a field-specifier argument by name. Prefer an explicit
+                        // keyword argument at the call site, because overload binding can lose literal metadata
+                        // for field-specifier keywords that are also accepted by `**kwargs`-style overloads.
+                        // Fall back to the bound parameter type so positional `default` / `default_factory`
+                        // arguments still work.
                         let get_argument_type = |name, fallback_to_default| -> Option<Type<'db>> {
-                            if let Ok(ty) =
-                                overload.parameter_type_by_name(name, fallback_to_default)
-                            {
-                                return ty;
-                            }
-                            call_arguments.iter().find_map(|(arg, types)| {
+                            if let Some(ty) = call_arguments.iter().find_map(|(arg, types)| {
                                 if matches!(arg, Argument::Keyword(arg_name) if arg_name == name) {
                                     types.get_default()
                                 } else {
                                     None
                                 }
-                            })
+                            }) {
+                                return Some(ty);
+                            }
+                            overload
+                                .parameter_type_by_name(name, fallback_to_default)
+                                .unwrap_or(None)
                         };
 
-                        let has_default_value = get_argument_type("default", false).is_some()
+                        let explicit_default_ty = get_argument_type("default", false);
+                        let has_default_value = explicit_default_ty.is_some()
                             || get_argument_type("default_factory", false).is_some()
                             || get_argument_type("factory", false).is_some();
 
@@ -1514,7 +1516,13 @@ impl<'db> Bindings<'db> {
                         // instance, even if this is not what happens at runtime (see also below).
                         // We still make use of this fact and pretend that all field specifiers
                         // return the type of the default value:
-                        let default_ty = if has_default_value {
+                        let default_ty = if let Some(default_ty) = explicit_default_ty {
+                            if default_ty.is_instance_of(db, KnownClass::EllipsisType) {
+                                Some(overload.return_ty)
+                            } else {
+                                Some(default_ty.promote(db))
+                            }
+                        } else if has_default_value {
                             Some(overload.return_ty)
                         } else {
                             None

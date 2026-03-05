@@ -1040,7 +1040,7 @@ class Person:
     email: str = field(kw_only=True)
     internal_notes: str = field(alias="notes", default="")
 
-# revealed: (self: Person, name: str, age: int = ..., tags: list[str] = ..., notes: str = ..., *, email: str) -> None
+# revealed: (self: Person, name: str, age: int = 0, tags: list[str] = ..., notes: str = "", *, email: str) -> None
 reveal_type(Person.__init__)
 
 Person("Alice", 30, [], "some notes", email="alice@example.com")
@@ -1068,7 +1068,7 @@ class Person(ModelBase):
     email: str = field(kw_only=True)
     internal_notes: str = field(alias="notes", default="")
 
-# revealed: (self: Person, name: str, age: int = ..., tags: list[str] = ..., notes: str = ..., *, email: str) -> None
+# revealed: (self: Person, name: str, age: int = 0, tags: list[str] = ..., notes: str = "", *, email: str) -> None
 reveal_type(Person.__init__)
 
 Person("Alice", 30, [], "some notes", email="alice@example.com")
@@ -1094,7 +1094,7 @@ class Person(ModelBase):
     email: str = field(kw_only=True)
     internal_notes: str = field(alias="notes", default="")
 
-# revealed: (self: Person, name: str, age: int = ..., tags: list[str] = ..., notes: str = ..., *, email: str) -> None
+# revealed: (self: Person, name: str, age: int = 0, tags: list[str] = ..., notes: str = "", *, email: str) -> None
 reveal_type(Person.__init__)
 
 Person("Alice", 30, [], "some notes", email="alice@example.com")
@@ -1175,6 +1175,32 @@ class Person:
     age: int | None = fancy_field(kw_only=True)
 
 reveal_type(Person.__init__)  # revealed: (self: Person, name: str, *, age: int | None) -> None
+```
+
+### With overloaded field specifiers that also accept `**kwargs`
+
+Literal alias metadata should still be preserved when an overloaded field specifier accepts
+additional keyword arguments.
+
+```py
+from typing import overload
+from typing_extensions import dataclass_transform, Any
+
+@overload
+def fancy_field(*, alias: str | None = None, **kwargs: Any) -> Any: ...
+@overload
+def fancy_field(default: object, *, alias: str | None = None, **kwargs: Any) -> Any: ...
+def fancy_field(default: object = ..., *, alias: str | None = None, **kwargs: Any) -> Any: ...
+
+@dataclass_transform(field_specifiers=(fancy_field,))
+class FancyBase: ...
+
+class Person(FancyBase):
+    internal_name: str | None = fancy_field(default=None, alias="name")
+
+reveal_type(Person.__init__)  # revealed: (self: Person, name: str | None = None) -> None
+
+Person(name="Alice")
 ```
 
 ### Converter field specifier with overloaded callables
@@ -1859,7 +1885,7 @@ class Basic:
     a: int = field(converter=str_to_int)
     b: int = field(converter=str_to_int, default="0")
 
-reveal_type(Basic.__init__)  # revealed: (self: Basic, a: str, b: str = ...) -> None
+reveal_type(Basic.__init__)  # revealed: (self: Basic, a: str, b: str = "0") -> None
 
 Basic("1", "2")
 Basic("1")
@@ -2073,7 +2099,7 @@ class ConverterWithDefault:
     # error: [invalid-argument-type]
     incorrect1: int = field(converter=str_to_int, default=0)
 
-    # TODO: this should be an error
+    # error: [invalid-assignment]
     incorrect2: int = field(default="0")
 ```
 

@@ -74,6 +74,21 @@ User()
 User(name="alice", extra=1)
 ```
 
+## `Field` alias with a default value
+
+Alias-based constructor synthesis should also work on the defaulted `Field(...)` overloads:
+
+```py
+from pydantic import BaseModel, Field
+
+class Result(BaseModel):
+    meta: dict[str, object] | None = Field(alias="_meta", default=None)
+
+reveal_type(Result.__init__)  # revealed: (self: Result, *, _meta: dict[str, object] | None = None) -> None
+
+Result(_meta=None)
+```
+
 ## Validator and serializer decorators with explicit `@classmethod`
 
 Pydantic [recommends](https://docs.pydantic.dev/latest/concepts/validators/#class-validators) using

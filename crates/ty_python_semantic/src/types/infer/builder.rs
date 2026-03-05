@@ -4003,11 +4003,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // the definition of `OptionalList` as the binding context while inferring the
             // RHS (`list[T] | None`), in order to bind `T` to `OptionalList`.
             let previous_typevar_binding_context = self.typevar_binding_context.replace(definition);
+            let dataclass_field_specifiers_active = !self.dataclass_field_specifiers.is_empty();
 
-            let inferred_ty = self.infer_maybe_standalone_expression(
+            let mut inferred_ty = self.infer_maybe_standalone_expression(
                 value,
                 TypeContext::new(Some(declared.inner_type())),
             );
+            if dataclass_field_specifiers_active
+                && inferred_ty.is_unknown()
+                && let Some(standalone_expression) = self.index.try_expression(value)
+            {
+                inferred_ty = infer_expression_types(
+                    self.db(),
+                    standalone_expression,
+                    TypeContext::default(),
+                )
+                .expression_type(value);
+            }
 
             self.typevar_binding_context = previous_typevar_binding_context;
 
