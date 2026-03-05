@@ -118,6 +118,25 @@ reveal_type(data.content)  # revealed: list[int]
 reveal_type(data.timestamp)  # revealed: datetime
 ```
 
+## Literal defaults stay precise in field metadata
+
+Literal defaults on field specifiers should remain literal-valued so they can satisfy literal-union
+annotations:
+
+```py
+from dataclasses import dataclass, field
+from typing import Literal
+
+@dataclass
+class Card:
+    header_image_type: Literal["ai", "image_search"] = field(default="ai")
+
+reveal_type(Card.__init__)  # revealed: (self: Card, header_image_type: Literal["ai", "image_search"] = "ai") -> None
+
+card = Card()
+reveal_type(card.header_image_type)  # revealed: Literal["ai", "image_search"]
+```
+
 ## `kw_only`
 
 ```toml

@@ -89,10 +89,29 @@ reveal_type(Result.__init__)  # revealed: (self: Result, *, _meta: dict[str, obj
 Result(_meta=None)
 ```
 
+## `Field` literal defaults should satisfy literal-union annotations
+
+Explicit literal defaults should remain precise when Pydantic `Field(...)` is used as a field
+specifier:
+
+```py
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+class Card(BaseModel):
+    header_image_type: Literal["ai", "image_search"] = Field(default="ai")
+
+reveal_type(Card.__init__)  # revealed: (self: Card, *, header_image_type: Literal["ai", "image_search"] = "ai") -> None
+
+card = Card()
+reveal_type(card.header_image_type)  # revealed: Literal["ai", "image_search"]
+```
+
 ## Discriminated unions with enum-member tags
 
-Enum-valued discriminators should narrow the containing Pydantic union just like
-string-valued discriminators:
+Enum-valued discriminators should narrow the containing Pydantic union just like string-valued
+discriminators:
 
 ```py
 from enum import Enum

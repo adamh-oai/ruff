@@ -1520,7 +1520,7 @@ impl<'db> Bindings<'db> {
                             if default_ty.is_instance_of(db, KnownClass::EllipsisType) {
                                 Some(overload.return_ty)
                             } else {
-                                Some(default_ty.promote(db))
+                                Some(default_ty)
                             }
                         } else if has_default_value {
                             Some(overload.return_ty)
