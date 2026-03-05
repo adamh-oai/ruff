@@ -890,7 +890,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     | KnownInstanceType::Annotated(_)
                     | KnownInstanceType::TypeGenericAlias(_)
                     | KnownInstanceType::Callable(_)
-                    | KnownInstanceType::TypeVar(_),
+                    | KnownInstanceType::TypeVar(_)
+                    | KnownInstanceType::NewType(_),
                 ),
                 Type::ClassLiteral(..)
                 | Type::SubclassOf(..)
@@ -902,7 +903,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     | KnownInstanceType::Annotated(_)
                     | KnownInstanceType::TypeGenericAlias(_)
                     | KnownInstanceType::Callable(_)
-                    | KnownInstanceType::TypeVar(_),
+                    | KnownInstanceType::TypeVar(_)
+                    | KnownInstanceType::NewType(_),
                 ),
                 ast::Operator::BitOr,
             ) if pep_604_unions_allowed() => {

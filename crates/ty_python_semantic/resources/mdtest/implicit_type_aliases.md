@@ -217,6 +217,20 @@ def _(int_or_int: IntOrInt, list_of_int_or_list_of_int: ListOfIntOrListOfInt):
 None | None  # error: [unsupported-operator] "Operator `|` is not supported between two objects of type `None`"
 ```
 
+Implicit aliases should also work when one union member is a `NewType` pseudo-class:
+
+```py
+from typing import NewType
+
+Foo = NewType("Foo", int)
+FooOrStr = Foo | str
+
+reveal_type(FooOrStr)  # revealed: <types.UnionType special-form 'Foo | str'>
+
+def _(x: FooOrStr):
+    reveal_type(x)  # revealed: Foo | str
+```
+
 When constructing something nonsensical like `int | 1`, we emit a diagnostic for the expression
 itself, as it leads to a `TypeError` at runtime. The result of the expression is then inferred as
 `Unknown`, so we permit it to be used in a type expression.
