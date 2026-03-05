@@ -2246,7 +2246,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 // Keep protocol actuals on the structural path so protocol members that use
                 // `Self` still participate in constraint-set inference.
                 let when =
-                    actual.when_constraint_set_assignable_to(self.db, formal, constraints, self.inferable);
+                    actual.when_constraint_set_assignable_to(self.db, formal, self.constraints);
                 // For protocol inference via constraint sets, we currently treat
                 // unsatisfiable results as "no inference" instead of an immediate
                 // specialization error. This matches the previous behavior (where

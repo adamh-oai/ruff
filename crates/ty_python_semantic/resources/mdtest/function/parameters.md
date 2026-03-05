@@ -6,7 +6,8 @@ is no annotation, it is the union of `Unknown` with the type of the default valu
 any).
 
 The variadic parameter is a variadic tuple of its annotated type; the variadic-keywords parameter is
-a dictionary from strings to its annotated type.
+usually a dictionary from strings to its annotated type, except for special cases like `P.kwargs`
+and `Unpack[TypedDict]`.
 
 ## Parameter kinds
 
@@ -34,6 +35,23 @@ def f(a, b: int, c=1, d: int = 2, /, e=3, f: Literal[4] = 4, *args: object, g=5,
 def g(*args, **kwargs):
     reveal_type(args)  # revealed: tuple[Unknown, ...]
     reveal_type(kwargs)  # revealed: dict[str, Unknown]
+```
+
+## `Unpack[TypedDict]` for `**kwargs`
+
+`PEP 692` uses `Unpack[TypedDict]` to describe keyword names in a function signature. Inside the
+function body, the `**kwargs` symbol should keep the inner `TypedDict` type.
+
+```py
+from typing_extensions import TypedDict, Unpack
+
+class Params(TypedDict, total=False):
+    timeout: float
+
+def takes_params(params: Params) -> None: ...
+def f(**kwargs: Unpack[Params]) -> None:
+    reveal_type(kwargs)  # revealed: Params
+    takes_params(kwargs)
 ```
 
 ## Annotation is present but not a fully static type

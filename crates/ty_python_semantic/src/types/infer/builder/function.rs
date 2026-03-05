@@ -2,8 +2,8 @@ use crate::{
     Db,
     reachability::ReachabilityConstraintsExtension,
     types::{
-        KnownClass, KnownInstanceType, ParamSpecAttrKind, SubclassOfInner, SubclassOfType, Type,
-        TypeContext, UnionType,
+        KnownClass, KnownInstanceType, ParamSpecAttrKind, SpecialFormType, SubclassOfInner,
+        SubclassOfType, Type, TypeContext, UnionType,
         context::InNoTypeCheck,
         diagnostic::{
             FINAL_ON_NON_METHOD, INVALID_PARAMETER_DEFAULT, INVALID_PARAMSPEC, INVALID_TYPE_FORM,
@@ -861,7 +861,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         if let Some(annotation) = parameter.annotation() {
             let annotated_type = self.file_expression_type(annotation);
-            let ty = if let Type::TypeVar(typevar) = annotated_type
+            let ty = if let Some(unpacked_typed_dict) =
+                self.keyword_variadic_unpacked_typed_dict_annotation_type(annotation)
+            {
+                unpacked_typed_dict
+            } else if let Type::TypeVar(typevar) = annotated_type
                 && typevar.is_paramspec(db)
             {
                 match typevar.paramspec_attr(db) {
@@ -912,5 +916,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.add_binding(parameter.into(), definition)
                 .insert(self, inferred_ty);
         }
+    }
+
+    fn keyword_variadic_unpacked_typed_dict_annotation_type(
+        &self,
+        annotation: &ast::Expr,
+    ) -> Option<Type<'db>> {
+        let ast::Expr::Subscript(ast::ExprSubscript { value, slice, .. }) = annotation else {
+            return None;
+        };
+
+        if self.file_expression_type(value) != Type::SpecialForm(SpecialFormType::Unpack) {
+            return None;
+        }
+
+        let inner_type = self.file_expression_type(slice);
+        inner_type.is_typed_dict().then_some(inner_type)
     }
 }
