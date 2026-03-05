@@ -1181,7 +1181,7 @@ def _(x1: int, x2: int, kwargs: dict[str, int]):
     reveal_type(f(x1=x1, x2=x2))  # revealed: tuple[int, int]
 
     # Step 4 should filter out all but the last overload.
-    reveal_type(f(**{"x1": x1, "x2": x2}))  # revealed: int
+    reveal_type(f(**{"x1": x1, "x2": x2}))  # revealed: tuple[int, int]
     reveal_type(f(**kwargs))  # revealed: int
 ```
 

@@ -4,7 +4,7 @@ use std::rc::Rc;
 use itertools::Itertools;
 use ruff_db::diagnostic::{Annotation, DiagnosticId, Severity};
 use ruff_db::files::File;
-use ruff_db::parsed::ParsedModuleRef;
+use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_db::source::source_text;
 use ruff_python_ast::helpers::is_dotted_name;
 use ruff_python_ast::name::Name;
@@ -83,6 +83,9 @@ use crate::types::special_form::TypeQualifier;
 use crate::types::subclass_of::SubclassOfInner;
 use crate::types::tuple::{Tuple, TupleLength, TupleSpecBuilder, TupleType};
 use crate::types::type_alias::{ManualPEP695TypeAliasType, PEP695TypeAliasType};
+use crate::types::typed_dict::{
+    SynthesizedTypedDictKind, SynthesizedTypedDictType, TypedDictFieldBuilder, TypedDictSchema,
+};
 use crate::types::typevar::{BoundTypeVarIdentity, TypeVarConstraints, TypeVarIdentity};
 use crate::types::{
     CallDunderError, CallableBinding, CallableType, CallableTypes, ClassType, DynamicType,
@@ -91,7 +94,8 @@ use crate::types::{
     ParamSpecAttrKind, Parameter, ParameterForm, Parameters, Signature, SpecialFormType,
     SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeQualifiers,
     TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypedDictType, UnionBuilder,
-    UnionType, binding_type, infer_complete_scope_types, infer_scope_types, todo_type,
+    UnionType, binding_type, definition_expression_type, infer_complete_scope_types,
+    infer_scope_types, todo_type,
 };
 use crate::{AnalysisSettings, Db, FxIndexSet, Program};
 use ty_python_core::ExpressionNodeKey;
@@ -109,7 +113,7 @@ use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, NodeWithScopeRef, Sc
 use ty_python_core::symbol::{ScopedSymbolId, Symbol};
 use ty_python_core::{
     ApplicableConstraints, EnclosingSnapshotResult, EvaluationMode, SemanticIndex, Truthiness,
-    place_table, unpack::UnpackPosition,
+    place_table, semantic_index, unpack::UnpackPosition,
 };
 
 mod annotation_expression;
@@ -5764,6 +5768,159 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             })
     }
 
+    fn infer_keywords_argument_type(&mut self, expr: &ast::Expr) -> Type<'db> {
+        let ty = self.infer_expression(expr, TypeContext::default());
+
+        self.try_synthesize_kwargs_typed_dict(expr, None, &mut FxHashSet::default())
+            .map(Type::TypedDict)
+            .unwrap_or(ty)
+    }
+
+    fn try_synthesize_kwargs_typed_dict(
+        &mut self,
+        expr: &ast::Expr,
+        definition: Option<Definition<'db>>,
+        seen_definitions: &mut FxHashSet<Definition<'db>>,
+    ) -> Option<TypedDictType<'db>> {
+        match expr {
+            ast::Expr::Dict(dict) => {
+                let schema = self.try_synthesize_kwargs_schema_from_dict(
+                    dict,
+                    definition,
+                    seen_definitions,
+                )?;
+                Some(TypedDictType::Synthesized(SynthesizedTypedDictType::new(
+                    self.db(),
+                    schema,
+                    SynthesizedTypedDictKind::Schema,
+                )))
+            }
+            ast::Expr::Name(name) => {
+                let db = self.db();
+                let (file, file_scope, use_id) = if let Some(definition) = definition {
+                    let file = definition.file(db);
+                    let index = semantic_index(db, file);
+                    let file_scope = index.expression_scope_id(expr);
+                    let scope = file_scope.to_scope_id(db, file);
+                    (file, file_scope, name.scoped_use_id(db, scope))
+                } else {
+                    let file_scope = self.scope().file_scope_id(db);
+                    (
+                        self.file(),
+                        file_scope,
+                        name.scoped_use_id(db, self.scope()),
+                    )
+                };
+
+                self.try_synthesize_kwargs_typed_dict_from_use(
+                    file,
+                    file_scope,
+                    use_id,
+                    seen_definitions,
+                )
+            }
+            ast::Expr::Named(named) => {
+                self.try_synthesize_kwargs_typed_dict(&named.value, definition, seen_definitions)
+            }
+            _ => None,
+        }
+    }
+
+    fn try_synthesize_kwargs_typed_dict_from_use(
+        &mut self,
+        file: File,
+        file_scope: FileScopeId,
+        use_id: ScopedUseId,
+        seen_definitions: &mut FxHashSet<Definition<'db>>,
+    ) -> Option<TypedDictType<'db>> {
+        let mut definitions = vec![];
+        let use_def = if file == self.file() {
+            self.index.use_def_map(file_scope)
+        } else {
+            semantic_index(self.db(), file).use_def_map(file_scope)
+        };
+        for binding in use_def.bindings_at_use(use_id) {
+            let definition = binding.binding.definition()?;
+            if !definitions.contains(&definition) {
+                definitions.push(definition);
+            }
+        }
+
+        let [definition] = definitions.as_slice() else {
+            return None;
+        };
+
+        if !seen_definitions.insert(*definition) {
+            return None;
+        }
+
+        let module = parsed_module(self.db(), definition.file(self.db())).load(self.db());
+        let result = match definition.kind(self.db()) {
+            DefinitionKind::Assignment(assignment) => {
+                let value = assignment.value(&module);
+                self.try_synthesize_kwargs_typed_dict(value, Some(*definition), seen_definitions)
+            }
+            DefinitionKind::AnnotatedAssignment(assignment) => {
+                let value = assignment.value(&module)?;
+                self.try_synthesize_kwargs_typed_dict(value, Some(*definition), seen_definitions)
+            }
+            DefinitionKind::NamedExpression(named) => {
+                let value = &named.node(&module).value;
+                self.try_synthesize_kwargs_typed_dict(value, Some(*definition), seen_definitions)
+            }
+            _ => None,
+        };
+        seen_definitions.remove(definition);
+        result
+    }
+
+    fn try_synthesize_kwargs_schema_from_dict(
+        &mut self,
+        dict: &ast::ExprDict,
+        definition: Option<Definition<'db>>,
+        seen_definitions: &mut FxHashSet<Definition<'db>>,
+    ) -> Option<TypedDictSchema<'db>> {
+        let db = self.db();
+        let mut schema = TypedDictSchema::default();
+
+        for item in &dict.items {
+            if let Some(key_expr) = item.key.as_ref() {
+                let key = self
+                    .kwargs_expression_type(key_expr, definition)
+                    .as_string_literal()?;
+                let key = Name::new(key.value(db));
+                let value_ty = self.kwargs_expression_type(&item.value, definition);
+                schema.insert(
+                    key,
+                    TypedDictFieldBuilder::new(value_ty).required(true).build(),
+                );
+            } else {
+                let nested = self
+                    .try_synthesize_kwargs_typed_dict(&item.value, definition, seen_definitions)
+                    .or_else(|| {
+                        self.kwargs_expression_type(&item.value, definition)
+                            .as_typed_dict()
+                    })?;
+                for (name, field) in nested.items(db) {
+                    schema.insert(name.clone(), field.clone());
+                }
+            }
+        }
+
+        Some(schema)
+    }
+
+    fn kwargs_expression_type(
+        &self,
+        expression: &ast::Expr,
+        definition: Option<Definition<'db>>,
+    ) -> Type<'db> {
+        definition.map_or_else(
+            || self.expression_type(expression),
+            |definition| definition_expression_type(self.db(), definition, expression),
+        )
+    }
+
     // Infer the type of a collection literal expression.
     fn infer_collection_literal<'expr, const N: usize>(
         &mut self,
@@ -6763,7 +6920,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> CallArguments<'a, 'db> {
         let call_arguments =
             CallArguments::from_arguments(arguments, |arg_or_keyword, splatted_value| {
-                let ty = self.infer_expression(splatted_value, TypeContext::default());
+                let ty = if matches!(
+                    arg_or_keyword,
+                    ast::ArgOrKeyword::Keyword(ast::Keyword { arg: None, .. })
+                ) {
+                    self.infer_keywords_argument_type(splatted_value)
+                } else {
+                    self.infer_expression(splatted_value, TypeContext::default())
+                };
                 if let ast::ArgOrKeyword::Arg(argument) = arg_or_keyword
                     && argument.is_starred_expr()
                 {

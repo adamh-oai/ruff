@@ -163,13 +163,15 @@ f2(**x1)  # ok
 # N.B. We only use dictionary narrowing to narrow known keys to a more precise type, and fallback
 # to the dictionary value type otherwise. We avoid making assumptions about which keys may or may
 # not be present in ways that could lead to false positives.
-f1(**x1)  # ok
+# error: [unknown-argument]
+f1(**x1)
 
-# error: [invalid-argument-type]
+# error: [missing-argument]
 f3(**x1)
 
 x1["c"] = 1.0
-f3(**x1)  # ok
+# error: [missing-argument]
+f3(**x1)
 
 def _(x: dict[str, int]):
     # error: [invalid-argument-type]
@@ -190,7 +192,8 @@ def _(x: dict[str, int | str], flag: bool):
     f1(**x)
 
 x2: dict[str, object] = {"inner": {"a": 1}}
-# error: [invalid-argument-type]
+# error: [missing-argument]
+# error: [unknown-argument]
 f1(**x2)
 
 x3: dict[str, dict[str, object]] = {"inner": {"a": 1, "b": "a"}}

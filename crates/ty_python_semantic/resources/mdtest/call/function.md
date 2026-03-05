@@ -1240,6 +1240,20 @@ f(**dict(foo=1))
 f(**Foo(a=1, b=2))
 ```
 
+### Dict literal variables
+
+```py
+def f(*, a: int, b: str) -> None: ...
+
+def _() -> None:
+    kwargs = {"a": 1, "b": "x"}
+    f(**kwargs)
+
+    base = {"a": 1}
+    merged = {**base, "b": "x"}
+    f(**merged)
+```
+
 ### Positional-only and variadic parameters
 
 ```py

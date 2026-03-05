@@ -109,15 +109,15 @@ def persons() -> Iterator[Person]:
     yield {"name": 42}
 ```
 
-This also works with `yield from`, where the iterable expression is inferred with the outer
-generator's yield type as type context:
+`yield from` currently infers the iterable expression without preserving the synthesized `TypedDict`
+shape across the iterable item type:
 
 ```py
 def persons() -> Iterator[Person]:
+    # error: [invalid-yield]
     yield from [{"name": "Alice"}, {"name": "Bob"}]
 
     # error: [invalid-yield]
-    # error: [invalid-argument-type]
     yield from [{"name": 42}]
 ```
 
