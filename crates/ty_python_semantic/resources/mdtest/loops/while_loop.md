@@ -586,6 +586,42 @@ recovery logic doesn't carry that result forward.
 Addendum: #23563 fixed the implementation of `Type::cycle_normalized`, so that such "tainted
 previous values" are no longer unioned.
 
+### Loop header reachability cycle recovery is monotonic
+
+This is a minimized version of a real-world panic. The loop header sees loop-carried bindings for
+both `buffered_app_ids` and `peek_cursor`, and the two exit checks observe them in different orders.
+That should converge rather than panic:
+
+```py
+from typing import NamedTuple
+
+class Page(NamedTuple):
+    cursor: str | None
+    apps: list[str]
+
+def load(limit: int, cursor: str | None) -> Page:
+    return Page(None, [])
+
+def f() -> None:
+    buffered_app_ids: list[str] = []
+    next_cursor: str | None = None
+    peek_cursor: str | None = None
+    while True:
+        previous_peek_cursor = peek_cursor
+        page = load(1, peek_cursor)
+        next_cursor = page.cursor
+        buffered_app_ids = [app for app in page.apps]
+        if buffered_app_ids:
+            break
+        if next_cursor is None or next_cursor == previous_peek_cursor:
+            buffered_app_ids = []
+            break
+        peek_cursor = next_cursor
+
+    reveal_type(buffered_app_ids)  # revealed: list[str]
+    reveal_type(peek_cursor)  # revealed: None | str
+```
+
 ### `global` and `nonlocal` keywords in a loop
 
 We need to make sure that the loop header definition doesn't count as a "use" prior to the
