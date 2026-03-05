@@ -1452,7 +1452,10 @@ impl<'db> ClassType<'db> {
                 .own_class_member(db, inherited_generic_context, specialization, name)
                 .map_type(|ty| {
                     let ty = ty.apply_optional_specialization(db, specialization);
-                    if self.is_known(db, KnownClass::Dict)
+                    if self
+                        .iter_mro(db)
+                        .filter_map(ClassBase::into_class)
+                        .any(|class| class.is_known(db, KnownClass::Mapping))
                         && matches!(
                             specialization.map(|spec| spec.materialization_kind(db)),
                             Some(Some(MaterializationKind::Top))

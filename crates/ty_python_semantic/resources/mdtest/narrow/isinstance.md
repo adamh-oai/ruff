@@ -690,6 +690,15 @@ def _(x: object):
         reveal_type(x.get("a"))  # revealed: object
         reveal_type(x.get("a", 1))  # revealed: object
         reveal_type(x["a"])  # revealed: object
+
+from collections.abc import Mapping
+
+def _(x: object):
+    if isinstance(x, Mapping):
+        reveal_type(x)  # revealed: Top[Mapping[Unknown, object]]
+        reveal_type(x.get("a"))  # revealed: object
+        reveal_type(x.get("a", 1))  # revealed: object
+        reveal_type(x["a"])  # revealed: object
 ```
 
 When reading attributes from a top-materialized generic, only type parameters should be
