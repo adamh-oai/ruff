@@ -1656,6 +1656,27 @@ class C[T]:
     }
 
     #[test]
+    fn typevar_simple_assignment_rhs_is_not_standalone() {
+        let TestCase { db, file } = test_case(
+            r#"
+from typing import TypeVar
+
+T = TypeVar("T")
+x: list[T] = []
+"#,
+        );
+
+        let index = semantic_index(&db, file);
+        let module = parsed_module(&db, file).load(&db);
+        let assign = module.syntax().body[1].as_assign_stmt().unwrap();
+
+        assert!(
+            index.try_expression(&assign.value).is_none(),
+            "simple assignments must keep legacy TypeVar/NewType inference paths"
+        );
+    }
+
+    #[test]
     fn scope_iterators() {
         fn scope_names<'a, 'db>(
             scopes: impl Iterator<Item = (FileScopeId, &'db Scope)>,

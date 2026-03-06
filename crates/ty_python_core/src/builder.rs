@@ -1184,7 +1184,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         }
 
         // Control-flow tests are always inferred as standalone expressions, even when we later
-        // replay a predicate alias for narrowing.
+        // replay a predicate alias for narrowing. Predicate alias capture itself must not mark the
+        // source assignment RHS as standalone, because that changes simple-assignment inference.
         if track_expression {
             let _ = self.standalone_expression(predicate_node);
         }
@@ -1221,10 +1222,25 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         match resolve_to_literal(predicate_node) {
             Some(literal) => PredicateOrLiteral::Literal(literal),
             None => PredicateOrLiteral::Predicate(Predicate {
-                node: PredicateNode::Expression(self.standalone_expression(predicate_node)),
+                node: PredicateNode::Expression(if track_expression {
+                    self.standalone_expression(predicate_node)
+                } else {
+                    self.predicate_expression(predicate_node)
+                }),
                 is_positive: true,
             }),
         }
+    }
+
+    fn predicate_expression(&self, expression_node: &ast::Expr) -> Expression<'db> {
+        Expression::new(
+            self.db,
+            self.file,
+            self.current_scope(),
+            AstNodeRef::new(self.module, expression_node),
+            None,
+            ExpressionKind::Normal,
+        )
     }
 
     fn standalone_expression(&mut self, expression_node: &ast::Expr) -> Expression<'db> {
@@ -1241,7 +1257,26 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .collect()
     }
 
+    fn is_supported_predicate_alias_expr(expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Compare(_) => true,
+            ast::Expr::UnaryOp(ast::ExprUnaryOp {
+                op: ast::UnaryOp::Not,
+                operand,
+                ..
+            }) => Self::is_supported_predicate_alias_expr(operand),
+            ast::Expr::BoolOp(ast::ExprBoolOp { values, .. }) => values
+                .iter()
+                .all(|value| Self::is_supported_predicate_alias_expr(value)),
+            _ => false,
+        }
+    }
+
     fn try_build_predicate_alias(&mut self, value: &ast::Expr) -> Option<PredicateAlias<'db>> {
+        if !Self::is_supported_predicate_alias_expr(value) {
+            return None;
+        }
+
         let predicate = self.build_predicate_without_alias_resolution(value);
         let captured_places = self.compute_possibly_narrowed_places(&predicate);
         if captured_places.is_empty() {

@@ -118,3 +118,14 @@ def _(flag: bool):
     if x_set:
         reveal_type(x)  # revealed: None
 ```
+
+## Plain value aliases still narrow themselves
+
+```py
+def _(x: str | None):
+    y = x
+
+    if y:
+        reveal_type(y)  # revealed: str & ~AlwaysFalsy
+        reveal_type(x)  # revealed: str | None
+```
