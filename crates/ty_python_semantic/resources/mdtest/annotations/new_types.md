@@ -468,7 +468,7 @@ UnaryNT = NewType("UnaryNT", Unary)
 reveal_type(-UnaryNT(Unary()))  # revealed: str
 +UnaryNT(Unary())  # error: [unsupported-operator]
 reveal_type(~UnaryNT(Unary()))  # revealed: list[int]
-reveal_type(not UnaryNT(Unary()))  # revealed: bool
+reveal_type(not UnaryNT(Unary()))  # revealed: Literal[False]
 ```
 
 Make sure we handle the case where a `NewType` of `float` or `complex` participates in a larger

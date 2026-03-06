@@ -192,6 +192,10 @@ class VariadicTupleSubclass(tuple[int, ...]): ...
 def f(x: tuple[int, ...], y: VariadicTupleSubclass):
     reveal_type(bool(x))  # revealed: bool
 
+class PlainInstance: ...
+
+reveal_type(bool(PlainInstance()))  # revealed: Literal[True]
+
 class NonFinalOverridingLenAndNotBool:
     def __len__(self) -> Literal[42]:
         return 42

@@ -141,11 +141,10 @@ class AlwaysFalse:
 # revealed: Literal[True]
 reveal_type(not AlwaysFalse())
 
-# At runtime, no `__bool__` and no `__len__` means truthy, but we can't rely on that, because
-# a subclass could add a `__bool__` method.
+# At runtime, no `__bool__` and no `__len__` means truthy.
 class NoBoolMethod: ...
 
-# revealed: bool
+# revealed: Literal[False]
 reveal_type(not NoBoolMethod())
 
 # And we can't rely on `__len__` for the same reason: a subclass could add `__bool__`.

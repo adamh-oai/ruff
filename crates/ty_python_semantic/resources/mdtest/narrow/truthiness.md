@@ -97,9 +97,9 @@ else:
 
 ### Truthiness of Instances
 
-The boolean value of an instance is not always consistent. For example, `__bool__` can be customized
-to return random values, or in the case of a `list()`, the result depends on the number of elements
-in the list. Therefore, these types should not be narrowed by `if x` or `if not x`.
+For user-defined instances that define neither `__bool__` nor `__len__`, ty treats the instance as
+truthy. This is a heuristic that ignores hypothetical subclass overrides. Instances with explicit
+truthiness hooks, and mutable builtins like `list`, still require conservative handling.
 
 ```py
 class A: ...
@@ -107,19 +107,19 @@ class B: ...
 
 def f(x: A | B):
     if x:
-        reveal_type(x)  # revealed: (A & ~AlwaysFalsy) | (B & ~AlwaysFalsy)
+        reveal_type(x)  # revealed: A | B
     else:
-        reveal_type(x)  # revealed: (A & ~AlwaysTruthy) | (B & ~AlwaysTruthy)
+        reveal_type(x)  # revealed: Never
 
     if x and not x:
-        reveal_type(x)  # revealed: (A & ~AlwaysFalsy & ~AlwaysTruthy) | (B & ~AlwaysFalsy & ~AlwaysTruthy)
+        reveal_type(x)  # revealed: Never
     else:
         reveal_type(x)  # revealed: A | B
 
     if x or not x:
         reveal_type(x)  # revealed: A | B
     else:
-        reveal_type(x)  # revealed: (A & ~AlwaysTruthy & ~AlwaysFalsy) | (B & ~AlwaysTruthy & ~AlwaysFalsy)
+        reveal_type(x)  # revealed: Never
 ```
 
 ### Truthiness of Types
@@ -204,9 +204,9 @@ if isinstance(x, str) and not isinstance(x, B):
     reveal_type(z)  # revealed: (A & str & ~B) | Literal[0, 42, "", "hello"]
 
     if z:
-        reveal_type(z)  # revealed: (A & str & ~B & ~AlwaysFalsy) | Literal[42, "hello"]
+        reveal_type(z)  # revealed: (A & str & ~B) | Literal[42, "hello"]
     else:
-        reveal_type(z)  # revealed: (A & str & ~B & ~AlwaysTruthy) | Literal[0, ""]
+        reveal_type(z)  # revealed: Literal[0, ""]
 ```
 
 ## Narrowing Multiple Variables
@@ -244,7 +244,7 @@ x = A()
 
 if x and not x:
     y = x
-    reveal_type(y)  # revealed: A & ~AlwaysFalsy & ~AlwaysTruthy
+    reveal_type(y)  # revealed: Never
 else:
     y = x
     reveal_type(y)  # revealed: A

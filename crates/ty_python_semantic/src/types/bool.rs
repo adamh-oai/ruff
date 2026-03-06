@@ -97,8 +97,11 @@ impl<'db> Type<'db> {
 
                 Err(CallDunderError::MethodNotAvailable) => {
                     // We only consider `__len__` for tuples and `@final` types,
-                    // since `__bool__` takes precedence
-                    // and a subclass could add a `__bool__` method.
+                    // since `__bool__` takes precedence and a subclass could add
+                    // either `__bool__` or `__len__`. For non-final classes, if
+                    // neither dunder is present on the concrete class, treat the
+                    // instance as always truthy rather than conservatively modeling
+                    // hypothetical subclass overrides.
                     //
                     // TODO: with regards to tuple types, we intend to emit a diagnostic
                     // if a tuple subclass defines a `__bool__` method with a return type
@@ -127,7 +130,8 @@ impl<'db> Type<'db> {
                                         Ok(Truthiness::Ambiguous)
                                     }
                                 }
-                                // if a `@final` type does not define `__bool__` or `__len__`, it is always truthy
+                                // If a type does not define either `__bool__` or `__len__`,
+                                // treat its instances as always truthy.
                                 Err(CallDunderError::MethodNotAvailable) => {
                                     Ok(Truthiness::AlwaysTrue)
                                 }
@@ -136,7 +140,17 @@ impl<'db> Type<'db> {
                                 Err(_) => Ok(Truthiness::Ambiguous),
                             }
                         } else {
-                            Ok(Truthiness::Ambiguous)
+                            match self.try_call_dunder(
+                                db,
+                                "__len__",
+                                CallArguments::none(),
+                                TypeContext::default(),
+                            ) {
+                                Err(CallDunderError::MethodNotAvailable) => {
+                                    Ok(Truthiness::AlwaysTrue)
+                                }
+                                _ => Ok(Truthiness::Ambiguous),
+                            }
                         }
                     } else {
                         Ok(Truthiness::Ambiguous)

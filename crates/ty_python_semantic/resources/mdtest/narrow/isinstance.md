@@ -498,22 +498,22 @@ def f(
     if isinstance(a, bool):
         reveal_type(a)  # revealed: Never
     else:
-        reveal_type(a)  # revealed: P & AlwaysTruthy
+        reveal_type(a)  # revealed: P
 
     if isinstance(b, bool):
         reveal_type(b)  # revealed: Never
     else:
-        reveal_type(b)  # revealed: P & AlwaysFalsy
+        reveal_type(b)  # revealed: Never
 
     if isinstance(c, bool):
         reveal_type(c)  # revealed: Never
     else:
-        reveal_type(c)  # revealed: P & ~AlwaysTruthy
+        reveal_type(c)  # revealed: Never
 
     if isinstance(d, bool):
         reveal_type(d)  # revealed: Never
     else:
-        reveal_type(d)  # revealed: P & ~AlwaysFalsy
+        reveal_type(d)  # revealed: Never
 ```
 
 ## Narrowing if an object of type `Any` or `Unknown` is used as the second argument

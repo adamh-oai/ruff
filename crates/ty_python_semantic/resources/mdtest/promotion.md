@@ -183,9 +183,9 @@ class Consumer(Generic[T_contra]): ...
 class Producer(Generic[T_co]): ...
 
 def _(c: Consumer[Intersection[A, Not[AlwaysFalsy]]], p: Producer[Intersection[A, Not[AlwaysFalsy]]]):
-    reveal_type(c)  # revealed: Consumer[A & ~AlwaysFalsy]
-    reveal_type(p)  # revealed: Producer[A & ~AlwaysFalsy]
-    reveal_type([c])  # revealed: list[Consumer[A & ~AlwaysFalsy]]
+    reveal_type(c)  # revealed: Consumer[A]
+    reveal_type(p)  # revealed: Producer[A]
+    reveal_type([c])  # revealed: list[Consumer[A]]
     reveal_type([p])  # revealed: list[Producer[A]]
 ```
 
@@ -246,7 +246,7 @@ x11: list[Literal[1] | Literal[2] | Literal[3]] = [1, 2, 3]
 reveal_type(x11)  # revealed: list[Literal[1, 2, 3]]
 
 x12: Y[Y[Literal[1]]] = [[1]]
-reveal_type(x12)  # revealed: list[list[Literal[1]]]
+reveal_type(x12)  # revealed: list[Y[Literal[1]] | list[Literal[1]]]
 
 x13: list[tuple[Literal[1], Literal[2], Literal[3]]] = [(1, 2, 3)]
 reveal_type(x13)  # revealed: list[tuple[Literal[1], Literal[2], Literal[3]]]
@@ -303,19 +303,19 @@ Literal annotations are respected even if the inferred type is a subtype of the 
 ```py
 from typing import Any, Iterable, Literal, MutableSequence, Sequence
 
-x1: Sequence[Literal[1, 2, 3]] = [1, 2, 3]
-reveal_type(x1)  # revealed: list[Literal[1, 2, 3]]
+x1: Sequence[Literal[1, 2, 3]] = [1, 2, 3]  # error: [invalid-assignment]
+reveal_type(x1)  # revealed: Sequence[Literal[1, 2, 3]]
 
 x2: MutableSequence[Literal[1, 2, 3]] = [1, 2, 3]
 reveal_type(x2)  # revealed: list[Literal[1, 2, 3]]
 
-x3: Iterable[Literal[1, 2, 3]] = [1, 2, 3]
-reveal_type(x3)  # revealed: list[Literal[1, 2, 3]]
+x3: Iterable[Literal[1, 2, 3]] = [1, 2, 3]  # error: [invalid-assignment]
+reveal_type(x3)  # revealed: Iterable[Literal[1, 2, 3]]
 
-x4: Iterable[Literal[1, 2, 3]] = list([1, 2, 3])
-reveal_type(x4)  # revealed: list[Literal[1, 2, 3]]
+x4: Iterable[Literal[1, 2, 3]] = list([1, 2, 3])  # error: [invalid-assignment]
+reveal_type(x4)  # revealed: Iterable[Literal[1, 2, 3]]
 
-x5: frozenset[Literal[1]] = frozenset([1])
+x5: frozenset[Literal[1]] = frozenset([1])  # error: [invalid-assignment]
 reveal_type(x5)  # revealed: frozenset[Literal[1]]
 
 class Sup1[T]:
