@@ -65,6 +65,7 @@ impl Db {
         let analysis = if let Some(options) = options {
             let AnalysisSettings {
                 respect_type_ignore_comments: respect_type_ignore_comments_default,
+                allow_function_monkeypatches: allow_function_monkeypatches_default,
                 allowed_unresolved_imports: allowed_unresolved_imports_default,
                 replace_imports_with_any: replace_imports_with_any_default,
             } = AnalysisSettings::default();
@@ -101,6 +102,9 @@ impl Db {
                 respect_type_ignore_comments: options
                     .respect_type_ignore_comments
                     .unwrap_or(respect_type_ignore_comments_default),
+                allow_function_monkeypatches: options
+                    .allow_function_monkeypatches
+                    .unwrap_or(allow_function_monkeypatches_default),
                 allowed_unresolved_imports,
                 replace_imports_with_any,
             }

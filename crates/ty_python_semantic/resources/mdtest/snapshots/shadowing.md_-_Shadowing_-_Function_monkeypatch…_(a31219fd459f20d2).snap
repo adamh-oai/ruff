@@ -1,0 +1,50 @@
+---
+source: crates/ty_test/src/lib.rs
+expression: snapshot
+---
+
+---
+mdtest name: shadowing.md - Shadowing - Function monkeypatching under config
+mdtest path: crates/ty_python_semantic/resources/mdtest/diagnostics/shadowing.md
+---
+
+# Python source files
+
+## mdtest_snippet.py
+
+```
+ 1 | from unittest.mock import AsyncMock
+ 2 | 
+ 3 | class Client:
+ 4 |     async def fetch(self, user_id: str) -> int:
+ 5 |         return 0
+ 6 | 
+ 7 | client = Client()
+ 8 | client.fetch = AsyncMock(return_value=1)
+ 9 | client.fetch = 1  # error: [invalid-assignment]
+10 | 
+11 | class Suggestions:
+12 |     def enabled(self) -> bool:
+13 |         return True
+14 | 
+15 | suggestions = Suggestions()
+16 | suggestions.enabled = lambda: False
+```
+
+# Diagnostics
+
+```
+error[invalid-assignment]: Object of type `Literal[1]` is not assignable to attribute `fetch` of type `def fetch(self, user_id: str) -> CoroutineType[Any, Any, int]`
+  --> src/mdtest_snippet.py:9:1
+   |
+ 7 | client = Client()
+ 8 | client.fetch = AsyncMock(return_value=1)
+ 9 | client.fetch = 1  # error: [invalid-assignment]
+   | ^^^^^^^^^^^^
+10 |
+11 | class Suggestions:
+   |
+info: Implicit shadowing of function `fetch`, add an annotation to make it explicit if this is intentional
+info: rule `invalid-assignment` is enabled by default
+
+```

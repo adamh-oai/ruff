@@ -1345,6 +1345,26 @@ pub struct AnalysisOptions {
     )]
     pub respect_type_ignore_comments: Option<bool>,
 
+    /// Whether assignments that monkeypatch function-valued attributes should be allowed.
+    ///
+    /// When enabled, ty widens function-valued assignment targets to their callable type for
+    /// assignment validation. This is useful for monkeypatch-heavy test code, where direct
+    /// assignments like `client.fetch = AsyncMock(...)` are common and intentional.
+    ///
+    /// Defaults to `false`.
+    #[option(
+        default = r#"false"#,
+        value_type = "bool",
+        example = r#"
+        [[tool.ty.overrides]]
+        include = ["tests/**"]
+
+        [tool.ty.overrides.analysis]
+        allow-function-monkeypatches = true
+        "#
+    )]
+    pub allow_function_monkeypatches: Option<bool>,
+
     /// A list of module glob patterns for which `unresolved-import` diagnostics should be suppressed.
     ///
     /// Details on supported glob patterns:
@@ -1403,12 +1423,14 @@ impl AnalysisOptions {
     ) -> AnalysisSettings {
         let Self {
             respect_type_ignore_comments,
+            allow_function_monkeypatches,
             allowed_unresolved_imports,
             replace_imports_with_any,
         } = self;
 
         let AnalysisSettings {
             respect_type_ignore_comments: respect_type_ignore_default,
+            allow_function_monkeypatches: allow_function_monkeypatches_default,
             allowed_unresolved_imports: allowed_unresolved_imports_default,
             replace_imports_with_any: replace_imports_with_any_default,
         } = AnalysisSettings::default();
@@ -1438,6 +1460,8 @@ impl AnalysisOptions {
         AnalysisSettings {
             respect_type_ignore_comments: respect_type_ignore_comments
                 .unwrap_or(respect_type_ignore_default),
+            allow_function_monkeypatches: allow_function_monkeypatches
+                .unwrap_or(allow_function_monkeypatches_default),
             allowed_unresolved_imports,
             replace_imports_with_any,
         }

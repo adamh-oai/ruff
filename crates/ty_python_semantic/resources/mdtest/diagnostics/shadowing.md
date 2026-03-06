@@ -42,3 +42,32 @@ error[invalid-assignment]: Object of type `Literal[1]` is not assignable to `def
   |
 info: Implicit shadowing of function `f`. Add an annotation to make it explicit if this is intentional
 ```
+
+## Function monkeypatching under config
+
+This behavior is intentionally opt-in because it weakens `ty`'s protection against accidental
+function rebinding.
+
+```toml
+[analysis]
+allow-function-monkeypatches = true
+```
+
+```py
+from unittest.mock import AsyncMock
+
+class Client:
+    async def fetch(self, user_id: str) -> int:
+        return 0
+
+client = Client()
+client.fetch = AsyncMock(return_value=1)
+client.fetch = 1  # error: [invalid-assignment]
+
+class Suggestions:
+    def enabled(self) -> bool:
+        return True
+
+suggestions = Suggestions()
+suggestions.enabled = lambda: False
+```

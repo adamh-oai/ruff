@@ -96,6 +96,13 @@ pub struct AnalysisSettings {
     /// * report invalid `type: ignore` comments
     pub respect_type_ignore_comments: bool,
 
+    /// Whether assignments that monkeypatch function-valued attributes should be allowed.
+    ///
+    /// When enabled, ty widens function-valued assignment targets to their callable type for
+    /// assignment validation. This keeps non-callables rejected while allowing test-style
+    /// replacements like `AsyncMock`, `MagicMock`, lambdas, and helper functions.
+    pub allow_function_monkeypatches: bool,
+
     pub allowed_unresolved_imports: ModuleGlobSet,
 
     pub replace_imports_with_any: ModuleGlobSet,
@@ -105,6 +112,7 @@ impl Default for AnalysisSettings {
     fn default() -> Self {
         Self {
             respect_type_ignore_comments: true,
+            allow_function_monkeypatches: false,
             allowed_unresolved_imports: ModuleGlobSet::empty(),
             replace_imports_with_any: ModuleGlobSet::empty(),
         }

@@ -464,6 +464,53 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .is_in_type_checking_block(scope.file_scope_id(self.db()), node.range())
     }
 
+    fn is_allowed_function_monkeypatch(
+        &self,
+        object_ty: Type<'db>,
+        target_ty: Type<'db>,
+        value_ty: Type<'db>,
+    ) -> bool {
+        if !self.settings().allow_function_monkeypatches {
+            return false;
+        }
+
+        let db = self.db();
+
+        let unbound_callable_target_ty = match target_ty {
+            Type::FunctionLiteral(_) | Type::BoundMethod(_) | Type::KnownBoundMethod(_) => {
+                target_ty
+                    .try_upcast_to_callable(db)
+                    .map(|callables| callables.into_type(db))
+            }
+            _ => None,
+        };
+
+        if unbound_callable_target_ty
+            .is_some_and(|callable_target_ty| value_ty.is_assignable_to(db, callable_target_ty))
+        {
+            return true;
+        }
+
+        match target_ty {
+            Type::FunctionLiteral(function)
+                if !matches!(
+                    object_ty,
+                    Type::ClassLiteral(_) | Type::SubclassOf(_) | Type::ModuleLiteral(_)
+                ) =>
+            {
+                let bound_callable_target_ty =
+                    Type::BoundMethod(function.into_bound_method_type(db, object_ty))
+                        .try_upcast_to_callable(db)
+                        .map(|callables| callables.into_type(db));
+
+                bound_callable_target_ty.is_some_and(|callable_target_ty| {
+                    value_ty.is_assignable_to(db, callable_target_ty)
+                })
+            }
+            _ => false,
+        }
+    }
+
     /// If the current scope is a class body scope of a dataclass-like class, populate
     /// `self.dataclass_field_specifiers` with the field specifiers from the class's
     /// `dataclass_params` or `dataclass_transform` parameters. This is needed so that
@@ -2094,7 +2141,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // This closure should only be called if `value_ty` was inferred with `attr_ty` as type context.
         let ensure_assignable_to =
             |builder: &Self, value_ty: Type<'db>, attr_ty: Type<'db>| -> bool {
-                let assignable = value_ty.is_assignable_to(db, attr_ty);
+                let assignable = value_ty.is_assignable_to(db, attr_ty)
+                    || builder.is_allowed_function_monkeypatch(object_ty, attr_ty, value_ty);
                 if !assignable && emit_diagnostics {
                     report_invalid_attribute_assignment(
                         &builder.context,
