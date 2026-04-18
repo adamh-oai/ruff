@@ -180,12 +180,12 @@ class A:
 
 a = (A(), A())
 
-reveal_type(a == a)  # revealed: bool
-reveal_type(a != a)  # revealed: bool
-reveal_type(a < a)  # revealed: LtReturnType | Literal[False]
-reveal_type(a <= a)  # revealed: LeReturnType | Literal[True]
-reveal_type(a > a)  # revealed: GtReturnType | Literal[False]
-reveal_type(a >= a)  # revealed: GeReturnType | Literal[True]
+reveal_type(a == a)  # revealed: Literal[True]
+reveal_type(a != a)  # revealed: Literal[False]
+reveal_type(a < a)  # revealed: Literal[False]
+reveal_type(a <= a)  # revealed: Literal[True]
+reveal_type(a > a)  # revealed: Literal[False]
+reveal_type(a >= a)  # revealed: Literal[True]
 
 # If lexicographic comparison is finished before comparing A()
 b = ("1_foo", A())
@@ -204,7 +204,7 @@ class B:
     def __lt__(self, o: B) -> LtReturnTypeOnB:
         return LtReturnTypeOnB()
 
-reveal_type((A(), B()) < (A(), B()))  # revealed: LtReturnType | LtReturnTypeOnB | Literal[False]
+reveal_type((A(), B()) < (A(), B()))  # revealed: LtReturnTypeOnB | Literal[False]
 ```
 
 #### Special Handling of Eq and NotEq in Lexicographic Comparisons

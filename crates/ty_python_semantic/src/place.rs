@@ -1323,8 +1323,14 @@ impl<'db> LoopHeaderReachability<'db> {
             previous_bindings.chain(self.reachable_bindings).collect()
         };
 
+        let deleted_reachability = if cycle.iteration() <= 1 {
+            self.deleted_reachability
+        } else {
+            previous.deleted_reachability.or(self.deleted_reachability)
+        };
+
         LoopHeaderReachability {
-            deleted_reachability: previous.deleted_reachability.or(self.deleted_reachability),
+            deleted_reachability,
             reachable_bindings,
         }
     }

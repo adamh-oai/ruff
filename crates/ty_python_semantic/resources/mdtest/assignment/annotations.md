@@ -768,7 +768,7 @@ x5: list[Iterable[Any]] = [[1, 2, 3]]
 reveal_type(x5)  # revealed: list[Iterable[Any]]
 
 x6: Iterable[list[Any]] = [[1, 2, 3]]
-reveal_type(x6)  # revealed: list[list[Any]]
+reveal_type(x6)  # revealed: list[list[int]]
 
 x7: Sequence[Any] = [i for i in [1, 2, 3]]
 reveal_type(x7)  # revealed: list[int]
@@ -786,7 +786,7 @@ x11: list[Iterable[Any]] = [[i] for i in [1, 2, 3]]
 reveal_type(x11)  # revealed: list[Iterable[Any]]
 
 x12: Iterable[list[Any]] = [[i] for i in [1, 2, 3]]
-reveal_type(x12)  # revealed: list[list[Any]]
+reveal_type(x12)  # revealed: list[list[int]]
 
 class X[T]:
     value: T

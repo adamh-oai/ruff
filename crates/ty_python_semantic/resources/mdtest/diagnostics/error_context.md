@@ -784,8 +784,6 @@ error[invalid-assignment]: Object of type `list[str]` is not assignable to `Iter
 info: type `list[str]` is not assignable to protocol `Iterable[bytes]`
 info: └── protocol member `__iter__` is incompatible
 info:     └── incompatible return types: `Iterator[str]` is not assignable to `Iterator[bytes]`
-info:         └── protocol `Iterator[str]` is not assignable to protocol `Iterator[bytes]`
-info:             └── incompatible return types: `str` is not assignable to `bytes`
 ```
 
 ## Invariant generic classes

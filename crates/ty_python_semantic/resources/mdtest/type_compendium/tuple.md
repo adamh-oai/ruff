@@ -546,8 +546,8 @@ reveal_type(("foo", *y))  # revealed: tuple[Literal["foo"], Literal[1], Literal[
 aa: tuple[list[int], ...] = ([42], *{[56], [78]}, [100])
 reveal_type(aa)  # revealed: tuple[list[int], list[int], list[int], list[int]]
 
-bb: tuple[list[Literal[42, 56]], ...] = ([42], *{[56, 42], [42]}, [42, 42, 56])
-reveal_type(bb)  # revealed: tuple[list[Literal[42, 56]], list[Literal[42, 56]], list[Literal[42, 56]], list[Literal[42, 56]]]
+bb: tuple[list[Literal[42, 56]], ...] = ([42], *{[56, 42], [42]}, [42, 42, 56])  # error: [invalid-assignment]
+reveal_type(bb)  # revealed: tuple[list[Literal[42, 56]], ...]
 
 reveal_type((*[],))  # revealed: tuple[()]
 reveal_type((42, *[], 56, *[]))  # revealed: tuple[Literal[42], Literal[56]]

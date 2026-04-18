@@ -199,6 +199,7 @@ async def g() -> list[int | str]:
     return list1(1)
 
 def h[T](x: T, cond: bool) -> T | list[T]:
+    # error: [invalid-return-type]
     return i(x, cond)
 
 def i[T](x: T, cond: bool) -> T | list[T]:

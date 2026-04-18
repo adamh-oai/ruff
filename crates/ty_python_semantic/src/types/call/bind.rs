@@ -78,6 +78,23 @@ enum CallErrorPriority {
     BindingError = 2,
 }
 
+fn is_dataclass_field_specifier<'db>(
+    db: &'db dyn Db,
+    function: FunctionType<'db>,
+    dataclass_field_specifiers: &[Type<'db>],
+) -> bool {
+    dataclass_field_specifiers.iter().any(|specifier| {
+        if *specifier == Type::FunctionLiteral(function) {
+            return true;
+        }
+
+        specifier.bindings(db).iter_flat().any(|binding| {
+            binding.callable_type.as_function_literal() == Some(function)
+                || binding.signature_type.as_function_literal() == Some(function)
+        })
+    })
+}
+
 /// A single callable item within the union/intersection structure.
 /// Either a regular callable, or a constructor callable.
 #[derive(Debug, Clone)]
@@ -1477,8 +1494,12 @@ impl<'db> Bindings<'db> {
                         }
                     }
 
-                    function @ Type::FunctionLiteral(_)
-                        if dataclass_field_specifiers.contains(&function) =>
+                    Type::FunctionLiteral(function)
+                        if is_dataclass_field_specifier(
+                            db,
+                            function,
+                            dataclass_field_specifiers,
+                        ) =>
                     {
                         // Helper to get the type of a field-specifier argument by name. Prefer an explicit
                         // keyword argument at the call site, because overload binding can lose literal metadata
@@ -2100,15 +2121,32 @@ impl<'db> Bindings<'db> {
 
                             // Accept both `field_specifiers` (current name) and
                             // `field_descriptors` (legacy name).
-                            let field_specifiers_param = overload
-                                .parameter_type_by_name("field_specifiers", false)
-                                .ok()
-                                .flatten()
-                                .or_else(|| {
+                            let explicit_field_specifiers_arg =
+                                call_arguments.iter().find_map(|(arg, arg_types)| {
+                                    if matches!(
+                                        arg,
+                                        Argument::Keyword(arg_name)
+                                            if arg_name == "field_specifiers"
+                                                || arg_name == "field_descriptors"
+                                    ) {
+                                        arg_types.get_default()
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                            let field_specifiers_param =
+                                explicit_field_specifiers_arg.or_else(|| {
                                     overload
-                                        .parameter_type_by_name("field_descriptors", false)
+                                        .parameter_type_by_name("field_specifiers", false)
                                         .ok()
                                         .flatten()
+                                        .or_else(|| {
+                                            overload
+                                                .parameter_type_by_name("field_descriptors", false)
+                                                .ok()
+                                                .flatten()
+                                        })
                                 });
 
                             let field_specifiers: Box<[Type<'db>]> = field_specifiers_param
