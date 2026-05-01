@@ -1946,6 +1946,11 @@ impl<'db> Type<'db> {
     fn promote_impl(self, db: &'db dyn Db) -> Type<'db> {
         match self {
             Type::LiteralValue(literal) if literal.is_promotable() => literal.fallback_instance(db),
+            Type::LiteralValue(literal)
+                if matches!(literal.kind(), LiteralValueTypeKind::LiteralString) =>
+            {
+                KnownClass::Str.to_instance(db)
+            }
             Type::FunctionLiteral(literal) => Type::Callable(literal.into_callable_type(db)),
             _ => self,
         }

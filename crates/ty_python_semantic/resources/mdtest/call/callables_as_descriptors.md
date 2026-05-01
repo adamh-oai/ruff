@@ -159,22 +159,38 @@ class C3:
 reveal_type(C3().method_decorated(1))  # revealed: int | str
 ```
 
+And with unions of `Callable` and dynamic types:
+
+```py
+from typing import Any, Callable
+
+def maybe_unknown(f: Callable[[C4, int], str]) -> Callable[[C4, int], str] | Any:
+    raise NotImplementedError
+
+class C4:
+    @maybe_unknown
+    def method_decorated(self, x: int) -> str:
+        return str(x)
+
+reveal_type(C4().method_decorated(1))  # revealed: str | Any
+```
+
 Note that we currently only apply this heuristic when calling a function such as `memoize` via the
 decorator syntax. This is inconsistent, because the above *should* be equivalent to the following,
 but here we emit errors:
 
 ```py
-def memoize3(f: Callable[[C4, int], str]) -> Callable[[C4, int], str]:
+def memoize3(f: Callable[[C5, int], str]) -> Callable[[C5, int], str]:
     raise NotImplementedError
 
-class C4:
+class C5:
     def method(self, x: int) -> str:
         return str(x)
     method_decorated = memoize3(method)
 
 # error: [missing-argument]
 # error: [invalid-argument-type]
-C4().method_decorated(1)
+C5().method_decorated(1)
 ```
 
 The reason for this is that the heuristic is problematic. We don't *know* that the `Callable` in the

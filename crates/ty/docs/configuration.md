@@ -41,6 +41,88 @@ Valid severities are:
 
 ## `analysis`
 
+### `allow-function-monkeypatches`
+
+Whether assignments that monkeypatch function-valued attributes should be allowed.
+
+When enabled, ty widens function-valued assignment targets to their callable type for
+assignment validation. This is useful for monkeypatch-heavy test code, where direct
+assignments like `client.fetch = AsyncMock(...)` are common and intentional.
+
+Defaults to `false`.
+
+**Default value**: `false`
+
+**Type**: `bool`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.ty.analysis]
+    [[tool.ty.overrides]]
+    include = ["tests/**"]
+
+    [tool.ty.overrides.analysis]
+    allow-function-monkeypatches = true
+    ```
+
+=== "ty.toml"
+
+    ```toml
+    [analysis]
+    [[overrides]]
+    include = ["tests/**"]
+
+    [overrides.analysis]
+    allow-function-monkeypatches = true
+    ```
+
+---
+
+### `allow-mock-function-attributes`
+
+Whether common `unittest.mock` assertion and configuration attributes should be allowed on
+function-valued objects.
+
+When enabled, ty permits attributes like `assert_called_once_with`, `assert_awaited_once`,
+`return_value`, and `side_effect` on callable values. This is useful for monkeypatch-heavy
+test code where a method is replaced by `Mock` or `AsyncMock`, but subsequent assertions are
+still written through the original method attribute.
+
+Defaults to `false`.
+
+**Default value**: `false`
+
+**Type**: `bool`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.ty.analysis]
+    [[tool.ty.overrides]]
+    include = ["tests/**"]
+
+    [tool.ty.overrides.analysis]
+    allow-mock-function-attributes = true
+    ```
+
+=== "ty.toml"
+
+    ```toml
+    [analysis]
+    [[overrides]]
+    include = ["tests/**"]
+
+    [overrides.analysis]
+    allow-mock-function-attributes = true
+    ```
+
+---
+
 ### `allowed-unresolved-imports`
 
 A list of module glob patterns for which `unresolved-import` diagnostics should be suppressed.
@@ -118,6 +200,76 @@ When multiple patterns match, later entries take precedence.
     [analysis]
     # Replace all pandas and numpy imports with Any
     replace-imports-with-any = ["pandas.**", "numpy.**"]
+    ```
+
+---
+
+### `respect-mypy-type-ignore-codes`
+
+Whether mypy- and Pyright-style codes in `type: ignore[...]` comments should suppress
+equivalent ty diagnostics.
+
+When enabled, ty maps common external checker codes such as `arg-type`,
+`reportArgumentType`, and `attr-defined` to equivalent ty diagnostics. This is useful when
+migrating projects that already have checker-specific suppressions and need ty to coexist
+with them.
+
+Defaults to `false`.
+
+**Default value**: `false`
+
+**Type**: `bool`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.ty.analysis]
+    # Allow existing mypy-style ignores to suppress equivalent ty diagnostics
+    respect-mypy-type-ignore-codes = true
+    ```
+
+=== "ty.toml"
+
+    ```toml
+    [analysis]
+    # Allow existing mypy-style ignores to suppress equivalent ty diagnostics
+    respect-mypy-type-ignore-codes = true
+    ```
+
+---
+
+### `respect-pyright-ignore-comments`
+
+Whether ty should respect `pyright: ignore[...]` comments.
+
+When enabled, ty maps common Pyright codes such as `reportArgumentType` and
+`reportAttributeAccessIssue` to equivalent ty diagnostics. This is useful when migrating
+projects that already use Pyright suppressions.
+
+Defaults to `false`.
+
+**Default value**: `false`
+
+**Type**: `bool`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.ty.analysis]
+    # Allow existing Pyright ignores to suppress equivalent ty diagnostics
+    respect-pyright-ignore-comments = true
+    ```
+
+=== "ty.toml"
+
+    ```toml
+    [analysis]
+    # Allow existing Pyright ignores to suppress equivalent ty diagnostics
+    respect-pyright-ignore-comments = true
     ```
 
 ---
@@ -531,6 +683,88 @@ severity levels or disable them entirely.
 
 ## `overrides.analysis`
 
+#### `allow-function-monkeypatches`
+
+Whether assignments that monkeypatch function-valued attributes should be allowed.
+
+When enabled, ty widens function-valued assignment targets to their callable type for
+assignment validation. This is useful for monkeypatch-heavy test code, where direct
+assignments like `client.fetch = AsyncMock(...)` are common and intentional.
+
+Defaults to `false`.
+
+**Default value**: `false`
+
+**Type**: `bool`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.ty.overrides.analysis]
+    [[tool.ty.overrides]]
+    include = ["tests/**"]
+
+    [tool.ty.overrides.analysis]
+    allow-function-monkeypatches = true
+    ```
+
+=== "ty.toml"
+
+    ```toml
+    [overrides.analysis]
+    [[overrides]]
+    include = ["tests/**"]
+
+    [overrides.analysis]
+    allow-function-monkeypatches = true
+    ```
+
+---
+
+#### `allow-mock-function-attributes`
+
+Whether common `unittest.mock` assertion and configuration attributes should be allowed on
+function-valued objects.
+
+When enabled, ty permits attributes like `assert_called_once_with`, `assert_awaited_once`,
+`return_value`, and `side_effect` on callable values. This is useful for monkeypatch-heavy
+test code where a method is replaced by `Mock` or `AsyncMock`, but subsequent assertions are
+still written through the original method attribute.
+
+Defaults to `false`.
+
+**Default value**: `false`
+
+**Type**: `bool`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.ty.overrides.analysis]
+    [[tool.ty.overrides]]
+    include = ["tests/**"]
+
+    [tool.ty.overrides.analysis]
+    allow-mock-function-attributes = true
+    ```
+
+=== "ty.toml"
+
+    ```toml
+    [overrides.analysis]
+    [[overrides]]
+    include = ["tests/**"]
+
+    [overrides.analysis]
+    allow-mock-function-attributes = true
+    ```
+
+---
+
 #### `allowed-unresolved-imports`
 
 A list of module glob patterns for which `unresolved-import` diagnostics should be suppressed.
@@ -608,6 +842,76 @@ When multiple patterns match, later entries take precedence.
     [overrides.analysis]
     # Replace all pandas and numpy imports with Any
     replace-imports-with-any = ["pandas.**", "numpy.**"]
+    ```
+
+---
+
+#### `respect-mypy-type-ignore-codes`
+
+Whether mypy- and Pyright-style codes in `type: ignore[...]` comments should suppress
+equivalent ty diagnostics.
+
+When enabled, ty maps common external checker codes such as `arg-type`,
+`reportArgumentType`, and `attr-defined` to equivalent ty diagnostics. This is useful when
+migrating projects that already have checker-specific suppressions and need ty to coexist
+with them.
+
+Defaults to `false`.
+
+**Default value**: `false`
+
+**Type**: `bool`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.ty.overrides.analysis]
+    # Allow existing mypy-style ignores to suppress equivalent ty diagnostics
+    respect-mypy-type-ignore-codes = true
+    ```
+
+=== "ty.toml"
+
+    ```toml
+    [overrides.analysis]
+    # Allow existing mypy-style ignores to suppress equivalent ty diagnostics
+    respect-mypy-type-ignore-codes = true
+    ```
+
+---
+
+#### `respect-pyright-ignore-comments`
+
+Whether ty should respect `pyright: ignore[...]` comments.
+
+When enabled, ty maps common Pyright codes such as `reportArgumentType` and
+`reportAttributeAccessIssue` to equivalent ty diagnostics. This is useful when migrating
+projects that already use Pyright suppressions.
+
+Defaults to `false`.
+
+**Default value**: `false`
+
+**Type**: `bool`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.ty.overrides.analysis]
+    # Allow existing Pyright ignores to suppress equivalent ty diagnostics
+    respect-pyright-ignore-comments = true
+    ```
+
+=== "ty.toml"
+
+    ```toml
+    [overrides.analysis]
+    # Allow existing Pyright ignores to suppress equivalent ty diagnostics
+    respect-pyright-ignore-comments = true
     ```
 
 ---

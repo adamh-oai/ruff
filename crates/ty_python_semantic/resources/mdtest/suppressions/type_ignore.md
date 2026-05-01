@@ -139,6 +139,54 @@ starting with `ty:` to avoid ambiguity with suppression comments from mypy and o
 a = test  # type: ignore[name-defined, ty:unresolved-reference]
 ```
 
+## Mypy codes under config
+
+By default, mypy- and Pyright-style codes do not suppress ty diagnostics. Projects that are
+migrating to ty can enable compatibility with common external checker codes.
+
+```toml
+[analysis]
+respect-mypy-type-ignore-codes = true
+respect-pyright-ignore-comments = true
+```
+
+```py
+def takes_int(value: int) -> None: ...
+
+takes_int("not an int")  # type: ignore[arg-type]
+takes_int("not an int")  # type: ignore[reportArgumentType]
+takes_int("not an int")  # pyright: ignore[reportArgumentType]
+
+value: int = "not an int"  # pyright: ignore [reportAssignmentType]
+
+def returns_int() -> int:
+    return "not an int"  # pyright: ignore [reportReturnType]
+
+class User:
+    name: str
+
+User().missing  # type: ignore[attr-defined]
+User().also_missing  # type: ignore[reportAttributeAccessIssue]
+User().pyright_missing  # pyright: ignore[reportAttributeAccessIssue]
+
+User().missing_again  # error: [unresolved-attribute] "Object of type `User` has no attribute `missing_again`"
+
+import missing_type_ignore  # type: ignore[import-not-found]
+import missing_pyright_ignore  # pyright: ignore[reportMissingImports]
+
+from typing import TypedDict
+
+class UserPayload(TypedDict):
+    name: str
+    age: int
+
+def takes_user_payload(user: UserPayload) -> None: ...
+
+takes_user_payload({
+    "name": "Alice",
+})  # type: ignore[arg-type]
+```
+
 ## Unknown codes starting with `ty`
 
 ```py

@@ -29,6 +29,7 @@ impl<'src> SuppressionParser<'src> {
         self.eat_whitespace();
 
         // type: ignore[code]
+        // pyright: ignore[code]
         // ^^^^^^^^^^^^
         let Some(kind) = self.eat_kind() else {
             return Err(ParseError::new(
@@ -59,6 +60,8 @@ impl<'src> SuppressionParser<'src> {
     fn eat_kind(&mut self) -> Option<SuppressionKind> {
         let kind = if self.cursor.as_str().starts_with("type") {
             SuppressionKind::TypeIgnore
+        } else if self.cursor.as_str().starts_with("pyright") {
+            SuppressionKind::Pyright
         } else if self.cursor.as_str().starts_with("ty") {
             SuppressionKind::Ty
         } else {

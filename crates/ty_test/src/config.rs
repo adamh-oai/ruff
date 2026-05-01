@@ -114,7 +114,13 @@ pub(crate) struct Analysis {
     /// Whether ty should support `type: ignore` comments.
     pub(crate) respect_type_ignore_comments: Option<bool>,
 
+    pub(crate) respect_mypy_type_ignore_codes: Option<bool>,
+
+    pub(crate) respect_pyright_ignore_comments: Option<bool>,
+
     pub(crate) allow_function_monkeypatches: Option<bool>,
+
+    pub(crate) allow_mock_function_attributes: Option<bool>,
 
     pub(crate) allowed_unresolved_imports: Option<Vec<String>>,
 

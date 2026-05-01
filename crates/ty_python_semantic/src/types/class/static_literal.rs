@@ -63,6 +63,30 @@ use ty_python_core::{
     use_def_map,
 };
 
+fn pydantic_field_alias_from_value(value: &ast::Expr) -> Option<Box<str>> {
+    let call = value.as_call_expr()?;
+    let is_field_call = match call.func.as_ref() {
+        ast::Expr::Name(name) => name.id == "Field",
+        ast::Expr::Attribute(attribute) => attribute.attr.as_str() == "Field",
+        _ => false,
+    };
+    if !is_field_call {
+        return None;
+    }
+
+    call.arguments
+        .keywords
+        .iter()
+        .find(|keyword| keyword.arg.as_ref().is_some_and(|arg| arg.id == "alias"))
+        .and_then(|keyword| {
+            keyword
+                .value
+                .as_string_literal_expr()
+                .and_then(ast::ExprStringLiteral::as_single_part_string)
+                .map(|literal| Box::from(literal.value.as_ref()))
+        })
+}
+
 /// Representation of a class definition statement in the AST: either a non-generic class, or a
 /// generic class that has not been specialized.
 ///
@@ -1855,6 +1879,18 @@ impl<'db> StaticClassLiteral<'db> {
                     kw_only = field.kw_only(db);
                     alias = field.alias(db);
                     converter = field.converter(db);
+                }
+                if alias.is_none()
+                    && let Some(first_declaration) = first_declaration
+                {
+                    let module = parsed_module(db, first_declaration.file(db)).load(db);
+                    if let DefinitionKind::AnnotatedAssignment(assignment) =
+                        first_declaration.kind(db)
+                    {
+                        alias = assignment
+                            .value(&module)
+                            .and_then(pydantic_field_alias_from_value);
+                    }
                 }
 
                 let kind = match field_policy {

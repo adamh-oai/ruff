@@ -31,7 +31,7 @@ use crate::diagnostic::format_enumeration;
 use crate::place::{
     ConsideredDefinitions, DefinedPlace, Definedness, LookupError, Place, PlaceAndQualifiers,
     TypeOrigin, builtins_module_scope, builtins_symbol, class_body_implicit_symbol,
-    explicit_global_symbol, global_symbol, loop_header_reachability,
+    explicit_global_symbol, global_symbol, imported_symbol, loop_header_reachability,
     module_type_implicit_global_declaration, module_type_implicit_global_symbol, place,
     place_from_bindings, place_from_declarations, typing_extensions_symbol,
 };
@@ -511,6 +511,56 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
+    fn is_allowed_mock_function_attribute_access(
+        &self,
+        value_ty: Type<'db>,
+        attr_name: &str,
+    ) -> bool {
+        if !self.settings().allow_mock_function_attributes {
+            return false;
+        }
+
+        if !matches!(
+            value_ty,
+            Type::FunctionLiteral(..)
+                | Type::BoundMethod(_)
+                | Type::KnownBoundMethod(_)
+                | Type::Callable(..)
+        ) && !value_ty.is_callable_type()
+        {
+            return false;
+        }
+
+        matches!(
+            attr_name,
+            "assert_any_await"
+                | "assert_any_call"
+                | "assert_awaited"
+                | "assert_awaited_once"
+                | "assert_awaited_once_with"
+                | "assert_awaited_with"
+                | "assert_called"
+                | "assert_called_once"
+                | "assert_called_once_with"
+                | "assert_called_with"
+                | "assert_has_awaits"
+                | "assert_has_calls"
+                | "assert_not_awaited"
+                | "assert_not_called"
+                | "await_args"
+                | "await_args_list"
+                | "await_count"
+                | "call_args"
+                | "call_args_list"
+                | "call_count"
+                | "called"
+                | "mock_calls"
+                | "reset_mock"
+                | "return_value"
+                | "side_effect"
+        )
+    }
+
     /// If the current scope is a class body scope of a dataclass-like class, populate
     /// `self.dataclass_field_specifiers` with the field specifiers from the class's
     /// `dataclass_params` or `dataclass_transform` parameters. This is needed so that
@@ -531,7 +581,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .as_class_literal()?
                 .as_static()?;
 
-            class_literal
+            let mut field_specifiers = class_literal
                 .dataclass_params(db)
                 .map(|params| SmallVec::from(params.field_specifiers(db)))
                 .or_else(|| {
@@ -540,7 +590,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             .dataclass_transformer_params()?
                             .field_specifiers(db),
                     ))
-                })
+                })?;
+
+            if let Some(pydantic_field) = resolve_module(
+                db,
+                scope.file(db),
+                &ModuleName::new_static("pydantic.fields")
+                    .expect("pydantic.fields is a valid module name"),
+            )
+            .and_then(|module| module.file(db))
+            .and_then(|file| {
+                imported_symbol(db, Some(file), "Field", None)
+                    .place
+                    .ignore_possibly_undefined()
+            }) && !field_specifiers.contains(&pydantic_field)
+            {
+                field_specifiers.push(pydantic_field);
+            }
+
+            Some(field_specifiers)
         }
 
         if let Some(specifiers) = field_specifiers(self.db(), self.index, self.scope()) {
@@ -2318,6 +2386,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // Perform loud inference without type context, as we may encounter multiple equally
                 // applicable type contexts during attribute resolution.
                 let value_ty = infer_value_ty.infer_loud(self, TypeContext::default());
+
+                if self.is_allowed_mock_function_attribute_access(object_ty, attribute) {
+                    return true;
+                }
 
                 // Infer `__setattr__` once upfront. We use this result for:
                 // 1. Checking if it returns `Never` (indicating an immutable class)
@@ -4707,9 +4779,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     callable.signatures(db),
                     kind,
                 ))),
-                Type::Union(union) => {
-                    union.try_map(db, |element| propagate_callable_kind(db, *element, kind))
-                }
+                Type::Union(union) => Some(union.map(db, |element| {
+                    propagate_callable_kind(db, *element, kind).unwrap_or(*element)
+                })),
                 Type::TypeAlias(alias) => propagate_callable_kind(db, alias.value_type(db), kind),
                 // Intersections are currently not handled here because that would require
                 // the decorator to be explicitly annotated as returning an intersection.
@@ -8561,6 +8633,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 }
                             }
                         }
+                        return fallback();
+                    }
+
+                    if self.is_allowed_mock_function_attribute_access(value_type, attr_name) {
                         return fallback();
                     }
 

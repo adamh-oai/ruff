@@ -139,10 +139,18 @@ pub(crate) fn suppressions(db: &dyn Db, file: File) -> Suppressions {
     let parsed = parsed_module(db, file).load(db);
     let source = source_text(db, file);
 
-    let respect_type_ignore = db.analysis_settings(file).respect_type_ignore_comments;
+    let analysis_settings = db.analysis_settings(file);
+    let respect_type_ignore = analysis_settings.respect_type_ignore_comments;
+    let respect_pyright_ignore = analysis_settings.respect_pyright_ignore_comments;
 
-    let mut builder = SuppressionsBuilder::new(&source, db.lint_registry());
+    let mut builder = SuppressionsBuilder::new(
+        &source,
+        db.lint_registry(),
+        analysis_settings.respect_mypy_type_ignore_codes,
+    );
     let mut line_start = TextSize::default();
+    let mut open_delimiters = Vec::new();
+    let mut last_closed_delimiter = None;
 
     for token in parsed.tokens() {
         if !token.kind().is_trivia() {
@@ -150,8 +158,29 @@ pub(crate) fn suppressions(db: &dyn Db, file: File) -> Suppressions {
         }
 
         match token.kind() {
+            TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace => {
+                open_delimiters.push(token.start());
+            }
+            TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => {
+                if let Some(start) = open_delimiters.pop()
+                    && token.start() >= line_start
+                    && source[line_start.to_usize()..token.start().to_usize()]
+                        .trim()
+                        .is_empty()
+                {
+                    last_closed_delimiter =
+                        Some((start, physical_line_start(&source, token.start())));
+                }
+            }
             TokenKind::Comment => {
                 let parser = SuppressionParser::new(&source, token.range());
+                let comment_line_start = physical_line_start(&source, token.start());
+                let line_range = TextRange::new(
+                    last_closed_delimiter
+                        .filter(|(_, close_line_start)| *close_line_start == comment_line_start)
+                        .map_or(line_start, |(open_start, _)| open_start),
+                    token.end(),
+                );
 
                 for comment in parser {
                     match comment {
@@ -159,7 +188,10 @@ pub(crate) fn suppressions(db: &dyn Db, file: File) -> Suppressions {
                             if comment.kind().is_type_ignore() && !respect_type_ignore {
                                 continue;
                             }
-                            builder.add_comment(comment, TextRange::new(line_start, token.end()));
+                            if comment.kind().is_pyright_ignore() && !respect_pyright_ignore {
+                                continue;
+                            }
+                            builder.add_comment(comment, line_range);
                         }
                         Err(error) => match error.kind {
                             ParseErrorKind::NotASuppression
@@ -173,6 +205,9 @@ pub(crate) fn suppressions(db: &dyn Db, file: File) -> Suppressions {
                                 if kind.is_type_ignore() && !respect_type_ignore {
                                     continue;
                                 }
+                                if kind.is_pyright_ignore() && !respect_pyright_ignore {
+                                    continue;
+                                }
 
                                 builder.add_invalid_comment(kind, error);
                             }
@@ -182,12 +217,21 @@ pub(crate) fn suppressions(db: &dyn Db, file: File) -> Suppressions {
             }
             TokenKind::Newline | TokenKind::NonLogicalNewline => {
                 line_start = token.end();
+                last_closed_delimiter = None;
             }
             _ => {}
         }
     }
 
     builder.finish()
+}
+
+fn physical_line_start(source: &str, offset: TextSize) -> TextSize {
+    let offset = offset.to_usize();
+    let start = source[..offset]
+        .rfind('\n')
+        .map_or(0, |newline| newline + '\n'.len_utf8());
+    TextSize::try_from(start).expect("source offset fits in TextSize")
 }
 
 pub(crate) fn check_suppressions(
@@ -473,6 +517,7 @@ impl Suppression {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
 enum SuppressionKind {
     TypeIgnore,
+    Pyright,
     Ty,
 }
 
@@ -481,9 +526,14 @@ impl SuppressionKind {
         matches!(self, SuppressionKind::TypeIgnore)
     }
 
+    const fn is_pyright_ignore(self) -> bool {
+        matches!(self, SuppressionKind::Pyright)
+    }
+
     fn len_utf8(self) -> usize {
         match self {
             SuppressionKind::TypeIgnore => "type".len(),
+            SuppressionKind::Pyright => "pyright".len(),
             SuppressionKind::Ty => "ty".len(),
         }
     }
@@ -493,6 +543,7 @@ impl fmt::Display for SuppressionKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SuppressionKind::TypeIgnore => f.write_str("type: ignore"),
+            SuppressionKind::Pyright => f.write_str("pyright: ignore"),
             SuppressionKind::Ty => f.write_str("ty: ignore"),
         }
     }
@@ -528,6 +579,7 @@ impl SuppressionTarget {
 struct SuppressionsBuilder<'a> {
     lint_registry: &'a LintRegistry,
     source: &'a str,
+    respect_mypy_type_ignore_codes: bool,
 
     /// Ignore comments at the top of the file before any non-trivia code apply to the entire file.
     /// This boolean tracks if there has been any non trivia token.
@@ -540,10 +592,15 @@ struct SuppressionsBuilder<'a> {
 }
 
 impl<'a> SuppressionsBuilder<'a> {
-    fn new(source: &'a str, lint_registry: &'a LintRegistry) -> Self {
+    fn new(
+        source: &'a str,
+        lint_registry: &'a LintRegistry,
+        respect_mypy_type_ignore_codes: bool,
+    ) -> Self {
         Self {
             source,
             lint_registry,
+            respect_mypy_type_ignore_codes,
             seen_non_trivia_token: false,
             line: Vec::new(),
             file: SmallVec::new_const(),
@@ -620,21 +677,46 @@ impl<'a> SuppressionsBuilder<'a> {
             // `ty: ignore[a, b]` or `type: ignore[a, b]`
             Some(codes) => {
                 for &code_range in codes {
-                    let code = &self.source[code_range];
+                    let original_code = &self.source[code_range];
 
                     // For `type:ignore`, ignore codes that don't start with `ty:`.
                     let code = if comment.kind().is_type_ignore() {
-                        if let Some(prefix) = code.strip_prefix("ty:") {
-                            prefix
+                        if let Some(prefix) = original_code.strip_prefix("ty:") {
+                            Some(prefix)
+                        } else if self.respect_mypy_type_ignore_codes {
+                            None
                         } else {
                             continue;
                         }
+                    } else if comment.kind().is_pyright_ignore() {
+                        None
                     } else {
-                        code
+                        Some(original_code)
                     };
 
-                    match self.lint_registry.get(code) {
-                        Ok(lint) => {
+                    if let Some(code) = code {
+                        match self.lint_registry.get(code) {
+                            Ok(lint) => {
+                                push_ignore_suppression(Suppression {
+                                    target: SuppressionTarget::Lint(lint),
+                                    kind: comment.kind(),
+                                    range: code_range,
+                                    comment_range: comment.range(),
+                                    suppressed_range,
+                                });
+                            }
+                            Err(error) => self.unknown.push(UnknownSuppression {
+                                range: code_range,
+                                comment_range: comment.range(),
+                                reason: error,
+                            }),
+                        }
+                    } else {
+                        for &code in mypy_code_to_ty_codes(original_code) {
+                            let Ok(lint) = self.lint_registry.get(code) else {
+                                continue;
+                            };
+
                             push_ignore_suppression(Suppression {
                                 target: SuppressionTarget::Lint(lint),
                                 kind: comment.kind(),
@@ -643,11 +725,6 @@ impl<'a> SuppressionsBuilder<'a> {
                                 suppressed_range,
                             });
                         }
-                        Err(error) => self.unknown.push(UnknownSuppression {
-                            range: code_range,
-                            comment_range: comment.range(),
-                            reason: error,
-                        }),
                     }
                 }
             }
@@ -656,6 +733,32 @@ impl<'a> SuppressionsBuilder<'a> {
 
     fn add_invalid_comment(&mut self, kind: SuppressionKind, error: ParseError) {
         self.invalid.push(InvalidSuppression { kind, error });
+    }
+}
+
+fn mypy_code_to_ty_codes(code: &str) -> &'static [&'static str] {
+    match code {
+        "arg-type" | "reportArgumentType" => &[
+            "invalid-argument-type",
+            "missing-typed-dict-key",
+            "invalid-key",
+        ],
+        "assignment"
+        | "method-assign"
+        | "reportAssignmentType"
+        | "reportIncompatibleVariableOverride" => &["invalid-assignment"],
+        "attr-defined" | "union-attr" | "reportFunctionMemberAccess" => &["unresolved-attribute"],
+        "reportAttributeAccessIssue" => &["unresolved-attribute", "invalid-assignment"],
+        "call-arg" => &["missing-argument", "unknown-argument"],
+        "index" => &["not-subscriptable", "invalid-key"],
+        "import-not-found" | "reportMissingImports" => &["unresolved-import"],
+        "list-item" => &["invalid-assignment", "invalid-argument-type"],
+        "name-defined" => &["unresolved-reference"],
+        "operator" | "reportOperatorIssue" => &["unsupported-operator"],
+        "override" | "reportIncompatibleMethodOverride" => &["invalid-method-override"],
+        "return-value" | "no-any-return" | "reportReturnType" => &["invalid-return-type"],
+        "typeddict-item" => &["missing-typed-dict-key", "invalid-key"],
+        _ => &[],
     }
 }
 

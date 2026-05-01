@@ -1345,6 +1345,42 @@ pub struct AnalysisOptions {
     )]
     pub respect_type_ignore_comments: Option<bool>,
 
+    /// Whether mypy- and Pyright-style codes in `type: ignore[...]` comments should suppress
+    /// equivalent ty diagnostics.
+    ///
+    /// When enabled, ty maps common external checker codes such as `arg-type`,
+    /// `reportArgumentType`, and `attr-defined` to equivalent ty diagnostics. This is useful when
+    /// migrating projects that already have checker-specific suppressions and need ty to coexist
+    /// with them.
+    ///
+    /// Defaults to `false`.
+    #[option(
+        default = r#"false"#,
+        value_type = "bool",
+        example = r#"
+        # Allow existing mypy-style ignores to suppress equivalent ty diagnostics
+        respect-mypy-type-ignore-codes = true
+        "#
+    )]
+    pub respect_mypy_type_ignore_codes: Option<bool>,
+
+    /// Whether ty should respect `pyright: ignore[...]` comments.
+    ///
+    /// When enabled, ty maps common Pyright codes such as `reportArgumentType` and
+    /// `reportAttributeAccessIssue` to equivalent ty diagnostics. This is useful when migrating
+    /// projects that already use Pyright suppressions.
+    ///
+    /// Defaults to `false`.
+    #[option(
+        default = r#"false"#,
+        value_type = "bool",
+        example = r#"
+        # Allow existing Pyright ignores to suppress equivalent ty diagnostics
+        respect-pyright-ignore-comments = true
+        "#
+    )]
+    pub respect_pyright_ignore_comments: Option<bool>,
+
     /// Whether assignments that monkeypatch function-valued attributes should be allowed.
     ///
     /// When enabled, ty widens function-valued assignment targets to their callable type for
@@ -1364,6 +1400,28 @@ pub struct AnalysisOptions {
         "#
     )]
     pub allow_function_monkeypatches: Option<bool>,
+
+    /// Whether common `unittest.mock` assertion and configuration attributes should be allowed on
+    /// function-valued objects.
+    ///
+    /// When enabled, ty permits attributes like `assert_called_once_with`, `assert_awaited_once`,
+    /// `return_value`, and `side_effect` on callable values. This is useful for monkeypatch-heavy
+    /// test code where a method is replaced by `Mock` or `AsyncMock`, but subsequent assertions are
+    /// still written through the original method attribute.
+    ///
+    /// Defaults to `false`.
+    #[option(
+        default = r#"false"#,
+        value_type = "bool",
+        example = r#"
+        [[tool.ty.overrides]]
+        include = ["tests/**"]
+
+        [tool.ty.overrides.analysis]
+        allow-mock-function-attributes = true
+        "#
+    )]
+    pub allow_mock_function_attributes: Option<bool>,
 
     /// A list of module glob patterns for which `unresolved-import` diagnostics should be suppressed.
     ///
@@ -1423,14 +1481,20 @@ impl AnalysisOptions {
     ) -> AnalysisSettings {
         let Self {
             respect_type_ignore_comments,
+            respect_mypy_type_ignore_codes,
+            respect_pyright_ignore_comments,
             allow_function_monkeypatches,
+            allow_mock_function_attributes,
             allowed_unresolved_imports,
             replace_imports_with_any,
         } = self;
 
         let AnalysisSettings {
             respect_type_ignore_comments: respect_type_ignore_default,
+            respect_mypy_type_ignore_codes: respect_mypy_type_ignore_codes_default,
+            respect_pyright_ignore_comments: respect_pyright_ignore_comments_default,
             allow_function_monkeypatches: allow_function_monkeypatches_default,
+            allow_mock_function_attributes: allow_mock_function_attributes_default,
             allowed_unresolved_imports: allowed_unresolved_imports_default,
             replace_imports_with_any: replace_imports_with_any_default,
         } = AnalysisSettings::default();
@@ -1460,8 +1524,14 @@ impl AnalysisOptions {
         AnalysisSettings {
             respect_type_ignore_comments: respect_type_ignore_comments
                 .unwrap_or(respect_type_ignore_default),
+            respect_mypy_type_ignore_codes: respect_mypy_type_ignore_codes
+                .unwrap_or(respect_mypy_type_ignore_codes_default),
+            respect_pyright_ignore_comments: respect_pyright_ignore_comments
+                .unwrap_or(respect_pyright_ignore_comments_default),
             allow_function_monkeypatches: allow_function_monkeypatches
                 .unwrap_or(allow_function_monkeypatches_default),
+            allow_mock_function_attributes: allow_mock_function_attributes
+                .unwrap_or(allow_mock_function_attributes_default),
             allowed_unresolved_imports,
             replace_imports_with_any,
         }

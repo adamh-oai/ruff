@@ -60,7 +60,7 @@ use crate::types::{
 use crate::{DisplaySettings, FxOrderSet, Program};
 use ruff_db::diagnostic::{Annotation, Diagnostic, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_python_ast::{self as ast, AnyNodeRef, ArgOrKeyword, PythonVersion};
-use ty_module_resolver::KnownModule;
+use ty_module_resolver::{KnownModule, file_to_module};
 use ty_python_core::scope::NodeWithScopeKind;
 use ty_python_core::{EvaluationMode, semantic_index};
 
@@ -80,19 +80,56 @@ enum CallErrorPriority {
 
 fn is_dataclass_field_specifier<'db>(
     db: &'db dyn Db,
-    function: FunctionType<'db>,
+    field_specifier_type: Type<'db>,
     dataclass_field_specifiers: &[Type<'db>],
 ) -> bool {
+    if is_pydantic_field_specifier_type(db, field_specifier_type) {
+        return true;
+    }
+
     dataclass_field_specifiers.iter().any(|specifier| {
-        if *specifier == Type::FunctionLiteral(function) {
+        if *specifier == field_specifier_type {
             return true;
         }
 
-        specifier.bindings(db).iter_flat().any(|binding| {
-            binding.callable_type.as_function_literal() == Some(function)
-                || binding.signature_type.as_function_literal() == Some(function)
+        specifier.bindings(db).iter_flat().any(|specifier_binding| {
+            let specifier_function = specifier_binding
+                .callable_type
+                .as_function_literal()
+                .or_else(|| specifier_binding.signature_type.as_function_literal());
+
+            specifier_function.is_some_and(|specifier_function| {
+                field_specifier_type
+                    .bindings(db)
+                    .iter_flat()
+                    .any(|field_specifier_binding| {
+                        field_specifier_binding.callable_type.as_function_literal()
+                            == Some(specifier_function)
+                            || field_specifier_binding.signature_type.as_function_literal()
+                                == Some(specifier_function)
+                    })
+            })
         })
     })
+}
+
+fn is_pydantic_field_specifier_type<'db>(db: &'db dyn Db, field_specifier_type: Type<'db>) -> bool {
+    field_specifier_type
+        .bindings(db)
+        .iter_flat()
+        .any(|binding| {
+            [binding.callable_type, binding.signature_type]
+                .into_iter()
+                .filter_map(Type::as_function_literal)
+                .any(|function| {
+                    function.name(db) == "Field"
+                        && file_to_module(db, function.definition(db).file(db)).is_some_and(
+                            |module| {
+                                matches!(module.name(db).as_str(), "pydantic" | "pydantic.fields")
+                            },
+                        )
+                })
+        })
 }
 
 /// A single callable item within the union/intersection structure.
@@ -1494,10 +1531,10 @@ impl<'db> Bindings<'db> {
                         }
                     }
 
-                    Type::FunctionLiteral(function)
+                    field_specifier_type
                         if is_dataclass_field_specifier(
                             db,
-                            function,
+                            field_specifier_type,
                             dataclass_field_specifiers,
                         ) =>
                     {
@@ -2152,9 +2189,9 @@ impl<'db> Bindings<'db> {
                             let field_specifiers: Box<[Type<'db>]> = field_specifiers_param
                                 .map(|tuple_type| {
                                     tuple_type
-                                        .exact_tuple_instance_spec(db)
+                                        .tuple_instance_spec(db)
                                         .iter()
-                                        .flat_map(|tuple_spec| tuple_spec.fixed_elements())
+                                        .flat_map(|tuple_spec| tuple_spec.all_elements())
                                         .copied()
                                         .collect::<Vec<_>>()
                                         .into_boxed_slice()

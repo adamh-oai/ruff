@@ -71,6 +71,7 @@ pub(super) fn check_unused_suppressions(context: &mut CheckSuppressionsContext) 
     while let Some(suppression) = unused_iter.next() {
         let unused_lint = match suppression.kind {
             SuppressionKind::Ty => &UNUSED_IGNORE_COMMENT,
+            SuppressionKind::Pyright => &UNUSED_IGNORE_COMMENT,
             SuppressionKind::TypeIgnore => &UNUSED_TYPE_IGNORE_COMMENT,
         };
 

@@ -89,6 +89,22 @@ reveal_type(Result.__init__)  # revealed: (self: Result, *, _meta: dict[str, obj
 Result(_meta=None)
 ```
 
+## `Field` alias via module attribute
+
+Alias-based constructor synthesis should also work when `Field` is referenced through the `pydantic`
+module:
+
+```py
+import pydantic
+
+class Result(pydantic.BaseModel):
+    meta: dict[str, object] | None = pydantic.Field(alias="_meta", default=None)
+
+reveal_type(Result.__init__)  # revealed: (self: Result, *, _meta: dict[str, object] | None = None) -> None
+
+Result(_meta=None)
+```
+
 ## `Field` literal defaults should satisfy literal-union annotations
 
 Explicit literal defaults should remain precise when Pydantic `Field(...)` is used as a field

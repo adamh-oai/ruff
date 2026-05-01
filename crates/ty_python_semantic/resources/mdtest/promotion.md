@@ -61,6 +61,13 @@ reveal_type(promote(x5))  # revealed: list[int | float]
 x6 = 3.14j
 reveal_type(x6)  # revealed: complex
 reveal_type(promote(x6))  # revealed: list[int | float | complex]
+
+def source() -> LiteralString:
+    return "hello"
+
+literal_string = source()
+reveal_type(literal_string)  # revealed: LiteralString
+reveal_type([literal_string])  # revealed: list[str]
 ```
 
 Function types are also promoted to their `Callable` form:

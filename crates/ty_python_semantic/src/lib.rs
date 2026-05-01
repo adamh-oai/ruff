@@ -96,12 +96,30 @@ pub struct AnalysisSettings {
     /// * report invalid `type: ignore` comments
     pub respect_type_ignore_comments: bool,
 
+    /// Whether mypy-style codes in `type: ignore[...]` comments should suppress equivalent ty
+    /// diagnostics.
+    ///
+    /// When disabled, ty only respects `ty:`-prefixed codes inside `type: ignore[...]`, preserving
+    /// the default behavior that avoids ambiguity with other type checkers.
+    pub respect_mypy_type_ignore_codes: bool,
+
+    /// Whether errors can be suppressed with `pyright: ignore[...]` comments.
+    ///
+    /// When disabled, pyright-specific suppression comments are treated like normal comments.
+    pub respect_pyright_ignore_comments: bool,
+
     /// Whether assignments that monkeypatch function-valued attributes should be allowed.
     ///
     /// When enabled, ty widens function-valued assignment targets to their callable type for
     /// assignment validation. This keeps non-callables rejected while allowing test-style
     /// replacements like `AsyncMock`, `MagicMock`, lambdas, and helper functions.
     pub allow_function_monkeypatches: bool,
+
+    /// Whether common `unittest.mock` attributes should be allowed on function-valued objects.
+    ///
+    /// This is useful for tests that monkeypatch methods with `Mock`/`AsyncMock` and then access
+    /// assertion/configuration attributes through the original method name.
+    pub allow_mock_function_attributes: bool,
 
     pub allowed_unresolved_imports: ModuleGlobSet,
 
@@ -112,7 +130,10 @@ impl Default for AnalysisSettings {
     fn default() -> Self {
         Self {
             respect_type_ignore_comments: true,
+            respect_mypy_type_ignore_codes: false,
+            respect_pyright_ignore_comments: false,
             allow_function_monkeypatches: false,
+            allow_mock_function_attributes: false,
             allowed_unresolved_imports: ModuleGlobSet::empty(),
             replace_imports_with_any: ModuleGlobSet::empty(),
         }

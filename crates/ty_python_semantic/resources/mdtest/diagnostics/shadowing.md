@@ -71,3 +71,35 @@ class Suggestions:
 suggestions = Suggestions()
 suggestions.enabled = lambda: False
 ```
+
+## Mock function attributes require config
+
+This behavior is intentionally opt-in because it treats function-valued attributes as dynamic
+`unittest.mock` objects for common test assertion and configuration APIs.
+
+```py
+def fetch() -> int:
+    return 1
+
+fetch.assert_called_once_with()  # error: [unresolved-attribute]
+fetch.return_value = 2  # error: [unresolved-attribute]
+```
+
+## Mock function attributes under config
+
+```toml
+[analysis]
+allow-mock-function-attributes = true
+```
+
+```py
+def fetch() -> int:
+    return 1
+
+fetch.assert_called_once_with()
+fetch.return_value = 2
+fetch.side_effect = RuntimeError("boom")
+reveal_type(fetch.await_args)  # revealed: Unknown
+
+fetch.not_a_mock_attribute  # error: [unresolved-attribute]
+```

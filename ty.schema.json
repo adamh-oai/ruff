@@ -72,6 +72,20 @@
     "AnalysisOptions": {
       "type": "object",
       "properties": {
+        "allow-function-monkeypatches": {
+          "description": "Whether assignments that monkeypatch function-valued attributes should be allowed.\n\nWhen enabled, ty widens function-valued assignment targets to their callable type for\nassignment validation. This is useful for monkeypatch-heavy test code, where direct\nassignments like `client.fetch = AsyncMock(...)` are common and intentional.\n\nDefaults to `false`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allow-mock-function-attributes": {
+          "description": "Whether common `unittest.mock` assertion and configuration attributes should be allowed on\nfunction-valued objects.\n\nWhen enabled, ty permits attributes like `assert_called_once_with`, `assert_awaited_once`,\n`return_value`, and `side_effect` on callable values. This is useful for monkeypatch-heavy\ntest code where a method is replaced by `Mock` or `AsyncMock`, but subsequent assertions are\nstill written through the original method attribute.\n\nDefaults to `false`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "allowed-unresolved-imports": {
           "description": "A list of module glob patterns for which `unresolved-import` diagnostics should be suppressed.\n\nDetails on supported glob patterns:\n- `*` matches zero or more characters except `.`. For example, `foo.*` matches `foo.bar` but\n  not `foo.bar.baz`; `foo*` matches `foo` and `foobar` but not `foo.bar` or `barfoo`; and `*foo`\n  matches `foo` and `barfoo` but not `foo.bar` or `foobar`.\n- `**` matches any number of module components (e.g., `foo.**` matches `foo`, `foo.bar`, etc.)\n- Prefix a pattern with `!` to exclude matching modules\n\nWhen multiple patterns match, later entries take precedence.\n\nGlob patterns can be used in combinations with each other. For example, to suppress errors for\nany module where the first component contains the substring `test`, use `*test*.**`.",
           "type": [
@@ -91,6 +105,20 @@
           "items": {
             "$ref": "#/definitions/string"
           }
+        },
+        "respect-mypy-type-ignore-codes": {
+          "description": "Whether mypy- and Pyright-style codes in `type: ignore[...]` comments should suppress\nequivalent ty diagnostics.\n\nWhen enabled, ty maps common external checker codes such as `arg-type`,\n`reportArgumentType`, and `attr-defined` to equivalent ty diagnostics. This is useful when\nmigrating projects that already have checker-specific suppressions and need ty to coexist\nwith them.\n\nDefaults to `false`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "respect-pyright-ignore-comments": {
+          "description": "Whether ty should respect `pyright: ignore[...]` comments.\n\nWhen enabled, ty maps common Pyright codes such as `reportArgumentType` and\n`reportAttributeAccessIssue` to equivalent ty diagnostics. This is useful when migrating\nprojects that already use Pyright suppressions.\n\nDefaults to `false`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "respect-type-ignore-comments": {
           "description": "Whether ty should respect `type: ignore` comments.\n\nWhen set to `false`, `type: ignore` comments are treated like any other normal\ncomment and can't be used to suppress ty errors (you have to use `ty: ignore` instead).\n\nSetting this option can be useful when using ty alongside other type checkers or when\nyou prefer using `ty: ignore` over `type: ignore`.\n\nDefaults to `true`.",
