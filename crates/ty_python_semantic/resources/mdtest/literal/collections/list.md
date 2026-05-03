@@ -115,3 +115,25 @@ reveal_type([pick() for _ in range(1)])  # revealed: list[Color]
 literal_colors: list[Literal[Color.RED, Color.BLUE]] = [pick()]
 reveal_type(literal_colors)  # revealed: list[Literal[Color.RED, Color.BLUE]]
 ```
+
+## Unannotated list literal mutation
+
+List-mutating calls on unannotated variables initialized from list literals do not force new
+elements to match the original literal element type:
+
+```py
+class A: ...
+class B: ...
+
+xs = [A()]
+reveal_type(xs.append(B()))  # revealed: None
+
+ys: list[A] = [A()]
+ys.append(B())  # error: [invalid-argument-type]
+
+def make_as() -> list[A]:
+    return [A()]
+
+zs = make_as()
+zs.append(B())  # error: [invalid-argument-type]
+```

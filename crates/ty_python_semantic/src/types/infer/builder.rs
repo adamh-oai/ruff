@@ -7643,6 +7643,54 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         Some(KnownClass::FrozenSet.to_specialized_instance(db, &[result_element_ty]))
     }
 
+    fn infer_unannotated_list_literal_mutation_call(
+        &mut self,
+        func: &ast::Expr,
+        arguments: &ast::Arguments,
+    ) -> Option<Type<'db>> {
+        let ast::Expr::Attribute(ast::ExprAttribute { value, attr, .. }) = func else {
+            return None;
+        };
+
+        if !arguments.keywords.is_empty() {
+            return None;
+        }
+
+        let object_ty = self.expression_type(value);
+        if !self.unannotated_list_literal_mutation_target(value, object_ty) {
+            return None;
+        }
+
+        match attr.id.as_str() {
+            "append" => {
+                let [element] = arguments.args.as_ref() else {
+                    return None;
+                };
+                if element.is_starred_expr() {
+                    return None;
+                }
+
+                self.infer_expression(element, TypeContext::default());
+                Some(Type::none(self.db()))
+            }
+            "extend" => {
+                let [iterable] = arguments.args.as_ref() else {
+                    return None;
+                };
+                if iterable.is_starred_expr() {
+                    return None;
+                }
+
+                let iterable_ty = self.infer_expression(iterable, TypeContext::default());
+                if let Err(err) = iterable_ty.try_iterate(self.db()) {
+                    err.report_diagnostic(&self.context, iterable_ty, iterable.into());
+                }
+                Some(Type::none(self.db()))
+            }
+            _ => None,
+        }
+    }
+
     fn infer_call_expression_impl(
         &mut self,
         call_expression: &ast::ExprCall,
@@ -7754,6 +7802,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         if callable_type == Type::SpecialForm(SpecialFormType::TypedDict) {
             return self.infer_typeddict_call_expression(call_expression, None);
+        }
+
+        if let Some(ty) = self.infer_unannotated_list_literal_mutation_call(func, arguments) {
+            return ty;
         }
 
         // We don't call `Type::try_call`, because we want to perform type inference on the
@@ -8534,6 +8586,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .is_some_and(|dict| dict.items.is_empty())
     }
 
+    fn list_literal_binding(&self, definition: Definition<'db>) -> bool {
+        let module = self.module();
+        let Some(value) = (match definition.kind(self.db()) {
+            DefinitionKind::Assignment(assignment) => Some(assignment.value(module)),
+            DefinitionKind::AnnotatedAssignment(assignment) => assignment.value(module),
+            _ => None,
+        }) else {
+            return false;
+        };
+
+        value.as_list_expr().is_some()
+    }
+
     fn place_has_only_empty_dict_literal_bindings_at_use(
         &self,
         place_id: ScopedPlaceId,
@@ -8554,6 +8619,33 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             has_binding = true;
             if !self.empty_dict_literal_binding(definition) {
+                return false;
+            }
+        }
+
+        has_binding
+    }
+
+    fn place_has_only_list_literal_bindings_at_use(
+        &self,
+        place_id: ScopedPlaceId,
+        use_id: ScopedUseId,
+    ) -> bool {
+        let db = self.db();
+        let use_def = self.index.use_def_map(self.scope().file_scope_id(db));
+        let mut has_binding = false;
+
+        for binding in use_def.bindings_at_use(use_id) {
+            let DefinitionState::Defined(definition) = binding.binding else {
+                continue;
+            };
+
+            if definition.place(db) != place_id {
+                continue;
+            }
+
+            has_binding = true;
+            if !self.list_literal_binding(definition) {
                 return false;
             }
         }
@@ -8734,7 +8826,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.place_is_unannotated_at_use(
             place_id,
             ast::ExprRef::from(object).scoped_use_id(db, self.scope()),
-        ) && object_ty.known_specialization(db, KnownClass::Dict).is_some()
+        ) && object_ty
+            .known_specialization(db, KnownClass::Dict)
+            .is_some()
+    }
+
+    fn unannotated_list_literal_mutation_target(
+        &self,
+        object: &ast::Expr,
+        object_ty: Type<'db>,
+    ) -> bool {
+        let db = self.db();
+        let file_scope_id = self.scope().file_scope_id(db);
+        let Some(place_expr) = PlaceExpr::try_from_expr(object) else {
+            return false;
+        };
+        let Some(place_id) = self.index.place_table(file_scope_id).place_id(&place_expr) else {
+            return false;
+        };
+
+        let use_id = ast::ExprRef::from(object).scoped_use_id(db, self.scope());
+
+        self.place_is_unannotated_at_use(place_id, use_id)
+            && self.place_has_only_list_literal_bindings_at_use(place_id, use_id)
+            && object_ty
+                .known_specialization(db, KnownClass::List)
+                .is_some()
     }
 
     fn infer_local_place_load(
