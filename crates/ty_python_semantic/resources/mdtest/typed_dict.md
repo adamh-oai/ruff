@@ -71,6 +71,33 @@ takes_formatter({"format": "%(message)s"})
 takes_formatter({"factory": object(), "facility": "local0"})
 ```
 
+Dictionary literals inside fresh mutable collection literals should use the element type from
+covariant protocol contexts:
+
+```py
+from collections.abc import Iterable
+from typing import Literal, TypedDict
+
+class ToolParam(TypedDict):
+    type: Literal["web_search"]
+
+def takes_tools(tools: Iterable[ToolParam]) -> None: ...
+
+takes_tools([{"type": "web_search"}])
+
+class FunctionToolParam(TypedDict):
+    type: Literal["function"]
+    name: str
+
+def takes_tool_union(tools: Iterable[ToolParam | FunctionToolParam]) -> None: ...
+
+takes_tool_union([{"type": "web_search"}])
+
+# error: 23 [invalid-argument-type] "Invalid argument to key "type" with declared type `Literal["web_search"]` on TypedDict `ToolParam`: value of type `Literal["wrong"]`"
+# error: 13 [invalid-argument-type] "Argument to function `takes_tools` is incorrect: Expected `Iterable[ToolParam]`, found `list[dict[str, str]]`"
+takes_tools([{"type": "wrong"}])
+```
+
 Methods that are available on `dict`s are also available on `TypedDict`s:
 
 ```py

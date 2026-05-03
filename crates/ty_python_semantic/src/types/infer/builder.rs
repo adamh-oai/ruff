@@ -5853,7 +5853,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .annotation
             .map(|annotation| annotation.resolve_type_alias(self.db()))
         {
-            if let Some(typed_dict) = annotation.as_typed_dict() {
+            let annotation = annotation.strip_redundant_object_intersection(self.db());
+            if let Some(typed_dict) = annotation.as_single_typed_dict_context(self.db()) {
                 // If there is a single typed dict annotation, infer against it directly.
                 if let Some(ty) =
                     self.infer_typed_dict_expression(dict, typed_dict, &mut item_types)
@@ -5864,10 +5865,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let union_elements = union.elements(self.db());
                 let typed_dicts = union_elements
                     .iter()
-                    .filter_map(|element| element.as_typed_dict())
+                    .filter_map(|element| element.as_single_typed_dict_context(self.db()))
                     .collect_vec();
                 let has_dict_compatible_fallback = union_elements.iter().any(|element| {
-                    !element.is_typed_dict() && element.is_instance_of(self.db(), KnownClass::Dict)
+                    element.as_single_typed_dict_context(self.db()).is_none()
+                        && element.is_instance_of(self.db(), KnownClass::Dict)
                 });
 
                 if let [typed_dict] = typed_dicts.as_slice()

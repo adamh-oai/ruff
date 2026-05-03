@@ -1488,6 +1488,47 @@ impl<'db> Type<'db> {
         }
     }
 
+    /// Remove a redundant `object` conjunct from an intersection.
+    ///
+    /// Constraint extraction for covariant protocol contexts can produce
+    /// intersections such as `SomeType & object`. The `object` conjunct is
+    /// redundant, so context-sensitive literal inference should treat the
+    /// intersection the same as the underlying type.
+    pub(crate) fn strip_redundant_object_intersection(self, db: &'db dyn Db) -> Type<'db> {
+        let resolved = self.resolve_type_alias(db);
+        let Type::Intersection(intersection) = resolved else {
+            return resolved;
+        };
+
+        if !intersection.negative(db).is_empty() {
+            return resolved;
+        }
+
+        let mut non_object = intersection
+            .positive(db)
+            .iter()
+            .copied()
+            .filter(|positive| !positive.is_equivalent_to(db, Type::object()));
+
+        match (non_object.next(), non_object.next()) {
+            (Some(ty), None) => ty,
+            (None, None) => Type::object(),
+            _ => resolved,
+        }
+    }
+
+    /// If this type can be used as a single `TypedDict` context, returns that
+    /// `TypedDict`.
+    pub(crate) fn as_single_typed_dict_context(
+        self,
+        db: &'db dyn Db,
+    ) -> Option<TypedDictType<'db>> {
+        match self.strip_redundant_object_intersection(db) {
+            Type::TypedDict(typed_dict) => Some(typed_dict),
+            _ => None,
+        }
+    }
+
     /// Turn a class literal (`Type::ClassLiteral` or `Type::GenericAlias`) into a `ClassType`.
     /// Since a `ClassType` must be specialized, apply the default specialization to any
     /// unspecialized generic class literal.

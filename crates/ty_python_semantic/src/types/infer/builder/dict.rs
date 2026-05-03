@@ -26,8 +26,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         // then validate and return the TypedDict type.
         if let Some(tcx) = call_expression_tcx.annotation
             && let Some(typed_dict) = tcx
-                .filter_union(self.db(), Type::is_typed_dict)
-                .as_typed_dict()
+                .strip_redundant_object_intersection(self.db())
+                .filter_union(self.db(), |ty| {
+                    ty.as_single_typed_dict_context(self.db()).is_some()
+                })
+                .as_single_typed_dict_context(self.db())
         {
             let items = typed_dict.items(self.db());
             for keyword in &arguments.keywords {
