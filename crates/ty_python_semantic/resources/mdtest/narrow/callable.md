@@ -42,6 +42,28 @@ def h(x: Callable[..., int] | None):
         reveal_type(x)  # revealed: None
 ```
 
+## Narrowing unions with non-callable arms
+
+When the narrowed value already has visible callable arms, the true branch should preserve those
+callable signatures instead of keeping the non-callable arms intersected with the top callable type.
+
+```py
+from collections.abc import Awaitable
+from typing import Callable
+
+def render(template: str | Callable[[dict[str, str]], str], mapping: dict[str, str]) -> str:
+    if callable(template):
+        reveal_type(template)  # revealed: (dict[str, str], /) -> str
+        return template(mapping)
+    return template
+
+def run_callback(callback: Callable[[], int] | Awaitable[int]) -> int | None:
+    if callable(callback):
+        reveal_type(callback)  # revealed: () -> int
+        return callback()
+    return None
+```
+
 ## Narrowing from object
 
 ```py

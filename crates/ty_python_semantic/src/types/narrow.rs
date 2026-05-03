@@ -879,6 +879,60 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         }
     }
 
+    /// Narrow to callable arms that are already visible in the current type.
+    ///
+    /// For broad values like `object`, `callable(x)` still narrows to the generic
+    /// `Top[Callable[..., object]]` via the `TypeIs` return type. This helper is only for unions
+    /// that already contain a precise callable arm, where keeping non-callable arms as
+    /// `T & Top[Callable[..., object]]` would hide that known signature behind a top callable.
+    fn visibly_callable_type(db: &'db dyn Db, ty: Type<'db>) -> Option<(Type<'db>, bool)> {
+        match ty {
+            Type::Union(union) => {
+                let mut has_precise_callable = false;
+                let narrowed = union.elements(db).iter().filter_map(|element| {
+                    let (narrowed, is_precise) = Self::visibly_callable_type(db, *element)?;
+                    has_precise_callable |= is_precise;
+                    Some(narrowed)
+                });
+                let narrowed = UnionType::from_elements(db, narrowed);
+                (narrowed != Type::Never).then_some((narrowed, has_precise_callable))
+            }
+            Type::Intersection(intersection) => {
+                let mut builder = IntersectionBuilder::new(db);
+                let mut narrowed_any_positive = false;
+                let mut has_precise_callable = false;
+
+                for positive in intersection.positive(db) {
+                    if let Some((narrowed, is_precise)) = Self::visibly_callable_type(db, *positive)
+                    {
+                        builder = builder.add_positive(narrowed);
+                        narrowed_any_positive = true;
+                        has_precise_callable |= is_precise;
+                    } else {
+                        builder = builder.add_positive(*positive);
+                    }
+                }
+
+                if !narrowed_any_positive {
+                    return ty
+                        .try_upcast_to_callable(db)
+                        .is_some()
+                        .then_some((ty, !ty.is_dynamic()));
+                }
+
+                for negative in intersection.negative(db) {
+                    builder = builder.add_negative(*negative);
+                }
+
+                Some((builder.build(), has_precise_callable))
+            }
+            _ => ty
+                .try_upcast_to_callable(db)
+                .is_some()
+                .then_some((ty, !ty.is_dynamic())),
+        }
+    }
+
     fn evaluate_simple_expr(
         &mut self,
         expr: &ast::Expr,
@@ -1575,6 +1629,12 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
     ) -> Option<NarrowingConstraints<'db>> {
         let inference = infer_expression_types(self.db, expression, TypeContext::default());
 
+        if let Some(callable_call_constraints) =
+            self.evaluate_callable_builtin_call(inference, expr_call, is_positive)
+        {
+            return Some(callable_call_constraints);
+        }
+
         if let Some(type_guard_call_constraints) =
             self.evaluate_type_guard_call(inference, expr_call, is_positive)
         {
@@ -1668,6 +1728,43 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             }
             _ => None,
         }
+    }
+
+    fn evaluate_callable_builtin_call(
+        &mut self,
+        inference: &ExpressionInference<'db>,
+        expr_call: &ast::ExprCall,
+        is_positive: bool,
+    ) -> Option<NarrowingConstraints<'db>> {
+        if !is_positive || !expr_call.arguments.keywords.is_empty() {
+            return None;
+        }
+
+        let [arg] = &*expr_call.arguments.args else {
+            return None;
+        };
+
+        let Type::FunctionLiteral(function_type) = inference.expression_type(&*expr_call.func)
+        else {
+            return None;
+        };
+
+        if function_type.known(self.db) != Some(KnownFunction::Callable) {
+            return None;
+        }
+
+        let target = PlaceExpr::try_from_expr(arg)?;
+        let place = self.expect_place(&target);
+        let (narrowed_ty, has_precise_callable) =
+            Self::visibly_callable_type(self.db, inference.expression_type(arg))?;
+        if !has_precise_callable {
+            return None;
+        }
+
+        Some(NarrowingConstraints::from_iter([(
+            place,
+            NarrowingConstraint::replacement(narrowed_ty),
+        )]))
     }
 
     // Helper to evaluate TypeGuard/TypeIs narrowing for a call expression.

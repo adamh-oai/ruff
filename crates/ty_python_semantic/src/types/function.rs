@@ -1689,6 +1689,8 @@ pub enum KnownFunction {
     RevealType,
     /// `builtins.len`
     Len,
+    /// `builtins.callable`
+    Callable,
     /// `builtins.repr`
     Repr,
     /// `builtins.__import__`, which returns the top-level module.
@@ -1819,6 +1821,7 @@ impl KnownFunction {
             | Self::IsSubclass
             | Self::HasAttr
             | Self::Len
+            | Self::Callable
             | Self::Repr
             | Self::DunderImport => module.is_builtins(),
             Self::AssertType
