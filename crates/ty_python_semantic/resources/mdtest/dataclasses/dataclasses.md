@@ -54,6 +54,35 @@ Person("Eve", "string instead of int")
 Person(20, "Eve")
 ```
 
+## `is_dataclass` reachability
+
+`dataclasses.is_dataclass` is always true for actual dataclass classes and instances, including
+subclasses of dataclasses:
+
+```py
+from dataclasses import asdict, dataclass, is_dataclass
+
+@dataclass
+class Event:
+    x: int
+
+class ChildEvent(Event): ...
+
+def serialize_event(event: Event) -> dict[str, object]:
+    if is_dataclass(event):
+        reveal_type(event)  # revealed: Event
+        return asdict(event)
+    else:
+        reveal_type(event)  # revealed: Never
+        return dict(event)
+
+def serialize_child_event(event: ChildEvent) -> dict[str, object]:
+    if not is_dataclass(event):
+        reveal_type(event)  # revealed: Never
+        return dict(event)
+    return asdict(event)
+```
+
 ## Signature of `__init__`
 
 Declarations in the class body are used to generate the signature of the `__init__` method. If the

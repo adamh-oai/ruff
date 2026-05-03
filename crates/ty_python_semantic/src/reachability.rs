@@ -198,10 +198,13 @@ use crate::{
     dunder_all::dunder_all_names,
     place::{DefinedPlace, Definedness, Place, RequiresExplicitReExport, imported_symbol},
     types::{
-        CallableTypes, IntersectionBuilder, KnownClass, NarrowingConstraint, Type, TypeContext,
-        UnionBuilder, UnionType, infer_expression_type, infer_narrowing_constraint,
+        CallableTypes, IntersectionBuilder, KnownClass, KnownFunction, NarrowingConstraint, Type,
+        TypeContext, UnionBuilder, UnionType, infer_expression_type, infer_expression_types,
+        infer_narrowing_constraint,
     },
 };
+use ruff_db::parsed::parsed_module;
+use ruff_python_ast as ast;
 use ruff_text_size::TextRange;
 use ty_python_core::{
     BindingWithConstraints, DeclarationWithConstraint, DeclarationsIterator, FileScopeId,
@@ -677,11 +680,11 @@ fn analyze_single(db: &dyn Db, predicate: &Predicate) -> Truthiness {
     let _span = tracing::trace_span!("analyze_single", ?predicate).entered();
 
     match predicate.node {
-        PredicateNode::Expression(test_expr) => {
-            infer_expression_type(db, test_expr, TypeContext::default())
-                .bool(db)
-                .negate_if(!predicate.is_positive)
-        }
+        PredicateNode::Expression(test_expr) => analyze_dataclass_check(db, test_expr)
+            .unwrap_or_else(|| {
+                infer_expression_type(db, test_expr, TypeContext::default()).bool(db)
+            })
+            .negate_if(!predicate.is_positive),
         PredicateNode::IsNonTerminalCall(CallableAndCallExpr {
             callable,
             call_expr,
@@ -783,6 +786,38 @@ fn analyze_single(db: &dyn Db, predicate: &Predicate) -> Truthiness {
             }
         }
     }
+}
+
+fn analyze_dataclass_check(
+    db: &dyn Db,
+    test_expr: ty_python_core::expression::Expression,
+) -> Option<Truthiness> {
+    let module = parsed_module(db, test_expr.file(db)).load(db);
+    let ast::Expr::Call(call) = test_expr.node_ref(db).node(&module) else {
+        return None;
+    };
+
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+
+    let [arg] = &*call.arguments.args else {
+        return None;
+    };
+
+    let inference = infer_expression_types(db, test_expr, TypeContext::default());
+    let callable_ty = inference.expression_type(&*call.func);
+    if !callable_ty
+        .as_function_literal()
+        .is_some_and(|function| function.known(db) == Some(KnownFunction::IsDataclass))
+    {
+        return None;
+    }
+
+    inference
+        .expression_type(arg)
+        .is_definitely_actual_dataclass_object(db)
+        .then_some(Truthiness::AlwaysTrue)
 }
 
 /// Check whether a diagnostic emitted at `range` is in reachable code, considering both

@@ -57,9 +57,10 @@ use crate::types::context::{LintDiagnosticGuard, LintDiagnosticGuardBuilder};
 use crate::types::diagnostic::{INVALID_AWAIT, INVALID_TYPE_FORM};
 pub use crate::types::display::{DisplaySettings, TypeDetail, TypeDisplayDetails};
 use crate::types::enums::enum_metadata;
+pub(crate) use crate::types::function::KnownFunction;
 use crate::types::function::{
     DataclassTransformerFlags, DataclassTransformerParams, FunctionDecorators, FunctionSpans,
-    FunctionType, KnownFunction,
+    FunctionType,
 };
 pub(crate) use crate::types::generics::GenericContext;
 use crate::types::generics::{
@@ -1088,6 +1089,21 @@ impl<'db> Type<'db> {
         self.as_nominal_instance().is_some_and(|instance| {
             crate::types::enums::enum_metadata(db, instance.class_literal(db)).is_some()
         })
+    }
+
+    pub(crate) fn is_definitely_actual_dataclass_object(self, db: &'db dyn Db) -> bool {
+        match self {
+            Type::ClassLiteral(class) => class.is_actual_dataclass(db),
+            Type::NominalInstance(instance) => instance.class_literal(db).is_actual_dataclass(db),
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .all(|element| element.is_definitely_actual_dataclass_object(db)),
+            Type::Intersection(intersection) => intersection
+                .positive_elements_or_object(db)
+                .any(|element| element.is_definitely_actual_dataclass_object(db)),
+            _ => false,
+        }
     }
 
     fn is_typealias_special_form(&self) -> bool {

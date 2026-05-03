@@ -508,6 +508,30 @@ impl<'db> ClassLiteral<'db> {
         }
     }
 
+    /// Returns whether `dataclasses.is_dataclass` is definitely true for this class object.
+    ///
+    /// This intentionally only considers actual dataclass parameters, including inherited
+    /// dataclass bases. Classes that are merely dataclass-like via `dataclass_transform` are
+    /// excluded because `dataclasses.is_dataclass` is a runtime stdlib check.
+    pub(crate) fn is_actual_dataclass(self, db: &'db dyn Db) -> bool {
+        match self {
+            Self::Static(class) => class.iter_mro(db, None).any(|base| {
+                base.into_class()
+                    .and_then(|class| class.static_class_literal(db))
+                    .is_some_and(|(class, _)| class.dataclass_params(db).is_some())
+            }),
+            Self::Dynamic(class) => {
+                class.dataclass_params(db).is_some()
+                    || class.iter_mro(db).skip(1).any(|base| {
+                        base.into_class()
+                            .and_then(|class| class.static_class_literal(db))
+                            .is_some_and(|(class, _)| class.dataclass_params(db).is_some())
+                    })
+            }
+            Self::DynamicNamedTuple(_) | Self::DynamicTypedDict(_) | Self::DynamicEnum(_) => false,
+        }
+    }
+
     /// Returns whether this class is `builtins.tuple` exactly
     pub(crate) fn is_tuple(self, db: &'db dyn Db) -> bool {
         match self {

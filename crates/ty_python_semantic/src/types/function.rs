@@ -1739,6 +1739,8 @@ pub enum KnownFunction {
 
     /// `dataclasses.dataclass`
     Dataclass,
+    /// `dataclasses.is_dataclass`
+    IsDataclass,
     /// `dataclasses.field`
     Field,
 
@@ -1845,7 +1847,7 @@ impl KnownFunction {
             Self::AsyncContextManager => {
                 matches!(module, KnownModule::Contextlib)
             }
-            Self::Dataclass | Self::Field => {
+            Self::Dataclass | Self::IsDataclass | Self::Field => {
                 matches!(module, KnownModule::Dataclasses)
             }
             Self::TotalOrdering => module.is_functools(),
@@ -2337,7 +2339,9 @@ pub(crate) mod tests {
 
                 KnownFunction::AsyncContextManager => KnownModule::Contextlib,
 
-                KnownFunction::Dataclass | KnownFunction::Field => KnownModule::Dataclasses,
+                KnownFunction::Dataclass | KnownFunction::IsDataclass | KnownFunction::Field => {
+                    KnownModule::Dataclasses
+                }
 
                 KnownFunction::GetattrStatic => KnownModule::Inspect,
 
