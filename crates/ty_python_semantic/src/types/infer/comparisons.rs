@@ -833,6 +833,37 @@ fn infer_rich_comparison<'db>(
 ) -> Result<Type<'db>, UnsupportedComparisonError<'db>> {
     // The following resource has details about the rich comparison algorithm:
     // https://snarky.ca/unravelling-rich-comparison-operators/
+    struct RichComparisonDunderResult<'db> {
+        return_ty: Option<Type<'db>>,
+        may_return_notimplemented: bool,
+    }
+
+    let remove_notimplemented = |return_ty: Type<'db>| {
+        let resolved = return_ty.resolve_type_alias(db);
+        if let Type::Union(union) = resolved {
+            let mut may_return_notimplemented = false;
+            let filtered = union.filter(db, |element| {
+                let is_notimplemented = element.is_notimplemented(db);
+                may_return_notimplemented |= is_notimplemented;
+                !is_notimplemented
+            });
+            RichComparisonDunderResult {
+                return_ty: (!matches!(filtered, Type::Never)).then_some(filtered),
+                may_return_notimplemented,
+            }
+        } else if resolved.is_notimplemented(db) {
+            RichComparisonDunderResult {
+                return_ty: None,
+                may_return_notimplemented: true,
+            }
+        } else {
+            RichComparisonDunderResult {
+                return_ty: Some(return_ty),
+                may_return_notimplemented: false,
+            }
+        }
+    };
+
     let call_dunder = |op: RichCompareOperator, left: Type<'db>, right: Type<'db>| {
         left.try_call_dunder_with_policy(
             db,
@@ -842,14 +873,42 @@ fn infer_rich_comparison<'db>(
             policy,
         )
         .map(|outcome| outcome.return_type(db))
+        .map(remove_notimplemented)
         .ok()
     };
 
+    let call_dunders =
+        |first: (RichCompareOperator, Type<'db>, Type<'db>),
+         second: (RichCompareOperator, Type<'db>, Type<'db>)| {
+            let mut builder = UnionBuilder::new(db);
+            let mut has_return_ty = false;
+            let mut should_try_second = true;
+
+            if let Some(result) = call_dunder(first.0, first.1, first.2) {
+                if let Some(return_ty) = result.return_ty {
+                    builder.add_in_place(return_ty);
+                    has_return_ty = true;
+                }
+                should_try_second = result.may_return_notimplemented;
+            }
+
+            if should_try_second {
+                if let Some(result) = call_dunder(second.0, second.1, second.2) {
+                    if let Some(return_ty) = result.return_ty {
+                        builder.add_in_place(return_ty);
+                        has_return_ty = true;
+                    }
+                }
+            }
+
+            has_return_ty.then(|| builder.build())
+        };
+
     // The reflected dunder has priority if the right-hand side is a strict subclass of the left-hand side.
     if left != right && right.is_subtype_of(db, left) {
-        call_dunder(op.reflect(), right, left).or_else(|| call_dunder(op, left, right))
+        call_dunders((op.reflect(), right, left), (op, left, right))
     } else {
-        call_dunder(op, left, right).or_else(|| call_dunder(op.reflect(), right, left))
+        call_dunders((op, left, right), (op.reflect(), right, left))
     }
     .or_else(|| {
         // When no appropriate method returns any value other than NotImplemented,

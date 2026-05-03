@@ -161,6 +161,49 @@ reveal_type(C() < C())  # revealed: EqReturnType
 reveal_type(C() <= C())  # revealed: NeReturnType
 ```
 
+## Rich Comparison Dunders Returning NotImplemented
+
+Python consumes `NotImplemented` return values from rich comparison dunders: it tries the reflected
+method, falls back for equality comparisons, or raises `TypeError` for unsupported ordering
+comparisons. The comparison expression itself does not evaluate to `NotImplemented`.
+
+```py
+from types import NotImplementedType
+
+class Ordered:
+    def __ge__(self, other: object) -> bool | NotImplementedType:
+        if not isinstance(other, Ordered):
+            return NotImplemented
+        return True
+
+reveal_type(Ordered() >= Ordered())  # revealed: bool
+
+class ReflectedResult: ...
+
+class LeftOnlyNotImplemented:
+    def __lt__(self, other: object) -> NotImplementedType:
+        return NotImplemented
+
+class RightReflected:
+    def __gt__(self, other: object) -> ReflectedResult:
+        return ReflectedResult()
+
+reveal_type(LeftOnlyNotImplemented() < RightReflected())  # revealed: ReflectedResult
+
+class MaybeLeft:
+    def __lt__(self, other: object) -> int | NotImplementedType:
+        return 1 if isinstance(other, MaybeLeft) else NotImplemented
+
+reveal_type(MaybeLeft() < RightReflected())  # revealed: int | ReflectedResult
+
+class NoOrdering:
+    def __lt__(self, other: object) -> NotImplementedType:
+        return NotImplemented
+
+# error: [unsupported-operator] "Operator `<` is not supported between two objects of type `NoOrdering`"
+reveal_type(NoOrdering() < NoOrdering())  # revealed: Unknown
+```
+
 ## Reflected Comparisons with Subclasses
 
 When subclasses override comparison methods, these overridden methods take precedence over those in
