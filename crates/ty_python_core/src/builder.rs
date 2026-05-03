@@ -61,8 +61,6 @@ use crate::{
     SemanticIndex, VisibleAncestorsIter, get_loop_header,
 };
 
-use super::place::PlaceExprRef;
-
 mod except_handlers;
 mod loop_bindings_visitor;
 
@@ -742,8 +740,16 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         if let ScopedPlaceId::Symbol(symbol_id) = place_id {
             self.mark_symbol_used(symbol_id);
         }
+        let associated_places: SmallVec<[ScopedPlaceId; 4]> = self
+            .current_place_table()
+            .directly_associated_place_ids(place_id)
+            .map(ScopedPlaceId::from)
+            .collect();
+
         let use_id = self.current_ast_ids().record_use(expr);
         self.current_use_def_map_mut().record_use(place_id, use_id);
+        self.current_use_def_map_mut()
+            .record_multi_use_bindings(associated_places.into_iter(), use_id);
     }
 
     fn record_place_definition(&mut self, place_id: ScopedPlaceId, expr: &'ast ast::Expr) {
@@ -3198,25 +3204,9 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                     .place_id((&value_place_expr).into())
             })
             .map(|value_place_id| {
-                let place_table = &self.place_tables[current_scope];
-                place_table
-                    .associated_place_ids(value_place_id)
-                    .iter()
-                    .filter(move |key_member_id| {
-                        let key_member_expr = place_table.member(**key_member_id).expression();
-
-                        // Only include top-level keys.
-                        let Some(key_parent) = key_member_expr.as_ref().parent() else {
-                            return true;
-                        };
-                        match place_table.place(value_place_id) {
-                            PlaceExprRef::Symbol(_) => false,
-                            PlaceExprRef::Member(value_member) => {
-                                key_parent == value_member.expression()
-                            }
-                        }
-                    })
-                    .map(|key_member_id| ScopedPlaceId::from(*key_member_id))
+                self.place_tables[current_scope]
+                    .directly_associated_place_ids(value_place_id)
+                    .map(ScopedPlaceId::from)
             });
 
         let use_id = self.ast_ids[current_scope].record_use(keyword);

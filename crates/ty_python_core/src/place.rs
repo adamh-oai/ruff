@@ -161,6 +161,9 @@ pub enum ScopedPlaceId {
 pub struct PlaceTable {
     symbols: SymbolTable,
     members: MemberTable,
+
+    associated_symbol_members: IndexVec<ScopedSymbolId, SmallVec<[ScopedMemberId; 4]>>,
+    associated_sub_members: IndexVec<ScopedMemberId, SmallVec<[ScopedMemberId; 4]>>,
 }
 
 impl PlaceTable {
@@ -243,6 +246,35 @@ impl PlaceTable {
     pub fn member_id_by_instance_attribute_name(&self, name: &str) -> Option<ScopedMemberId> {
         self.members.place_id_by_instance_attribute_name(name)
     }
+
+    pub fn associated_place_ids(&self, place: ScopedPlaceId) -> &[ScopedMemberId] {
+        match place {
+            ScopedPlaceId::Symbol(symbol) => &self.associated_symbol_members[symbol],
+            ScopedPlaceId::Member(member) => &self.associated_sub_members[member],
+        }
+    }
+
+    pub fn directly_associated_place_ids(
+        &self,
+        place: ScopedPlaceId,
+    ) -> impl Iterator<Item = ScopedMemberId> + '_ {
+        self.associated_place_ids(place)
+            .iter()
+            .copied()
+            .filter(move |member_id| {
+                let member_expr = self.member(*member_id).expression();
+                let Some(member_parent) = member_expr.as_ref().parent() else {
+                    return place.as_symbol().is_some_and(|symbol| {
+                        self.symbol(symbol).name() == member_expr.symbol_name()
+                    });
+                };
+
+                match self.place(place) {
+                    PlaceExprRef::Symbol(_) => false,
+                    PlaceExprRef::Member(parent) => member_parent == parent.expression(),
+                }
+            })
+    }
 }
 
 #[derive(Default)]
@@ -301,6 +333,28 @@ impl PlaceTableBuilder {
             ScopedPlaceId::Symbol(symbol) => &self.associated_symbol_members[symbol],
             ScopedPlaceId::Member(member) => &self.associated_sub_members[member],
         }
+    }
+
+    pub(crate) fn directly_associated_place_ids(
+        &self,
+        place: ScopedPlaceId,
+    ) -> impl Iterator<Item = ScopedMemberId> + '_ {
+        self.associated_place_ids(place)
+            .iter()
+            .copied()
+            .filter(move |member_id| {
+                let member_expr = self.member(*member_id).expression();
+                let Some(member_parent) = member_expr.as_ref().parent() else {
+                    return place.as_symbol().is_some_and(|symbol| {
+                        self.symbol(symbol).name().as_str() == member_expr.symbol_name()
+                    });
+                };
+
+                match self.place(place) {
+                    PlaceExprRef::Symbol(_) => false,
+                    PlaceExprRef::Member(parent) => member_parent == parent.expression(),
+                }
+            })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = PlaceExprRef<'_>> {
@@ -393,6 +447,8 @@ impl PlaceTableBuilder {
         PlaceTable {
             symbols: self.symbols.build(),
             members: self.member.build(),
+            associated_symbol_members: self.associated_symbol_members,
+            associated_sub_members: self.associated_sub_members,
         }
     }
 }

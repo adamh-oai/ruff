@@ -109,7 +109,7 @@ use ty_python_core::definition::{
 use ty_python_core::expression::{Expression, ExpressionKind};
 use ty_python_core::narrowing_constraints::ConstraintKey;
 use ty_python_core::node_key::NodeKey;
-use ty_python_core::place::{PlaceExpr, PlaceExprRef};
+use ty_python_core::place::{PlaceExpr, PlaceExprRef, ScopedPlaceId};
 use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, NodeWithScopeRef, ScopeId, ScopeKind};
 use ty_python_core::symbol::{ScopedSymbolId, Symbol};
 use ty_python_core::{
@@ -1270,38 +1270,43 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // If the place is unbound and its an attribute or subscript place, fall back to normal
         // attribute/subscript inference on the root type.
-        let declared_ty =
-            if resolved_place.is_undefined() && !place_table.place(place_id).is_symbol() {
-                if let AnyNodeRef::ExprAttribute(ast::ExprAttribute { value, attr, .. }) = node {
-                    let value_type =
-                        self.infer_maybe_standalone_expression(value, TypeContext::default());
-                    if let Place::Defined(DefinedPlace {
-                        ty,
-                        definedness: Definedness::AlwaysDefined,
-                        ..
-                    }) = value_type.member(db, attr).place
-                    {
-                        // TODO: also consider qualifiers on the attribute
-                        Some(ty)
-                    } else {
-                        None
-                    }
-                } else if let AnyNodeRef::ExprSubscript(
-                    subscript @ ast::ExprSubscript {
-                        value, slice, ctx, ..
-                    },
-                ) = node
+        let declared_ty = if resolved_place.is_undefined()
+            && !place_table.place(place_id).is_symbol()
+        {
+            if let AnyNodeRef::ExprAttribute(ast::ExprAttribute { value, attr, .. }) = node {
+                let value_type =
+                    self.infer_maybe_standalone_expression(value, TypeContext::default());
+                if let Place::Defined(DefinedPlace {
+                    ty,
+                    definedness: Definedness::AlwaysDefined,
+                    ..
+                }) = value_type.member(db, attr).place
                 {
-                    let value_ty = self.infer_expression(value, TypeContext::default());
-                    let slice_ty = self.infer_expression(slice, TypeContext::default());
-                    Some(self.infer_subscript_expression_types(subscript, value_ty, slice_ty, *ctx))
+                    // TODO: also consider qualifiers on the attribute
+                    Some(ty)
                 } else {
                     None
+                }
+            } else if let AnyNodeRef::ExprSubscript(
+                subscript @ ast::ExprSubscript {
+                    value, slice, ctx, ..
+                },
+            ) = node
+            {
+                let value_ty = self.infer_expression(value, TypeContext::default());
+                if self.unannotated_dict_assignment_target(value, value_ty) {
+                    None
+                } else {
+                    let slice_ty = self.infer_expression(slice, TypeContext::default());
+                    Some(self.infer_subscript_expression_types(subscript, value_ty, slice_ty, *ctx))
                 }
             } else {
                 None
             }
-            .or_else(|| resolved_place.ignore_possibly_undefined());
+        } else {
+            None
+        }
+        .or_else(|| resolved_place.ignore_possibly_undefined());
 
         AddBinding {
             declared_ty: if all_declarations_are_imports {
@@ -8478,6 +8483,260 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ty.inner_type()
     }
 
+    fn place_is_unannotated_at_use(&self, place_id: ScopedPlaceId, use_id: ScopedUseId) -> bool {
+        let db = self.db();
+        let use_def = self.index.use_def_map(self.scope().file_scope_id(db));
+        let mut has_binding = false;
+
+        for binding in use_def.bindings_at_use(use_id) {
+            let DefinitionState::Defined(definition) = binding.binding else {
+                continue;
+            };
+
+            if definition.place(db) != place_id {
+                continue;
+            }
+
+            has_binding = true;
+            if definition
+                .kind(db)
+                .category(self.context.in_stub(), self.module())
+                .is_declaration()
+            {
+                return false;
+            }
+            if let Some(declarations) = use_def.try_declarations_at_binding(definition) {
+                if !place_from_declarations(db, declarations)
+                    .ignore_conflicting_declarations()
+                    .is_undefined()
+                {
+                    return false;
+                }
+            }
+        }
+
+        has_binding
+    }
+
+    fn empty_dict_literal_binding(&self, definition: Definition<'db>) -> bool {
+        let module = self.module();
+        let Some(value) = (match definition.kind(self.db()) {
+            DefinitionKind::Assignment(assignment) => Some(assignment.value(module)),
+            DefinitionKind::AnnotatedAssignment(assignment) => assignment.value(module),
+            DefinitionKind::DictKeyAssignment(assignment) => Some(assignment.value(module)),
+            _ => None,
+        }) else {
+            return false;
+        };
+
+        value
+            .as_dict_expr()
+            .is_some_and(|dict| dict.items.is_empty())
+    }
+
+    fn place_has_only_empty_dict_literal_bindings_at_use(
+        &self,
+        place_id: ScopedPlaceId,
+        use_id: ScopedUseId,
+    ) -> bool {
+        let db = self.db();
+        let use_def = self.index.use_def_map(self.scope().file_scope_id(db));
+        let mut has_binding = false;
+
+        for binding in use_def.bindings_at_use(use_id) {
+            let DefinitionState::Defined(definition) = binding.binding else {
+                continue;
+            };
+
+            if definition.place(db) != place_id {
+                continue;
+            }
+
+            has_binding = true;
+            if !self.empty_dict_literal_binding(definition) {
+                return false;
+            }
+        }
+
+        has_binding
+    }
+
+    fn subscript_assignment_key(
+        &self,
+        definition: Definition<'db>,
+    ) -> Option<(Definition<'db>, &'ast ast::Expr)> {
+        let module = self.module();
+
+        match definition.kind(self.db()) {
+            DefinitionKind::DictKeyAssignment(assignment) => {
+                Some((assignment.assignment(), assignment.key(module)))
+            }
+            DefinitionKind::Assignment(assignment) => Some((
+                definition,
+                &assignment.target(module).as_subscript_expr()?.slice,
+            )),
+            DefinitionKind::AnnotatedAssignment(assignment) => Some((
+                definition,
+                &assignment.target(module).as_subscript_expr()?.slice,
+            )),
+            DefinitionKind::AugmentedAssignment(assignment) => Some((
+                definition,
+                &assignment.node(module).target.as_subscript_expr()?.slice,
+            )),
+            _ => None,
+        }
+    }
+
+    fn literal_subscript_key_type(&self, key: &ast::Expr) -> Option<Type<'db>> {
+        let db = self.db();
+        match key {
+            ast::Expr::StringLiteral(string) => {
+                Some(Type::string_literal(db, string.value.to_str()))
+            }
+            ast::Expr::NumberLiteral(ast::ExprNumberLiteral {
+                value: ast::Number::Int(int),
+                ..
+            }) => int
+                .as_i64()
+                .map(Type::int_literal)
+                .or_else(|| Some(KnownClass::Int.to_instance(db))),
+            ast::Expr::BooleanLiteral(ast::ExprBooleanLiteral { value, .. }) => {
+                Some(Type::bool_literal(*value))
+            }
+            ast::Expr::UnaryOp(ast::ExprUnaryOp {
+                op: ast::UnaryOp::USub,
+                operand,
+                ..
+            }) => {
+                let ast::Expr::NumberLiteral(ast::ExprNumberLiteral {
+                    value: ast::Number::Int(int),
+                    ..
+                }) = operand.as_ref()
+                else {
+                    return None;
+                };
+                int.as_i64()
+                    .and_then(i64::checked_neg)
+                    .map(Type::int_literal)
+                    .or_else(|| Some(KnownClass::Int.to_instance(db)))
+            }
+            ast::Expr::UnaryOp(ast::ExprUnaryOp {
+                op: ast::UnaryOp::UAdd,
+                operand,
+                ..
+            }) => {
+                let ast::Expr::NumberLiteral(ast::ExprNumberLiteral {
+                    value: ast::Number::Int(int),
+                    ..
+                }) = operand.as_ref()
+                else {
+                    return None;
+                };
+                int.as_i64()
+                    .map(Type::int_literal)
+                    .or_else(|| Some(KnownClass::Int.to_instance(db)))
+            }
+            _ => None,
+        }
+    }
+
+    fn widen_unannotated_dict_place_from_member_bindings(
+        &self,
+        place_id: ScopedPlaceId,
+        use_id: ScopedUseId,
+        place: Place<'db>,
+    ) -> Place<'db> {
+        let db = self.db();
+        let use_def = self.index.use_def_map(self.scope().file_scope_id(db));
+        if use_def.multi_bindings_at_use(use_id).next().is_none() {
+            return place;
+        }
+
+        let Place::Defined(mut defined) = place else {
+            return place;
+        };
+
+        let Some([key_ty, value_ty]) = defined
+            .ty
+            .known_specialization(db, KnownClass::Dict)
+            .map(|specialization| specialization.types(db))
+        else {
+            return Place::Defined(defined);
+        };
+
+        if !self.place_is_unannotated_at_use(place_id, use_id) {
+            return Place::Defined(defined);
+        }
+
+        let use_only_empty_dict_literals =
+            self.place_has_only_empty_dict_literal_bindings_at_use(place_id, use_id);
+
+        let mut key_builder = UnionBuilder::new(db);
+        let mut value_builder = UnionBuilder::new(db);
+        let mut has_member_binding = false;
+
+        if !key_ty.is_unknown() || !use_only_empty_dict_literals {
+            key_builder.add_in_place(*key_ty);
+        }
+        if !value_ty.is_unknown() || !use_only_empty_dict_literals {
+            value_builder.add_in_place(*value_ty);
+        }
+
+        for bindings in use_def.multi_bindings_at_use(use_id) {
+            let member_place = place_from_bindings(db, bindings);
+            let Some(first_definition) = member_place.first_definition else {
+                continue;
+            };
+            let Some((key_definition, key)) = self.subscript_assignment_key(first_definition)
+            else {
+                continue;
+            };
+            let Place::Defined(DefinedPlace { ty: field_ty, .. }) = member_place.place else {
+                continue;
+            };
+
+            let key_ty = self
+                .literal_subscript_key_type(key)
+                .unwrap_or_else(|| definition_expression_type(db, key_definition, key));
+            key_builder.add_in_place(key_ty.promote(db));
+            value_builder.add_in_place(field_ty.promote(db));
+            has_member_binding = true;
+        }
+
+        if has_member_binding {
+            let value_ty = value_builder.build();
+            let value_ty = if value_ty
+                .as_union()
+                .is_some_and(|union| union.elements(db).len() > 1)
+            {
+                Type::unknown()
+            } else {
+                value_ty
+            };
+
+            defined.ty =
+                KnownClass::Dict.to_specialized_instance(db, &[key_builder.build(), value_ty]);
+        }
+
+        Place::Defined(defined)
+    }
+
+    fn unannotated_dict_assignment_target(&self, object: &ast::Expr, object_ty: Type<'db>) -> bool {
+        let db = self.db();
+        let file_scope_id = self.scope().file_scope_id(db);
+        let Some(place_expr) = PlaceExpr::try_from_expr(object) else {
+            return false;
+        };
+        let Some(place_id) = self.index.place_table(file_scope_id).place_id(&place_expr) else {
+            return false;
+        };
+
+        self.place_is_unannotated_at_use(
+            place_id,
+            ast::ExprRef::from(object).scoped_use_id(db, self.scope()),
+        ) && object_ty.known_specialization(db, KnownClass::Dict).is_some()
+    }
+
     fn infer_local_place_load(
         &self,
         expr: PlaceExprRef,
@@ -8551,9 +8810,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let place_table = self.index.place_table(file_scope_id);
 
         let mut constraint_keys = vec![];
-        let (local_scope_place, use_id) = self.infer_local_place_load(place_expr, expr_ref);
+        let (mut local_scope_place, use_id) = self.infer_local_place_load(place_expr, expr_ref);
         if let Some(use_id) = use_id {
             constraint_keys.push((file_scope_id, ConstraintKey::UseId(use_id)));
+            if let Some(place_id) = place_table.place_id(place_expr) {
+                local_scope_place = self.widen_unannotated_dict_place_from_member_bindings(
+                    place_id,
+                    use_id,
+                    local_scope_place,
+                );
+            }
         }
 
         let place = PlaceAndQualifiers::from(local_scope_place).or_fall_back_to(db, || {

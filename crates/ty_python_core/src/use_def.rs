@@ -615,6 +615,17 @@ impl<'db> UseDefMap<'db> {
         )
     }
 
+    pub fn try_declarations_at_binding(
+        &self,
+        binding: Definition<'db>,
+    ) -> Option<DeclarationsIterator<'_, 'db>> {
+        let declarations_id = *self.declarations_by_binding.get(&binding)?;
+        Some(self.declarations_iterator(
+            &self.interned_declarations[declarations_id],
+            BoundnessAnalysis::BasedOnUnboundVisibility,
+        ))
+    }
+
     pub fn end_of_scope_declarations<'map>(
         &'map self,
         place: ScopedPlaceId,
@@ -1402,6 +1413,17 @@ impl<'db> UseDefMapBuilder<'db> {
         places: impl Iterator<Item = ScopedPlaceId>,
         use_id: ScopedUseId,
     ) {
+        self.record_multi_use_bindings(places, use_id);
+
+        // Record a placeholder use of the parent expression to preserve the indices of `bindings_by_use`.
+        self.record_use_bindings(Bindings::default(), use_id);
+    }
+
+    pub(super) fn record_multi_use_bindings(
+        &mut self,
+        places: impl Iterator<Item = ScopedPlaceId>,
+        use_id: ScopedUseId,
+    ) {
         for place in places {
             let bindings = match place {
                 ScopedPlaceId::Symbol(symbol) => self.symbol_states[symbol].bindings(),
@@ -1417,9 +1439,6 @@ impl<'db> UseDefMapBuilder<'db> {
                 .or_default()
                 .push(bindings);
         }
-
-        // Record a placeholder use of the parent expression to preserve the indices of `bindings_by_use`.
-        self.record_use_bindings(Bindings::default(), use_id);
     }
 
     fn record_use_bindings(&mut self, bindings: Bindings, use_id: ScopedUseId) {

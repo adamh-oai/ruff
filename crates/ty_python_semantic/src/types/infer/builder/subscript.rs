@@ -1072,6 +1072,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let object_ty = self.infer_expression(object, TypeContext::default());
         let mut infer_slice_ty = |builder: &mut Self, tcx| builder.infer_expression(slice, tcx);
 
+        if self.unannotated_dict_assignment_target(object, object_ty) {
+            infer_slice_ty(self, TypeContext::default());
+            infer_rhs_value(self, TypeContext::default());
+            return true;
+        }
+
         self.validate_subscript_assignment_impl(
             target,
             None,
