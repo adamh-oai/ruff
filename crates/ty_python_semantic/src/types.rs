@@ -3622,6 +3622,14 @@ impl<'db> Type<'db> {
                         .as_enum()
                         .map(|enum_literal| enum_literal.enum_class(db)),
                     Type::NominalInstance(instance) => Some(instance.class_literal(db)),
+                    Type::TypeVar(bound_typevar) => {
+                        match bound_typevar.typevar(db).bound_or_constraints(db) {
+                            Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
+                                bound.nominal_class(db).map(|class| class.class_literal(db))
+                            }
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 };
 
