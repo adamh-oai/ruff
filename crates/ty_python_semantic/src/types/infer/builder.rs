@@ -463,51 +463,92 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .is_in_type_checking_block(scope.file_scope_id(self.db()), node.range())
     }
 
+    fn callable_attribute_assignment_target(
+        &self,
+        object_ty: Type<'db>,
+        target_ty: Type<'db>,
+        value_ty: Type<'db>,
+        allow_arbitrary_callable: bool,
+    ) -> Option<Type<'db>> {
+        let db = self.db();
+
+        match target_ty {
+            Type::FunctionLiteral(function) => {
+                // Replacing a method on an instance stores an ordinary instance attribute.
+                // Unlike a function stored on the class, that replacement is not bound again
+                // on access, so validate against the bound callable shape.
+                let target = if matches!(
+                    object_ty,
+                    Type::ClassLiteral(_)
+                        | Type::GenericAlias(_)
+                        | Type::SubclassOf(_)
+                        | Type::ModuleLiteral(_)
+                ) {
+                    if !allow_arbitrary_callable
+                        && !self.is_function_like_callable_assignment_value(value_ty)
+                    {
+                        return None;
+                    }
+
+                    target_ty
+                } else {
+                    Type::BoundMethod(function.into_bound_method_type(db, object_ty))
+                };
+
+                target
+                    .try_upcast_to_callable(db)
+                    .map(|callables| callables.into_type(db))
+            }
+            Type::BoundMethod(_) | Type::KnownBoundMethod(_) => {
+                if !allow_arbitrary_callable
+                    && !matches!(
+                        value_ty,
+                        Type::FunctionLiteral(_) | Type::BoundMethod(_) | Type::KnownBoundMethod(_)
+                    )
+                {
+                    return None;
+                }
+
+                target_ty
+                    .try_upcast_to_callable(db)
+                    .map(|callables| callables.into_type(db))
+            }
+            _ => None,
+        }
+    }
+
+    fn is_function_like_callable_assignment_value(&self, value_ty: Type<'db>) -> bool {
+        match value_ty {
+            Type::FunctionLiteral(_) => true,
+            Type::Callable(callable) => callable.is_function_like(self.db()),
+            _ => false,
+        }
+    }
+
+    fn is_assignable_to_callable_attribute(
+        &self,
+        object_ty: Type<'db>,
+        target_ty: Type<'db>,
+        value_ty: Type<'db>,
+    ) -> bool {
+        self.callable_attribute_assignment_target(object_ty, target_ty, value_ty, false)
+            .is_some_and(|callable_target_ty| {
+                value_ty.is_assignable_to(self.db(), callable_target_ty)
+            })
+    }
+
     fn is_allowed_function_monkeypatch(
         &self,
         object_ty: Type<'db>,
         target_ty: Type<'db>,
         value_ty: Type<'db>,
     ) -> bool {
-        if !self.settings().allow_function_monkeypatches {
-            return false;
-        }
-
-        let db = self.db();
-
-        let unbound_callable_target_ty = match target_ty {
-            Type::FunctionLiteral(_) | Type::BoundMethod(_) | Type::KnownBoundMethod(_) => {
-                target_ty
-                    .try_upcast_to_callable(db)
-                    .map(|callables| callables.into_type(db))
-            }
-            _ => None,
-        };
-
-        if unbound_callable_target_ty
-            .is_some_and(|callable_target_ty| value_ty.is_assignable_to(db, callable_target_ty))
-        {
-            return true;
-        }
-
-        match target_ty {
-            Type::FunctionLiteral(function)
-                if !matches!(
-                    object_ty,
-                    Type::ClassLiteral(_) | Type::SubclassOf(_) | Type::ModuleLiteral(_)
-                ) =>
-            {
-                let bound_callable_target_ty =
-                    Type::BoundMethod(function.into_bound_method_type(db, object_ty))
-                        .try_upcast_to_callable(db)
-                        .map(|callables| callables.into_type(db));
-
-                bound_callable_target_ty.is_some_and(|callable_target_ty| {
-                    value_ty.is_assignable_to(db, callable_target_ty)
+        self.settings().allow_function_monkeypatches
+            && self
+                .callable_attribute_assignment_target(object_ty, target_ty, value_ty, true)
+                .is_some_and(|callable_target_ty| {
+                    value_ty.is_assignable_to(self.db(), callable_target_ty)
                 })
-            }
-            _ => false,
-        }
     }
 
     fn is_allowed_mock_function_attribute_access(
@@ -2224,6 +2265,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let ensure_assignable_to =
             |builder: &Self, value_ty: Type<'db>, attr_ty: Type<'db>| -> bool {
                 let assignable = value_ty.is_assignable_to(db, attr_ty)
+                    || builder.is_assignable_to_callable_attribute(object_ty, attr_ty, value_ty)
                     || builder.is_allowed_function_monkeypatch(object_ty, attr_ty, value_ty);
                 if !assignable && emit_diagnostics {
                     report_invalid_attribute_assignment(
@@ -2902,7 +2944,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 if let Place::Defined(DefinedPlace { ty: attr_ty, .. }) = sym.place {
                     let value_ty = infer_value_ty(self, TypeContext::new(Some(attr_ty)));
 
-                    let assignable = value_ty.is_assignable_to(db, attr_ty);
+                    let assignable = value_ty.is_assignable_to(db, attr_ty)
+                        || self.is_assignable_to_callable_attribute(object_ty, attr_ty, value_ty)
+                        || self.is_allowed_function_monkeypatch(object_ty, attr_ty, value_ty);
                     if assignable {
                         true
                     } else {

@@ -77,6 +77,47 @@ error[invalid-attribute-access]: Cannot assign to instance attribute `attr` from
   |
 ```
 
+## Function-valued attributes
+
+Assignments to function-valued attributes are checked against the callable shape that will be
+observed at runtime.
+
+For instance attributes, a replacement shadows the class descriptor and is not bound again on
+access, so it must match the bound method signature:
+
+```py
+from unittest.mock import Mock
+
+class C:
+    def method(self, value: int) -> str:
+        return str(value)
+
+def replacement(value: int) -> str:
+    return str(value)
+
+def still_expects_self(self: C, value: int) -> str:
+    return str(value)
+
+def wrong(value: str) -> str:
+    return value
+
+instance = C()
+instance.method = replacement
+instance.method = Mock(return_value="ok")
+
+instance.method = still_expects_self  # error: [invalid-assignment]
+instance.method = wrong  # error: [invalid-assignment]
+```
+
+For class attributes, a replacement function is itself a descriptor, so it must match the unbound
+method signature:
+
+```py
+C.method = still_expects_self
+C.method = lambda self, value: str(value)
+C.method = replacement  # error: [invalid-assignment]
+```
+
 ## Invalid annotated assignment to attribute
 
 Annotated assignments to attributes on `self` should be validated against their annotation.
