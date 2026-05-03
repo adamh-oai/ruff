@@ -6825,8 +6825,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } = if_expression;
 
         let test_ty = self.infer_maybe_standalone_expression(test, TypeContext::default());
-        let body_ty = self.infer_expression(body, tcx);
-        let orelse_ty = self.infer_expression(orelse, tcx);
+        let body_is_empty_dict = Self::is_empty_dict_expression(body);
+        let orelse_is_empty_dict = Self::is_empty_dict_expression(orelse);
+
+        let (body_ty, orelse_ty) = if body_is_empty_dict && !orelse_is_empty_dict {
+            let orelse_ty = self.infer_expression(orelse, tcx);
+            let body_tcx = self.empty_dict_branch_type_context(orelse_ty, tcx);
+            let body_ty = self.infer_expression(body, body_tcx);
+            (body_ty, orelse_ty)
+        } else {
+            let body_ty = self.infer_expression(body, tcx);
+            let orelse_tcx = if orelse_is_empty_dict && !body_is_empty_dict {
+                self.empty_dict_branch_type_context(body_ty, tcx)
+            } else {
+                tcx
+            };
+            let orelse_ty = self.infer_expression(orelse, orelse_tcx);
+            (body_ty, orelse_ty)
+        };
 
         match test_ty.try_bool(self.db()).unwrap_or_else(|err| {
             err.report_diagnostic(&self.context, &**test);
@@ -6835,6 +6851,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Truthiness::AlwaysTrue => body_ty,
             Truthiness::AlwaysFalse => orelse_ty,
             Truthiness::Ambiguous => UnionType::from_two_elements(self.db(), body_ty, orelse_ty),
+        }
+    }
+
+    fn is_empty_dict_expression(expression: &ast::Expr) -> bool {
+        matches!(expression, ast::Expr::Dict(dict) if dict.items.is_empty())
+    }
+
+    fn empty_dict_branch_type_context(
+        &self,
+        other_branch_ty: Type<'db>,
+        fallback_tcx: TypeContext<'db>,
+    ) -> TypeContext<'db> {
+        if other_branch_ty.is_instance_of(self.db(), KnownClass::Dict) {
+            TypeContext::new(Some(other_branch_ty))
+        } else {
+            fallback_tcx
         }
     }
 

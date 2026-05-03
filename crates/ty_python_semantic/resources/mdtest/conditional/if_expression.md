@@ -36,6 +36,23 @@ def _(flag: bool):
     reveal_type(x)  # revealed: Literal[1] | None
 ```
 
+## Empty dictionary branch
+
+When an if-expression chooses between a non-empty dictionary literal and an empty dictionary
+literal, the empty dictionary branch uses the type inferred from the non-empty branch:
+
+```py
+def _(flag: bool):
+    options = {"metadata": {"source": "test"}, "limit": 1} if flag else {}
+    reveal_type(options)  # revealed: dict[str, dict[str, str] | int]
+
+    payload = {"model": "test", "labels": ["yes", "no"], **options}
+    reveal_type(payload)  # revealed: dict[str, str | list[str] | dict[str, str] | int]
+
+    empty_first = {} if flag else {"metadata": {"source": "test"}, "limit": 1}
+    reveal_type(empty_first)  # revealed: dict[str, dict[str, str] | int]
+```
+
 ## Condition with object that implements `__bool__` incorrectly
 
 ```py
