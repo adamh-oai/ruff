@@ -14,6 +14,20 @@ def _(foo: str):
     reveal_type(foo or True)  # revealed: (str & ~AlwaysFalsy) | Literal[True]
 ```
 
+## Bidirectional context
+
+```py
+class TextContent: ...
+class TagContent: ...
+
+def expects_content(content: list[TextContent | TagContent]) -> None: ...
+def optional_content(content: list[TextContent | TagContent] | None) -> None:
+    expects_content(content or [TextContent()])
+
+def invalid_fallback(content: list[TextContent | TagContent] | None) -> None:
+    expects_content(content or [object()])  # error: [invalid-argument-type]
+```
+
 ## AND
 
 ```py
