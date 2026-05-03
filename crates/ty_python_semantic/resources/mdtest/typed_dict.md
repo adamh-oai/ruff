@@ -292,6 +292,38 @@ reveal_type(eve3a)  # revealed: Person
 reveal_type(eve3b)  # revealed: Person
 ```
 
+Dict literal unpacking preserves required keys from a source `TypedDict`, and later literal keys
+override unpacked keys:
+
+```py
+class WorkflowInput(TypedDict):
+    account_user_id: str
+    mail_account_id: str
+    run_id: str
+    redeemable_token: str
+
+class BadWorkflowInput(TypedDict):
+    account_user_id: int
+    mail_account_id: str
+    run_id: str
+    redeemable_token: str
+
+def _(
+    input: WorkflowInput,
+    bad_input: BadWorkflowInput,
+):
+    account_user_id = str(input["account_user_id"])
+
+    workflow_input: WorkflowInput = {**input, "account_user_id": account_user_id}
+    reveal_type(workflow_input)  # revealed: WorkflowInput
+
+    WorkflowInput({**input, "account_user_id": account_user_id})
+    WorkflowInput({**bad_input, "account_user_id": account_user_id})
+
+    # error: [invalid-argument-type] "Invalid argument to key "account_user_id" with declared type `str` on TypedDict `WorkflowInput`"
+    WorkflowInput({"account_user_id": account_user_id, **bad_input})
+```
+
 Constructor calls with multiple positional arguments should be rejected, including for empty
 `TypedDict`s:
 

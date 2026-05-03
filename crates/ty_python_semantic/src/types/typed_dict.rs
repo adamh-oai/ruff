@@ -1098,6 +1098,11 @@ struct TypedDictAssignmentNodes<'ast> {
     value: AnyNodeRef<'ast>,
 }
 
+struct ExtractedTypedDictKeysValidation {
+    provided_keys: OrderSet<Name>,
+    valid: bool,
+}
+
 /// Validates a set of extracted `TypedDict`-like keys against a constructor target.
 ///
 /// This is shared by `**kwargs` validation and mixed constructor calls where the first positional
@@ -1110,8 +1115,9 @@ fn validate_extracted_typed_dict_keys<'db, 'ast>(
     nodes: TypedDictAssignmentNodes<'ast>,
     full_object_ty: Option<Type<'db>>,
     ignored_keys: &OrderSet<Name>,
-) -> OrderSet<Name> {
+) -> ExtractedTypedDictKeysValidation {
     let mut provided_keys = OrderSet::new();
+    let mut valid = true;
 
     for (key_name, unpacked_key) in unpacked_keys {
         if ignored_keys.contains(key_name) {
@@ -1120,7 +1126,7 @@ fn validate_extracted_typed_dict_keys<'db, 'ast>(
         if unpacked_key.is_required {
             provided_keys.insert(key_name.clone());
         }
-        TypedDictKeyAssignment {
+        valid &= TypedDictKeyAssignment {
             context,
             typed_dict,
             full_object_ty,
@@ -1135,7 +1141,10 @@ fn validate_extracted_typed_dict_keys<'db, 'ast>(
         .validate();
     }
 
-    provided_keys
+    ExtractedTypedDictKeysValidation {
+        provided_keys,
+        valid,
+    }
 }
 
 /// Validates a mixed-constructor positional argument when its type can be viewed as a `TypedDict`.
@@ -1160,18 +1169,21 @@ fn validate_from_typed_dict_argument<'db, 'ast>(
         .filter(|(key_name, _)| typed_dict_items.contains_key(key_name))
         .collect();
 
-    Some(validate_extracted_typed_dict_keys(
-        context,
-        typed_dict,
-        &unpacked_keys,
-        TypedDictAssignmentNodes {
-            typed_dict: typed_dict_node,
-            key: arg.into(),
-            value: arg.into(),
-        },
-        full_object_ty_annotation(arg_ty),
-        ignored_keys,
-    ))
+    Some(
+        validate_extracted_typed_dict_keys(
+            context,
+            typed_dict,
+            &unpacked_keys,
+            TypedDictAssignmentNodes {
+                typed_dict: typed_dict_node,
+                key: arg.into(),
+                value: arg.into(),
+            },
+            full_object_ty_annotation(arg_ty),
+            ignored_keys,
+        )
+        .provided_keys,
+    )
 }
 
 fn report_duplicate_typed_dict_constructor_key<'db, 'ast>(
@@ -1379,20 +1391,24 @@ fn validate_from_dict_literal<'db, 'ast>(
     ignored_keys: &OrderSet<Name>,
 ) -> OrderSet<Name> {
     let mut provided_keys = OrderSet::new();
-    let items = typed_dict.items(context.db());
+    let mut overwritten_keys = ignored_keys.clone();
+    let db = context.db();
+    let items = typed_dict.items(db);
 
     if let ast::Expr::Dict(dict_expr) = &arguments.args[0] {
-        // Validate dict entries
-        for dict_item in &dict_expr.items {
+        // Validate dict entries in reverse order so later keys shadow earlier unpacked keys.
+        for dict_item in dict_expr.items.iter().rev() {
             if let Some(ref key_expr) = dict_item.key
                 && let Some(key_value) =
                     expression_type_fn(key_expr, TypeContext::default()).as_string_literal()
             {
-                let key = key_value.value(context.db());
-                if ignored_keys.contains(key) {
+                let key = key_value.value(db);
+                let key_name = Name::new(key);
+                if overwritten_keys.contains(key) {
                     continue;
                 }
-                provided_keys.insert(Name::new(key));
+                provided_keys.insert(key_name.clone());
+                overwritten_keys.insert(key_name);
 
                 let value_tcx = items
                     .get(key)
@@ -1412,6 +1428,36 @@ fn validate_from_dict_literal<'db, 'ast>(
                     emit_diagnostic: true,
                 }
                 .validate();
+            } else if dict_item.key.is_none() {
+                let unpacked_type = expression_type_fn(&dict_item.value, TypeContext::default());
+                if unpacked_type.is_never() || unpacked_type.is_dynamic() {
+                    for (key_name, field) in items {
+                        if field.is_required() && !overwritten_keys.contains(key_name) {
+                            provided_keys.insert(key_name.clone());
+                            overwritten_keys.insert(key_name.clone());
+                        }
+                    }
+                } else if let Some(unpacked_keys) =
+                    extract_unpacked_typed_dict_keys(db, unpacked_type)
+                {
+                    let unpacked_validation = validate_extracted_typed_dict_keys(
+                        context,
+                        typed_dict,
+                        &unpacked_keys,
+                        TypedDictAssignmentNodes {
+                            typed_dict: typed_dict_node,
+                            key: (&dict_item.value).into(),
+                            value: (&dict_item.value).into(),
+                        },
+                        full_object_ty_annotation(unpacked_type),
+                        &overwritten_keys,
+                    );
+
+                    for key_name in unpacked_validation.provided_keys {
+                        provided_keys.insert(key_name.clone());
+                        overwritten_keys.insert(key_name);
+                    }
+                }
             }
         }
     }
@@ -1501,7 +1547,9 @@ fn validate_from_keywords<'db, 'ast>(
                     },
                     full_object_ty_annotation(unpacked_type),
                     &OrderSet::new(),
-                ) {
+                )
+                .provided_keys
+                {
                     record_guaranteed_typed_dict_constructor_key(
                         context,
                         typed_dict,
@@ -1526,16 +1574,24 @@ pub(super) fn validate_typed_dict_dict_literal<'db>(
     typed_dict_node: AnyNodeRef,
     expression_type_fn: impl Fn(&ast::Expr) -> Type<'db>,
 ) -> Result<OrderSet<Name>, OrderSet<Name>> {
+    let db = context.db();
     let mut valid = true;
     let mut provided_keys = OrderSet::new();
+    let mut overwritten_keys = OrderSet::new();
 
-    // Validate each key-value pair in the dictionary literal
-    for item in &dict_expr.items {
+    // Validate the dictionary literal in reverse order so later keys shadow earlier unpacked keys.
+    for item in dict_expr.items.iter().rev() {
         if let Some(key_expr) = &item.key
             && let Some(key_str) = expression_type_fn(key_expr).as_string_literal()
         {
-            let key = key_str.value(context.db());
-            provided_keys.insert(Name::new(key));
+            let key = key_str.value(db);
+            let key_name = Name::new(key);
+            if overwritten_keys.contains(key) {
+                continue;
+            }
+
+            provided_keys.insert(key_name.clone());
+            overwritten_keys.insert(key_name);
 
             let value_ty = expression_type_fn(&item.value);
 
@@ -1552,6 +1608,36 @@ pub(super) fn validate_typed_dict_dict_literal<'db>(
                 emit_diagnostic: true,
             }
             .validate();
+        } else if item.key.is_none() {
+            let unpacked_type = expression_type_fn(&item.value);
+            if unpacked_type.is_never() || unpacked_type.is_dynamic() {
+                for (key_name, field) in typed_dict.items(db) {
+                    if field.is_required() && !overwritten_keys.contains(key_name) {
+                        provided_keys.insert(key_name.clone());
+                        overwritten_keys.insert(key_name.clone());
+                    }
+                }
+            } else if let Some(unpacked_keys) = extract_unpacked_typed_dict_keys(db, unpacked_type)
+            {
+                let unpacked_validation = validate_extracted_typed_dict_keys(
+                    context,
+                    typed_dict,
+                    &unpacked_keys,
+                    TypedDictAssignmentNodes {
+                        typed_dict: typed_dict_node,
+                        key: (&item.value).into(),
+                        value: (&item.value).into(),
+                    },
+                    full_object_ty_annotation(unpacked_type),
+                    &overwritten_keys,
+                );
+                valid &= unpacked_validation.valid;
+
+                for key_name in unpacked_validation.provided_keys {
+                    provided_keys.insert(key_name.clone());
+                    overwritten_keys.insert(key_name);
+                }
+            }
         }
     }
 
