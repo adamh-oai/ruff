@@ -507,6 +507,9 @@ reveal_type(f7)  # revealed: (int, /) -> None
 f8: Callable[[*tuple[int, ...], int], None] = lambda *args, x=1: None
 reveal_type(f8)  # revealed: (*args, *, x=1) -> None
 
+f9: Callable[[], list[int | str]] | Callable[[dict[str, object]], list[int | str]] = lambda: [1]
+reveal_type(f9)  # revealed: () -> list[int | str]
+
 def _(x: bool):
     signatures = {
         "upper": str.upper,
@@ -521,10 +524,10 @@ def _(x: bool):
 We do not currently account for type annotations present later in the scope:
 
 ```py
-f9 = lambda: [1]
+f10 = lambda: [1]
 # TODO: This should not error.
-_: list[int | str] = f9()  # error: [invalid-assignment]
-reveal_type(f9)  # revealed: () -> list[int]
+_: list[int | str] = f10()  # error: [invalid-assignment]
+reveal_type(f10)  # revealed: () -> list[int]
 ```
 
 ## Dunder Calls

@@ -6895,6 +6895,69 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         lambda_expression: &ast::ExprLambda,
         tcx: TypeContext<'db>,
     ) -> Type<'db> {
+        fn lambda_matches_callable_signature(
+            parameters: Option<&ast::Parameters>,
+            signature: &Signature<'_>,
+        ) -> bool {
+            let signature_parameters = signature.parameters();
+
+            // We can only choose between concrete callable shapes. Gradual and ParamSpec callables
+            // remain useful as a type context when they are the only candidate, but they do not help
+            // disambiguate overloaded callable contexts.
+            if signature_parameters.is_gradual()
+                || signature_parameters.is_top()
+                || signature_parameters.as_paramspec_with_prefix().is_some()
+            {
+                return false;
+            }
+
+            if signature_parameters
+                .iter()
+                .any(|parameter| !parameter.is_positional())
+            {
+                return false;
+            }
+
+            let expected_positional_count = signature_parameters.positional().count();
+
+            let Some(parameters) = parameters else {
+                return expected_positional_count == 0;
+            };
+
+            let positional_parameters = parameters.posonlyargs.len() + parameters.args.len();
+            let defaulted_positional_parameters = parameters
+                .posonlyargs
+                .iter()
+                .chain(&parameters.args)
+                .filter(|parameter| parameter.default().is_some())
+                .count();
+            let required_positional_parameters =
+                positional_parameters - defaulted_positional_parameters;
+
+            if parameters.vararg.is_some() {
+                expected_positional_count >= required_positional_parameters
+            } else {
+                (required_positional_parameters..=positional_parameters)
+                    .contains(&expected_positional_count)
+            }
+        }
+
+        fn collect_callable_signatures<'db>(
+            db: &'db dyn Db,
+            ty: Type<'db>,
+            signatures: &mut Vec<&'db Signature<'db>>,
+        ) {
+            match ty.resolve_type_alias(db) {
+                Type::Callable(callable) => signatures.extend(callable.signatures(db).iter()),
+                Type::Union(union) => {
+                    for element in union.elements(db) {
+                        collect_callable_signatures(db, *element, signatures);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let ast::ExprLambda {
             range: _,
             node_index: _,
@@ -6906,17 +6969,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let in_stub = self.in_stub();
         let previous_deferred_state = std::mem::replace(&mut self.deferred_state, in_stub.into());
 
-        let callable_tcx = if let Some(tcx) = tcx.annotation
-            // TODO: We could perform multi-inference here if there are multiple `Callable` annotations
-            // in the union/intersection.
-            && let Some(callable) = tcx
-                .filter_union(self.db(), Type::is_callable_type)
-                .as_callable()
-        {
-            match callable.signatures(self.db()).overloads.as_slice() {
-                [signature] => Some(signature),
-                // TODO: We could similarly perform multi-inference here if there are multiple overloads.
-                _ => None,
+        let callable_tcx = if let Some(tcx) = tcx.annotation {
+            let mut signatures = Vec::new();
+            collect_callable_signatures(self.db(), tcx, &mut signatures);
+
+            match signatures.as_slice() {
+                [signature] => Some(*signature),
+                _ => signatures
+                    .into_iter()
+                    .filter(|signature| {
+                        lambda_matches_callable_signature(parameters.as_deref(), signature)
+                    })
+                    .exactly_one()
+                    .ok(),
             }
         } else {
             None

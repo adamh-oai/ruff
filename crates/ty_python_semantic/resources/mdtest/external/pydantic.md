@@ -124,6 +124,23 @@ card = Card()
 reveal_type(card.header_image_type)  # revealed: Literal["ai", "image_search"]
 ```
 
+## `Field` default factory callable overloads
+
+Pydantic accepts both zero-argument and validated-data-aware factories. When the selected factory is
+a zero-argument lambda, the lambda body should still use the declared field type as context:
+
+```py
+from pydantic import BaseModel, Field
+
+class Defaults(BaseModel):
+    values: list[int | str] = Field(default_factory=lambda: [1])
+
+reveal_type(Defaults.__init__)  # revealed: (self: Defaults, *, values: list[int | str] = ...) -> None
+
+defaults = Defaults()
+reveal_type(defaults.values)  # revealed: list[int | str]
+```
+
 ## Discriminated unions with enum-member tags
 
 Enum-valued discriminators should narrow the containing Pydantic union just like string-valued
