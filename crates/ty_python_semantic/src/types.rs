@@ -988,6 +988,25 @@ impl<'db> Type<'db> {
         matches!(self, Type::Callable(..))
     }
 
+    /// Returns `true` if this type is known to be a Python function object with a mutable
+    /// `__dict__` for user-defined attributes.
+    pub(crate) fn supports_function_custom_attributes(&self, db: &'db dyn Db) -> bool {
+        match self {
+            Type::FunctionLiteral(_) | Type::DataclassDecorator(_) => true,
+            Type::Callable(callable) => callable.is_function_like(db),
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .all(|element| element.supports_function_custom_attributes(db)),
+            Type::Intersection(intersection) => intersection
+                .positive(db)
+                .iter()
+                .any(|element| element.supports_function_custom_attributes(db)),
+            Type::TypeAlias(alias) => alias.value_type(db).supports_function_custom_attributes(db),
+            _ => false,
+        }
+    }
+
     pub(crate) fn cycle_normalized(
         self,
         db: &'db dyn Db,

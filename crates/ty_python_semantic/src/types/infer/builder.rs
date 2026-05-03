@@ -2399,6 +2399,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     return true;
                 }
 
+                if object_ty.supports_function_custom_attributes(db)
+                    && object_ty.member(db, attribute).place.is_undefined()
+                {
+                    return true;
+                }
+
                 // Infer `__setattr__` once upfront. We use this result for:
                 // 1. Checking if it returns `Never` (indicating an immutable class)
                 // 2. As a fallback when no explicit attribute is found
@@ -8584,6 +8590,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let resolved_type =
             fallback_place.unwrap_with_diagnostic(db, |lookup_err| match lookup_err {
                 LookupError::Undefined(_) => {
+                    if let Some(assigned_type) = assigned_type
+                        && value_type.supports_function_custom_attributes(db)
+                    {
+                        return TypeAndQualifiers::new(
+                            assigned_type,
+                            TypeOrigin::Inferred,
+                            TypeQualifiers::empty(),
+                        );
+                    }
+
                     let fallback = || {
                         TypeAndQualifiers::new(
                             Type::unknown(),

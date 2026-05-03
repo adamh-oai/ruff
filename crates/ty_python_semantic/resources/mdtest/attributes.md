@@ -3183,6 +3183,21 @@ warning[possibly-missing-submodule]: Submodule `bar` might not have been importe
 help: Consider explicitly importing `baz.bar`
 ```
 
+## Custom attributes on function objects
+
+Python function objects have a mutable `__dict__`, so user-defined attributes can be assigned to a
+concrete function and read back from that function.
+
+```py
+def f() -> None:
+    pass
+
+f.cache_clear = lambda: None
+reveal_type(f.cache_clear)  # revealed: () -> None
+
+f.missing  # error: [unresolved-attribute] "Function `f` has no attribute `missing`"
+```
+
 ## Diagnostic for function attribute accessed on `Callable` type
 
 We show a special help message here that explains that not all callables are functions.
