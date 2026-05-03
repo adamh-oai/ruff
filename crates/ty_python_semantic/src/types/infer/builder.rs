@@ -2307,22 +2307,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let db = self.db();
 
         // This closure should only be called if `value_ty` was inferred with `attr_ty` as type context.
-        let ensure_assignable_to =
-            |builder: &Self, value_ty: Type<'db>, attr_ty: Type<'db>| -> bool {
-                let assignable = value_ty.is_assignable_to(db, attr_ty)
-                    || builder.is_assignable_to_callable_attribute(object_ty, attr_ty, value_ty)
-                    || builder.is_allowed_function_monkeypatch(object_ty, attr_ty, value_ty);
-                if !assignable && emit_diagnostics {
-                    report_invalid_attribute_assignment(
-                        &builder.context,
-                        target.into(),
-                        attr_ty,
-                        value_ty,
-                        attribute,
-                    );
-                }
-                assignable
-            };
+        let is_instance_dunder_attribute = attribute.starts_with("__")
+            && attribute.ends_with("__")
+            && !matches!(
+                object_ty,
+                Type::ClassLiteral(_)
+                    | Type::GenericAlias(_)
+                    | Type::SubclassOf(_)
+                    | Type::ModuleLiteral(_)
+            );
+
+        let ensure_assignable_to = |builder: &Self, value_ty: Type<'db>, attr_ty: Type<'db>| {
+            let assignable = value_ty.is_assignable_to(db, attr_ty)
+                || (!is_instance_dunder_attribute
+                    && (builder.is_assignable_to_callable_attribute(object_ty, attr_ty, value_ty)
+                        || builder.is_allowed_function_monkeypatch(object_ty, attr_ty, value_ty)));
+            if !assignable && emit_diagnostics {
+                report_invalid_attribute_assignment(
+                    &builder.context,
+                    target.into(),
+                    attr_ty,
+                    value_ty,
+                    attribute,
+                );
+            }
+            assignable
+        };
 
         // For dataclass fields with converters, the write type is the converter's
         // input type (the type of the first positional parameter), not the field's

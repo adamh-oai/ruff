@@ -17,8 +17,8 @@ use crate::{
     },
     types::{
         ApplyTypeMappingVisitor, BoundTypeVarInstance, CallableType, ClassBase, ClassType,
-        ErrorContext, FindLegacyTypeVarsVisitor, InstanceFallbackShadowsNonDataDescriptor,
-        KnownFunction, MemberLookupPolicy, PropertyInstanceType, ProtocolInstanceType, Signature,
+        ErrorContext, FallbackShadowingPolicy, FindLegacyTypeVarsVisitor, KnownFunction,
+        MemberLookupPolicy, PropertyInstanceType, ProtocolInstanceType, Signature,
         StaticClassLiteral, Type, TypeMapping, TypeQualifiers, TypeVarVariance, VarianceInferable,
         constraints::{ConstraintSet, IteratorConstraintsExtension, OptionConstraintsExtension},
         context::InferContext,
@@ -697,7 +697,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                             db,
                             member.name,
                             Place::Undefined.into(),
-                            InstanceFallbackShadowsNonDataDescriptor::No,
+                            FallbackShadowingPolicy::No,
                             MemberLookupPolicy::default(),
                         )
                         .place

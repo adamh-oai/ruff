@@ -361,12 +361,12 @@ impl MaterializationKind {
 
 /// The descriptor protocol distinguishes two kinds of descriptors. Non-data descriptors
 /// define a `__get__` method, while data descriptors additionally define a `__set__`
-/// method or a `__delete__` method. This enum is used to categorize attributes into two
-/// groups: (1) data descriptors and (2) normal attributes or non-data descriptors.
+/// method or a `__delete__` method.
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, salsa::Update, get_size2::GetSize)]
 pub(crate) enum AttributeKind {
     DataDescriptor,
-    NormalOrNonDataDescriptor,
+    NonDataDescriptor,
+    NormalAttribute,
 }
 
 impl AttributeKind {
@@ -376,17 +376,29 @@ impl AttributeKind {
 }
 
 /// This enum is used to control the behavior of the descriptor protocol implementation.
-/// When invoked on a class object, the fallback type (a class attribute) can shadow a
-/// non-data descriptor of the meta-type (the class's metaclass). However, this is not
-/// true for instances. When invoked on an instance, the fallback type (an attribute on
-/// the instance) cannot completely shadow a non-data descriptor of the meta-type (the
-/// class), because we do not currently attempt to statically infer if an instance
-/// attribute is definitely defined (i.e. to check whether a particular method has been
-/// called).
+/// An always-defined fallback type can shadow lower-precedence attributes found on the
+/// meta-type. Data descriptors still take precedence, and possibly undefined fallbacks
+/// are still unioned with the lower-precedence result.
 #[derive(Clone, Debug, Copy, PartialEq)]
-enum InstanceFallbackShadowsNonDataDescriptor {
-    Yes,
+enum FallbackShadowingPolicy {
+    NormalAndNonDataDescriptors,
+    NonDataDescriptorsOnly,
     No,
+}
+
+impl FallbackShadowingPolicy {
+    const fn allows(self, kind: AttributeKind) -> bool {
+        matches!(
+            (self, kind),
+            (
+                Self::NormalAndNonDataDescriptors,
+                AttributeKind::NormalAttribute | AttributeKind::NonDataDescriptor
+            ) | (
+                Self::NonDataDescriptorsOnly,
+                AttributeKind::NonDataDescriptor
+            )
+        )
+    }
 }
 
 bitflags! {
@@ -2829,7 +2841,7 @@ impl<'db> Type<'db> {
             Type::Callable(callable) if callable.is_staticmethod_like(db) => {
                 // For "staticmethod-like" callables, model the behavior of `staticmethod.__get__`.
                 // The underlying function is returned as-is, without binding self.
-                return Some((self, AttributeKind::NormalOrNonDataDescriptor));
+                return Some((self, AttributeKind::NonDataDescriptor));
             }
             Type::Callable(callable)
                 if callable.is_function_like(db) || callable.is_classmethod_like(db) =>
@@ -2843,7 +2855,7 @@ impl<'db> Type<'db> {
                 // `find_name_in_mro` when called on function-like `Callable`s. This would allow us to
                 // correctly model the behavior of *explicit* `SomeDataclass.__init__.__get__` calls.
                 return if instance.is_none() && callable.is_function_like(db) {
-                    Some((self, AttributeKind::NormalOrNonDataDescriptor))
+                    Some((self, AttributeKind::NonDataDescriptor))
                 } else {
                     let self_type = instance.unwrap_or_else(|| {
                         // For classmethod-like callables, bind to the owner class.
@@ -2852,7 +2864,7 @@ impl<'db> Type<'db> {
 
                     Some((
                         Type::Callable(callable.bind_self(db, Some(self_type))),
-                        AttributeKind::NormalOrNonDataDescriptor,
+                        AttributeKind::NonDataDescriptor,
                     ))
                 };
             }
@@ -2869,7 +2881,7 @@ impl<'db> Type<'db> {
                 // an instance of `None`
                 return Some((
                     Type::BoundMethod(BoundMethodType::new(db, function, instance.unwrap())),
-                    AttributeKind::NormalOrNonDataDescriptor,
+                    AttributeKind::NonDataDescriptor,
                 ));
             }
             _ => {}
@@ -2900,7 +2912,7 @@ impl<'db> Type<'db> {
             let descriptor_kind = if self.is_data_descriptor(db) {
                 AttributeKind::DataDescriptor
             } else {
-                AttributeKind::NormalOrNonDataDescriptor
+                AttributeKind::NonDataDescriptor
             };
 
             Some((return_ty, descriptor_kind))
@@ -2971,29 +2983,42 @@ impl<'db> Type<'db> {
                         public_type_policy,
                     }),
                 qualifiers,
-            } => (
-                union
-                    .map_with_boundness(db, |elem| {
-                        Place::Defined(DefinedPlace {
-                            ty: elem
-                                .try_call_dunder_get(db, instance, owner)
-                                .map_or(*elem, |(ty, _)| ty),
-                            origin,
-                            definedness: boundness,
-                            public_type_policy,
-                        })
-                    })
-                    .with_qualifiers(qualifiers),
-                // TODO: avoid the duplication here:
-                if union.elements(db).iter().all(|elem| {
+            } => {
+                let descriptor_kinds = union.elements(db).iter().map(|elem| {
                     elem.try_call_dunder_get(db, instance, owner)
-                        .is_some_and(|(_, kind)| kind.is_data())
-                }) {
+                        .map(|(_, kind)| kind)
+                });
+
+                let attribute_kind = if descriptor_kinds
+                    .clone()
+                    .all(|kind| kind.is_some_and(AttributeKind::is_data))
+                {
                     AttributeKind::DataDescriptor
+                } else if descriptor_kinds
+                    .clone()
+                    .all(|kind| matches!(kind, Some(AttributeKind::NonDataDescriptor)))
+                {
+                    AttributeKind::NonDataDescriptor
                 } else {
-                    AttributeKind::NormalOrNonDataDescriptor
-                },
-            ),
+                    AttributeKind::NormalAttribute
+                };
+
+                (
+                    union
+                        .map_with_boundness(db, |elem| {
+                            Place::Defined(DefinedPlace {
+                                ty: elem
+                                    .try_call_dunder_get(db, instance, owner)
+                                    .map_or(*elem, |(ty, _)| ty),
+                                origin,
+                                definedness: boundness,
+                                public_type_policy,
+                            })
+                        })
+                        .with_qualifiers(qualifiers),
+                    attribute_kind,
+                )
+            }
 
             attribute @ PlaceAndQualifiers {
                 place:
@@ -3022,7 +3047,7 @@ impl<'db> Type<'db> {
                         .with_qualifiers(qualifiers)
                 },
                 // TODO: Discover data descriptors in intersections.
-                AttributeKind::NormalOrNonDataDescriptor,
+                AttributeKind::NormalAttribute,
             ),
 
             PlaceAndQualifiers {
@@ -3049,11 +3074,11 @@ impl<'db> Type<'db> {
                         attribute_kind,
                     )
                 } else {
-                    (attribute, AttributeKind::NormalOrNonDataDescriptor)
+                    (attribute, AttributeKind::NormalAttribute)
                 }
             }
 
-            _ => (attribute, AttributeKind::NormalOrNonDataDescriptor),
+            _ => (attribute, AttributeKind::NormalAttribute),
         }
     }
 
@@ -3118,7 +3143,7 @@ impl<'db> Type<'db> {
         db: &'db dyn Db,
         name: &str,
         fallback: PlaceAndQualifiers<'db>,
-        policy: InstanceFallbackShadowsNonDataDescriptor,
+        policy: FallbackShadowingPolicy,
         member_policy: MemberLookupPolicy,
     ) -> PlaceAndQualifiers<'db> {
         let (
@@ -3182,24 +3207,21 @@ impl<'db> Type<'db> {
             })
             .with_qualifiers(meta_attr_qualifiers.union(fallback_qualifiers)),
 
-            // `meta_attr` is *not* a data descriptor. This means that the `fallback` type has
-            // now the highest priority. However, we only return the pure `fallback` type if the
-            // policy allows it. When invoked on class objects, the policy is set to `Yes`, which
-            // means that class-level attributes (the fallback) can shadow non-data descriptors
-            // on metaclasses. However, for instances, the policy is set to `No`, because we do
-            // allow instance-level attributes to shadow class-level non-data descriptors. This
-            // would require us to statically infer if an instance attribute is always set, which
-            // is something we currently don't attempt to do.
+            // `meta_attr` is a non-data descriptor. This means that the `fallback` type has now
+            // the highest priority. However, we only return the pure `fallback` type if the
+            // policy allows it and the fallback is always defined.
             (
-                Place::Defined(_),
-                AttributeKind::NormalOrNonDataDescriptor,
+                Place::Defined(DefinedPlace {
+                    definedness: Definedness::AlwaysDefined,
+                    ..
+                }),
+                meta_attr_kind
+                @ (AttributeKind::NormalAttribute | AttributeKind::NonDataDescriptor),
                 fallback @ Place::Defined(DefinedPlace {
                     definedness: Definedness::AlwaysDefined,
                     ..
                 }),
-            ) if policy == InstanceFallbackShadowsNonDataDescriptor::Yes => {
-                fallback.with_qualifiers(fallback_qualifiers)
-            }
+            ) if policy.allows(meta_attr_kind) => fallback.with_qualifiers(fallback_qualifiers),
 
             // `meta_attr` is *not* a data descriptor. The `fallback` symbol is either possibly
             // unbound or the policy argument is `No`. In both cases, the `fallback` type does
@@ -3211,7 +3233,7 @@ impl<'db> Type<'db> {
                     definedness: meta_attr_boundness,
                     ..
                 }),
-                AttributeKind::NormalOrNonDataDescriptor,
+                AttributeKind::NormalAttribute | AttributeKind::NonDataDescriptor,
                 Place::Defined(DefinedPlace {
                     ty: fallback_ty,
                     origin: fallback_origin,
@@ -3505,7 +3527,7 @@ impl<'db> Type<'db> {
                 db,
                 name_str,
                 Place::Undefined.into(),
-                InstanceFallbackShadowsNonDataDescriptor::No,
+                FallbackShadowingPolicy::No,
                 policy,
             ),
 
@@ -3605,7 +3627,7 @@ impl<'db> Type<'db> {
                     db,
                     name_str,
                     fallback,
-                    InstanceFallbackShadowsNonDataDescriptor::No,
+                    FallbackShadowingPolicy::NonDataDescriptorsOnly,
                     policy,
                 );
 
@@ -3658,7 +3680,7 @@ impl<'db> Type<'db> {
                     db,
                     name_str,
                     class_attr_fallback,
-                    InstanceFallbackShadowsNonDataDescriptor::Yes,
+                    FallbackShadowingPolicy::NormalAndNonDataDescriptors,
                     policy,
                 );
 

@@ -868,6 +868,29 @@ reveal_type(C.variable_with_class_default1)  # revealed: Literal["overwritten on
 reveal_type(c_instance.variable_with_class_default1)  # revealed: Literal["value set on instance"]
 ```
 
+#### Instance attributes shadow non-data descriptors
+
+When an instance attribute has the same name as a method on the class, the instance attribute
+shadows the method's non-data descriptor.
+
+```py
+class MethodSource:
+    def method(self, value: int) -> str:
+        return str(value)
+
+class C:
+    def __init__(self, source: MethodSource) -> None:
+        self.method = source.method
+
+    def method(self, value: int) -> str:
+        return f"{value}"
+
+c_instance = C(MethodSource())
+
+reveal_type(c_instance.method)  # revealed: bound method MethodSource.method(value: int) -> str
+reveal_type(c_instance.method(1))  # revealed: str
+```
+
 #### Descriptor attributes as class variables
 
 Whether they are explicitly qualified as `ClassVar`, or just have a class level default, we treat

@@ -17,12 +17,12 @@ use crate::{
     },
     reachability::{DeclarationsIteratorExtension, binding_reachability},
     types::{
-        ApplyTypeMappingVisitor, BoundTypeVarInstance, CallArguments, CallableType, ClassBase,
-        ClassLiteral, ClassType, DATACLASS_FLAGS, DataclassFlags, DataclassParams, GenericAlias,
-        GenericContext, KnownClass, KnownInstanceType, MaterializationKind, MemberLookupPolicy,
-        MetaclassCandidate, MetaclassTransformInfo, Parameter, Parameters, PropertyInstanceType,
-        Signature, SpecialFormType, StaticMroError, SubclassOfType, Truthiness, Type, TypeContext,
-        TypeMapping, TypeVarVariance, UnionBuilder, UnionType,
+        ApplyTypeMappingVisitor, AttributeKind, BoundTypeVarInstance, CallArguments, CallableType,
+        ClassBase, ClassLiteral, ClassType, DATACLASS_FLAGS, DataclassFlags, DataclassParams,
+        GenericAlias, GenericContext, KnownClass, KnownInstanceType, MaterializationKind,
+        MemberLookupPolicy, MetaclassCandidate, MetaclassTransformInfo, Parameter, Parameters,
+        PropertyInstanceType, Signature, SpecialFormType, StaticMroError, SubclassOfType,
+        Truthiness, Type, TypeContext, TypeMapping, TypeVarVariance, UnionBuilder, UnionType,
         call::{CallError, CallErrorKind},
         callable::CallableTypeKind,
         class::{
@@ -2416,7 +2416,21 @@ impl<'db> StaticClassLiteral<'db> {
                             Self::implicit_attribute(db, body_scope, name, MethodDecorator::None)
                                 .ignore_possibly_undefined()
                         {
-                            if declaredness == Definedness::AlwaysDefined {
+                            let is_non_data_descriptor = declared_ty
+                                .try_call_dunder_get(
+                                    db,
+                                    Some(Type::instance(db, self.unknown_specialization(db))),
+                                    Type::ClassLiteral(ClassLiteral::Static(self)),
+                                )
+                                .is_some_and(|(_, kind)| kind == AttributeKind::NonDataDescriptor);
+
+                            let is_dunder_method = name.starts_with("__") && name.ends_with("__");
+
+                            if is_non_data_descriptor && !is_dunder_method {
+                                Member {
+                                    inner: Place::bound(implicit_ty).with_qualifiers(qualifiers),
+                                }
+                            } else if declaredness == Definedness::AlwaysDefined {
                                 // If a symbol is definitely declared, and we see
                                 // attribute assignments in methods of the class,
                                 // we trust the declared type.

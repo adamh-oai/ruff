@@ -128,7 +128,7 @@ c = C()
 
 reveal_type(c.data_descriptor)  # revealed: Literal["data"]
 
-reveal_type(c.non_data_descriptor)  # revealed: Literal["non-data"] | int
+reveal_type(c.non_data_descriptor)  # revealed: int
 
 reveal_type(C.data_descriptor)  # revealed: Literal["data"]
 
@@ -181,8 +181,8 @@ def f1(flag: bool):
     C1().attr = 1
 ```
 
-We never treat implicit instance attributes as definitely bound, so we fall back to the non-data
-descriptor here:
+We treat implicit instance attributes as definitely bound for reads, so they shadow non-data
+descriptors:
 
 ```py
 class C2:
@@ -191,7 +191,7 @@ class C2:
         self.attr = b"normal"
     attr = NonDataDescriptor()
 
-reveal_type(C2().attr)  # revealed: Literal["non-data"] | bytes
+reveal_type(C2().attr)  # revealed: bytes
 
 # Reads still fall back to the instance attribute in this case, but assignments
 # are checked against the declared class attribute type.
