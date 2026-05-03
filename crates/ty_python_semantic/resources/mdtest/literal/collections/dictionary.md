@@ -12,6 +12,34 @@ reveal_type({})  # revealed: dict[Unknown, Unknown]
 reveal_type({1: 1, 2: 1})  # revealed: dict[int, int]
 ```
 
+## Get accepts arbitrary keys
+
+`dict.get` accepts any object as a lookup key at runtime. The key may be absent, but absence is
+already represented in the return type:
+
+```py
+from collections.abc import Mapping
+from enum import Enum
+
+class RuleName(str, Enum):
+    FAST = "fast"
+    SLOW = "slow"
+
+rules = {
+    RuleName.FAST: {"slug": "fast"},
+    RuleName.SLOW: {"slug": "slow"},
+}
+reveal_type(rules)  # revealed: dict[RuleName, dict[str, str]]
+
+def lookup_rule(rule_name: str):
+    reveal_type(rules.get(rule_name))  # revealed: dict[str, str] | None
+    reveal_type(rules.get(rule_name, {}))  # revealed: dict[str, str]
+
+def lookup_mapping(mapping: Mapping[RuleName, int], rule_name: str):
+    reveal_type(mapping.get(rule_name))  # revealed: int | None
+    reveal_type(mapping.get(rule_name, 0))  # revealed: int
+```
+
 ## Dict of tuples
 
 ```py
