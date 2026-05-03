@@ -1667,3 +1667,31 @@ def _(args_tuple: tuple[int, int], args_union: tuple[int] | tuple[int, int], kwa
     f(*args_tuple, **kwargs)  # fine
     f(*args_union, **kwargs)  # fine
 ```
+
+## Contextual inference for dictionary-backed keyword splats
+
+`**kwargs` dictionaries are first inferred without context so that ty can determine their keyword
+shape. Once the shape is known, values from a fresh dictionary literal can still use the matched
+parameter type as context:
+
+```py
+from collections.abc import Mapping
+from enum import Enum
+from typing import Any
+
+class Header(str, Enum):
+    REQUEST_ID = "x-request-id"
+
+def with_headers(*, extra_headers: Mapping[str, str] | None = None) -> None: ...
+def ok(request_id: str) -> None:
+    kwargs: dict[str, Any] = {
+        "extra_headers": {Header.REQUEST_ID: request_id},
+    }
+    with_headers(**kwargs)
+
+def bad() -> None:
+    kwargs: dict[str, Any] = {
+        "extra_headers": {Header.REQUEST_ID: 1},
+    }
+    with_headers(**kwargs)  # error: [invalid-argument-type]
+```

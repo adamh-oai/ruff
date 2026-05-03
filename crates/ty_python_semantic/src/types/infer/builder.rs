@@ -5148,10 +5148,38 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let ast_argument = match ast_argument {
                 // Splatted arguments are inferred before parameter matching to
                 // determine their length.
-                //
-                // TODO: Re-infer splatted arguments with their type context.
-                ast::ArgOrKeyword::Arg(ast::Expr::Starred(_))
-                | ast::ArgOrKeyword::Keyword(ast::Keyword { arg: None, .. }) => continue,
+                ast::ArgOrKeyword::Arg(ast::Expr::Starred(_)) => continue,
+                ast::ArgOrKeyword::Keyword(ast::Keyword {
+                    arg: None, value, ..
+                }) => {
+                    let Ok((overload, _binding)) = overloads_with_binding.iter().exactly_one()
+                    else {
+                        continue;
+                    };
+
+                    let mut expected_fields = FxHashMap::default();
+                    for parameter_index in &overload.argument_matches()[argument_index].parameters {
+                        let parameter = &overload.signature.parameters()[*parameter_index];
+                        if parameter.is_keyword_variadic() {
+                            expected_fields.clear();
+                            break;
+                        }
+
+                        if let Some(name) = parameter.keyword_name() {
+                            expected_fields.insert(name.clone(), parameter.annotated_type());
+                        }
+                    }
+
+                    if !expected_fields.is_empty()
+                        && let Some(ty) = self
+                            .speculate()
+                            .infer_keywords_argument_type_with_context(value, &expected_fields)
+                    {
+                        argument_types.insert(TypeContext::default(), ty);
+                    }
+
+                    continue;
+                }
 
                 ast::ArgOrKeyword::Arg(arg) => arg,
                 ast::ArgOrKeyword::Keyword(ast::Keyword { value, .. }) => value,
@@ -5915,9 +5943,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_keywords_argument_type(&mut self, expr: &ast::Expr) -> Type<'db> {
         let ty = self.infer_expression(expr, TypeContext::default());
 
-        self.try_synthesize_kwargs_typed_dict(expr, None, &mut FxHashSet::default())
+        self.try_synthesize_kwargs_typed_dict(expr, None, &mut FxHashSet::default(), None)
             .map(Type::TypedDict)
             .unwrap_or(ty)
+    }
+
+    fn infer_keywords_argument_type_with_context(
+        &mut self,
+        expr: &ast::Expr,
+        expected_fields: &FxHashMap<Name, Type<'db>>,
+    ) -> Option<Type<'db>> {
+        self.try_synthesize_kwargs_typed_dict(
+            expr,
+            None,
+            &mut FxHashSet::default(),
+            Some(expected_fields),
+        )
+        .map(Type::TypedDict)
     }
 
     fn try_synthesize_kwargs_typed_dict(
@@ -5925,6 +5967,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expr: &ast::Expr,
         definition: Option<Definition<'db>>,
         seen_definitions: &mut FxHashSet<Definition<'db>>,
+        expected_fields: Option<&FxHashMap<Name, Type<'db>>>,
     ) -> Option<TypedDictType<'db>> {
         match expr {
             ast::Expr::Dict(dict) => {
@@ -5932,6 +5975,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     dict,
                     definition,
                     seen_definitions,
+                    expected_fields,
                 )?;
                 Some(TypedDictType::Synthesized(SynthesizedTypedDictType::new(
                     self.db(),
@@ -5961,14 +6005,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     file_scope,
                     use_id,
                     seen_definitions,
+                    expected_fields,
                 )
             }
-            ast::Expr::Named(named) => {
-                self.try_synthesize_kwargs_typed_dict(&named.value, definition, seen_definitions)
-            }
-            ast::Expr::Call(call) => {
-                self.try_synthesize_kwargs_typed_dict_from_call(call, definition, seen_definitions)
-            }
+            ast::Expr::Named(named) => self.try_synthesize_kwargs_typed_dict(
+                &named.value,
+                definition,
+                seen_definitions,
+                expected_fields,
+            ),
+            ast::Expr::Call(call) => self.try_synthesize_kwargs_typed_dict_from_call(
+                call,
+                definition,
+                seen_definitions,
+                expected_fields,
+            ),
             _ => None,
         }
     }
@@ -5978,6 +6029,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         call: &ast::ExprCall,
         definition: Option<Definition<'db>>,
         seen_definitions: &mut FxHashSet<Definition<'db>>,
+        expected_fields: Option<&FxHashMap<Name, Type<'db>>>,
     ) -> Option<TypedDictType<'db>> {
         let ast::ExprCall {
             func, arguments, ..
@@ -6002,11 +6054,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         }
 
-        self.try_synthesize_kwargs_typed_dict(argument, definition, seen_definitions)
-            .or_else(|| {
-                self.kwargs_expression_type(argument, definition)
-                    .as_typed_dict()
-            })
+        self.try_synthesize_kwargs_typed_dict(
+            argument,
+            definition,
+            seen_definitions,
+            expected_fields,
+        )
+        .or_else(|| {
+            self.kwargs_expression_type(argument, definition)
+                .as_typed_dict()
+        })
     }
 
     fn try_synthesize_kwargs_typed_dict_from_use(
@@ -6015,6 +6072,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         file_scope: FileScopeId,
         use_id: ScopedUseId,
         seen_definitions: &mut FxHashSet<Definition<'db>>,
+        expected_fields: Option<&FxHashMap<Name, Type<'db>>>,
     ) -> Option<TypedDictType<'db>> {
         let mut definitions = vec![];
         let use_def = if file == self.file() {
@@ -6041,15 +6099,30 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let result = match definition.kind(self.db()) {
             DefinitionKind::Assignment(assignment) => {
                 let value = assignment.value(&module);
-                self.try_synthesize_kwargs_typed_dict(value, Some(*definition), seen_definitions)
+                self.try_synthesize_kwargs_typed_dict(
+                    value,
+                    self.definition_context_for_kwargs(*definition, expected_fields),
+                    seen_definitions,
+                    expected_fields,
+                )
             }
             DefinitionKind::AnnotatedAssignment(assignment) => {
                 let value = assignment.value(&module)?;
-                self.try_synthesize_kwargs_typed_dict(value, Some(*definition), seen_definitions)
+                self.try_synthesize_kwargs_typed_dict(
+                    value,
+                    self.definition_context_for_kwargs(*definition, expected_fields),
+                    seen_definitions,
+                    expected_fields,
+                )
             }
             DefinitionKind::NamedExpression(named) => {
                 let value = &named.node(&module).value;
-                self.try_synthesize_kwargs_typed_dict(value, Some(*definition), seen_definitions)
+                self.try_synthesize_kwargs_typed_dict(
+                    value,
+                    self.definition_context_for_kwargs(*definition, expected_fields),
+                    seen_definitions,
+                    expected_fields,
+                )
             }
             _ => None,
         };
@@ -6062,6 +6135,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         dict: &ast::ExprDict,
         definition: Option<Definition<'db>>,
         seen_definitions: &mut FxHashSet<Definition<'db>>,
+        expected_fields: Option<&FxHashMap<Name, Type<'db>>>,
     ) -> Option<TypedDictSchema<'db>> {
         let db = self.db();
         let mut schema = TypedDictSchema::default();
@@ -6069,17 +6143,29 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         for item in &dict.items {
             if let Some(key_expr) = item.key.as_ref() {
                 let key = self
-                    .kwargs_expression_type(key_expr, definition)
+                    .kwargs_expression_type_with_context(
+                        key_expr,
+                        definition,
+                        TypeContext::default(),
+                    )
                     .as_string_literal()?;
                 let key = Name::new(key.value(db));
-                let value_ty = self.kwargs_expression_type(&item.value, definition);
+                let value_tcx =
+                    TypeContext::new(expected_fields.and_then(|fields| fields.get(&key).copied()));
+                let value_ty =
+                    self.kwargs_expression_type_with_context(&item.value, definition, value_tcx);
                 schema.insert(
                     key,
                     TypedDictFieldBuilder::new(value_ty).required(true).build(),
                 );
             } else {
                 let nested = self
-                    .try_synthesize_kwargs_typed_dict(&item.value, definition, seen_definitions)
+                    .try_synthesize_kwargs_typed_dict(
+                        &item.value,
+                        definition,
+                        seen_definitions,
+                        None,
+                    )
                     .or_else(|| {
                         self.kwargs_expression_type(&item.value, definition)
                             .as_typed_dict()
@@ -6093,6 +6179,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         Some(schema)
     }
 
+    fn definition_context_for_kwargs(
+        &self,
+        definition: Definition<'db>,
+        expected_fields: Option<&FxHashMap<Name, Type<'db>>>,
+    ) -> Option<Definition<'db>> {
+        if expected_fields.is_some()
+            && definition.file(self.db()) == self.file()
+            && definition.scope(self.db()) == self.scope()
+        {
+            None
+        } else {
+            Some(definition)
+        }
+    }
+
     fn kwargs_expression_type(
         &self,
         expression: &ast::Expr,
@@ -6102,6 +6203,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             || self.expression_type(expression),
             |definition| definition_expression_type(self.db(), definition, expression),
         )
+    }
+
+    fn kwargs_expression_type_with_context(
+        &mut self,
+        expression: &ast::Expr,
+        definition: Option<Definition<'db>>,
+        tcx: TypeContext<'db>,
+    ) -> Type<'db> {
+        if definition.is_some() {
+            self.kwargs_expression_type(expression, definition)
+        } else {
+            self.get_or_infer_expression(expression, tcx)
+        }
     }
 
     // Infer the type of a collection literal expression.
