@@ -6582,6 +6582,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         return Some(Type::unknown());
                     }
 
+                    // Promote enum literals in mutable collection element types even when the
+                    // literal came from an explicit `Literal[Enum.MEMBER]` annotation. These
+                    // collections can later grow to contain any member of the enum class.
+                    let lower = if matches!(collection_class, KnownClass::List | KnownClass::Set) {
+                        lower.promote_enum_literals(self.db())
+                    } else {
+                        lower
+                    };
+
                     // Promote singleton types to `T | Unknown` in inferred type parameters,
                     // so that e.g. `[None]` is inferred as `list[None | Unknown]`.
                     if elt_tcx_constraints.is_empty() {

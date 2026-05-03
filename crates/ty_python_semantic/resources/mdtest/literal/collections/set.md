@@ -37,3 +37,30 @@ reveal_type({1, (1, 2), (1, 2, 3)})
 ```py
 reveal_type({x for x in range(42)})  # revealed: set[int]
 ```
+
+## Enum literal promotion
+
+Explicitly typed enum literals are promoted when inferring mutable set element types without
+context:
+
+```py
+from enum import Enum
+from typing import Literal
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+    GREEN = 3
+
+def pick() -> Literal[Color.RED, Color.BLUE]:
+    raise NotImplementedError
+
+def takes_colors(colors: set[Color]) -> None: ...
+
+reveal_type({pick()})  # revealed: set[Color]
+reveal_type({pick() for _ in range(1)})  # revealed: set[Color]
+takes_colors({pick() for _ in range(1)})
+
+literal_colors: set[Literal[Color.RED, Color.BLUE]] = {pick()}
+reveal_type(literal_colors)  # revealed: set[Literal[Color.RED, Color.BLUE]]
+```

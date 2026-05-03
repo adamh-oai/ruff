@@ -91,3 +91,27 @@ reveal_type(Foo().mylist)  # revealed: list[None | Unknown]
 ```py
 reveal_type([x for x in range(42)])  # revealed: list[int]
 ```
+
+## Enum literal promotion
+
+Explicitly typed enum literals are promoted when inferring mutable list element types without
+context:
+
+```py
+from enum import Enum
+from typing import Literal
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+    GREEN = 3
+
+def pick() -> Literal[Color.RED, Color.BLUE]:
+    raise NotImplementedError
+
+reveal_type([pick()])  # revealed: list[Color]
+reveal_type([pick() for _ in range(1)])  # revealed: list[Color]
+
+literal_colors: list[Literal[Color.RED, Color.BLUE]] = [pick()]
+reveal_type(literal_colors)  # revealed: list[Literal[Color.RED, Color.BLUE]]
+```

@@ -1986,6 +1986,18 @@ impl<'db> Type<'db> {
         )
     }
 
+    /// Promote enum literal types to their enum class instance type, even if the literal
+    /// originated from an explicit `Literal[Enum.MEMBER]` annotation.
+    pub(crate) fn promote_enum_literals(self, db: &'db dyn Db) -> Type<'db> {
+        match self {
+            Type::LiteralValue(literal) if literal.is_enum() => literal.fallback_instance(db),
+            Type::Union(union) => {
+                union.map_leave_aliases(db, |element| element.promote_enum_literals(db))
+            }
+            _ => self,
+        }
+    }
+
     /// Like [`Type::promote`], but does not recurse into nested types.
     fn promote_impl(self, db: &'db dyn Db) -> Type<'db> {
         match self {
