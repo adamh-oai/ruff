@@ -754,6 +754,23 @@ def _(x: list[int] | set[str]):
         reveal_type(x)  # revealed: set[str]
 ```
 
+Generic parameters can also be solved from an existing generic supertype when the runtime check
+narrows to a more specific generic class:
+
+```py
+from collections.abc import Iterable, Sequence
+
+class Message: ...
+
+def _(body_messages: Iterable[Message]):
+    messages = body_messages if isinstance(body_messages, list) else list(body_messages)
+    reveal_type(messages)  # revealed: list[Message]
+
+def _(x: Sequence[int]):
+    if isinstance(x, list):
+        reveal_type(x)  # revealed: list[int]
+```
+
 Though if the types involved are not disjoint bases, we necessarily keep a more complex type.
 
 ```py

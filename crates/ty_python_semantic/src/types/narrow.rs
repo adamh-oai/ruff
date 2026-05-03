@@ -1,17 +1,21 @@
 use crate::Db;
+use crate::FxOrderSet;
 use crate::reachability::ReachabilityConstraintsExtension;
 use crate::subscript::PyIndex;
+use crate::types::constraints::ConstraintSetBuilder;
 use crate::types::enums::{enum_member_literals, enum_metadata};
 use crate::types::function::KnownFunction;
+use crate::types::generics::{InferableTypeVars, SpecializationBuilder};
 use crate::types::infer::{ExpressionInference, infer_same_file_expression_type};
 use crate::types::special_form::TypeQualifier;
 use crate::types::typed_dict::{
     TypedDictField, TypedDictFieldBuilder, TypedDictSchema, TypedDictType,
 };
 use crate::types::{
-    CallableType, ClassLiteral, ClassType, IntersectionBuilder, IntersectionType, KnownClass,
-    KnownInstanceType, LiteralValueTypeKind, SpecialFormType, SubclassOfInner, SubclassOfType,
-    Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnionBuilder, infer_expression_types,
+    CallableType, ClassLiteral, ClassType, GenericAlias, IntersectionBuilder, IntersectionType,
+    KnownClass, KnownInstanceType, LiteralValueTypeKind, SpecialFormType, SubclassOfInner,
+    SubclassOfType, Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnionBuilder,
+    infer_expression_types,
 };
 use ty_python_core::expression::Expression;
 use ty_python_core::place::{PlaceExpr, PlaceTable, ScopedPlaceId};
@@ -933,6 +937,80 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         }
     }
 
+    /// Try to preserve generic parameters from an existing type while applying a runtime class
+    /// narrowing constraint.
+    ///
+    /// Runtime checks like `isinstance(x, list)` cannot see type arguments, so the raw class-info
+    /// constraint is `Top[list[Unknown]]`. If the current type already proves a compatible generic
+    /// supertype, such as `Iterable[Message]`, we can solve the checked class's type parameters from
+    /// that existing type and narrow to `list[Message]`.
+    fn specialize_class_constraint_from_base_type(
+        db: &'db dyn Db,
+        base_ty: Type<'db>,
+        constraint: Type<'db>,
+    ) -> Type<'db> {
+        if matches!(base_ty.resolve_type_alias(db), Type::Union(_)) {
+            return constraint;
+        }
+
+        let Type::NominalInstance(instance) = constraint else {
+            return constraint;
+        };
+
+        let ClassType::Generic(alias) = instance.class(db) else {
+            return constraint;
+        };
+
+        if alias.specialization(db).materialization_kind(db).is_none() {
+            return constraint;
+        }
+
+        let generic_context = alias.specialization(db).generic_context(db);
+        let typevars: FxOrderSet<_> = generic_context
+            .variables(db)
+            .map(|typevar| typevar.identity(db))
+            .collect();
+        let inferable = InferableTypeVars::from_typevars(db, typevars);
+
+        let identity_alias = GenericAlias::new(
+            db,
+            alias.origin(db),
+            generic_context.identity_specialization(db),
+        );
+        let Some(candidate) = Type::from(ClassType::Generic(identity_alias)).to_instance(db) else {
+            return constraint;
+        };
+
+        let constraints = ConstraintSetBuilder::new();
+        let mut builder = SpecializationBuilder::new(db, &constraints, inferable);
+        let mut inferred_typevars = FxOrderSet::default();
+        if builder
+            .infer_map(base_ty, candidate, |(identity, _, ty)| {
+                if ty.is_dynamic() {
+                    return None;
+                }
+                inferred_typevars.insert(identity);
+                Some(ty)
+            })
+            .is_err()
+            || inferred_typevars.len() != generic_context.len(db)
+        {
+            return constraint;
+        }
+
+        let specialization = builder.build_with(generic_context, |_, _, _| None);
+        let refined_alias = GenericAlias::new(db, alias.origin(db), specialization);
+        let refined = Type::from(ClassType::Generic(refined_alias))
+            .to_instance(db)
+            .unwrap_or(constraint);
+
+        if refined.is_subtype_of(db, constraint) {
+            refined
+        } else {
+            constraint
+        }
+    }
+
     fn evaluate_simple_expr(
         &mut self,
         expr: &ast::Expr,
@@ -1702,10 +1780,16 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 let function = function.into_classinfo_constraint_function()?;
 
                 let class_info_ty = inference.expression_type(second_arg);
+                let base_ty = inference.expression_type(&expr_call.arguments.args[0]);
 
                 function
                     .generate_constraint(self.db, class_info_ty, is_positive)
-                    .map(|constraint| {
+                    .map(|mut constraint| {
+                        if is_positive {
+                            constraint = Self::specialize_class_constraint_from_base_type(
+                                self.db, base_ty, constraint,
+                            );
+                        }
                         NarrowingConstraints::from_iter([(
                             place,
                             NarrowingConstraint::intersection(
