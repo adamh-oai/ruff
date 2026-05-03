@@ -200,6 +200,10 @@ impl<'a, 'db> CallArguments<'a, 'db> {
         &self.types
     }
 
+    pub(crate) fn types_mut(&mut self) -> &mut [CallArgumentTypes<'db>] {
+        &mut self.types
+    }
+
     /// Prepend an optional extra synthetic argument (for a `self` or `cls` parameter) to the front
     /// of this argument list. (If `bound_self` is none, we return the argument list
     /// unmodified.)

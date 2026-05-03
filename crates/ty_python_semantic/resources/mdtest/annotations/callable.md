@@ -202,6 +202,58 @@ def _(c: Callable[[int, str], int]):
     reveal_type(c)  # revealed: (int, str, /) -> int
 ```
 
+Callable return types can satisfy protocols structurally:
+
+```py
+from contextlib import contextmanager
+from typing import Callable, ContextManager, Generator, TypeAlias
+
+@contextmanager
+def cm() -> Generator[None, None, None]:
+    yield
+
+def expects_cm(c: Callable[[], ContextManager[None]]) -> None: ...
+
+expects_cm(cm)
+
+def expects_cm_list(c: list[Callable[[], ContextManager[None]]]) -> None: ...
+
+expects_cm_list([cm])
+
+MaybeCM: TypeAlias = Callable[[], ContextManager[None]] | Callable[[], None]
+
+def expects_union_cm_list(c: list[MaybeCM]) -> None: ...
+
+expects_union_cm_list([cm])
+```
+
+Callable return types can satisfy protocols through `ParamSpec.kwargs` inference:
+
+```py
+from collections.abc import Awaitable
+from contextlib import contextmanager
+from typing import Any, Callable, ContextManager, Generator, ParamSpec, Protocol, TypeAlias
+
+P = ParamSpec("P")
+ASGIApp: TypeAlias = Callable[[Any, Any, Any], Awaitable[None]]
+MaybeCM: TypeAlias = Callable[[str], ContextManager[None]] | Callable[[str], None]
+
+class Factory(Protocol[P]):
+    def __call__(self, app: ASGIApp, /, *args: P.args, **kwargs: P.kwargs) -> ASGIApp: ...
+
+def add_middleware(cls: Factory[P], *args: P.args, **kwargs: P.kwargs) -> None: ...
+
+class RequestContextMiddleware:
+    def __init__(self, app: ASGIApp, on_request: list[MaybeCM] | None = None) -> None: ...
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None: ...
+
+@contextmanager
+def http_request_event(request: str) -> Generator[None, None, None]:
+    yield
+
+add_middleware(RequestContextMiddleware, on_request=[http_request_event])
+```
+
 ## Overloaded callable assignability
 
 An overloaded callable should be assignable to a non-overloaded callable type when the overload set
