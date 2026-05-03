@@ -5152,21 +5152,38 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 ast::ArgOrKeyword::Keyword(ast::Keyword {
                     arg: None, value, ..
                 }) => {
-                    let Ok((overload, _binding)) = overloads_with_binding.iter().exactly_one()
-                    else {
-                        continue;
-                    };
-
                     let mut expected_fields = FxHashMap::default();
-                    for parameter_index in &overload.argument_matches()[argument_index].parameters {
-                        let parameter = &overload.signature.parameters()[*parameter_index];
-                        if parameter.is_keyword_variadic() {
-                            expected_fields.clear();
-                            break;
-                        }
+                    for (overload, binding) in &overloads_with_binding {
+                        let argument_index = if binding.bound_type.is_some() {
+                            argument_index + 1
+                        } else {
+                            argument_index
+                        };
+                        let Some(argument_matches) =
+                            overload.argument_matches().get(argument_index)
+                        else {
+                            continue;
+                        };
 
-                        if let Some(name) = parameter.keyword_name() {
-                            expected_fields.insert(name.clone(), parameter.annotated_type());
+                        for parameter_index in &argument_matches.parameters {
+                            let parameter = &overload.signature.parameters()[*parameter_index];
+                            if parameter.is_keyword_variadic() {
+                                continue;
+                            }
+
+                            if let Some(name) = parameter.keyword_name() {
+                                let annotated_type = parameter.annotated_type();
+                                expected_fields
+                                    .entry(name.clone())
+                                    .and_modify(|existing| {
+                                        *existing = UnionType::from_two_elements(
+                                            db,
+                                            *existing,
+                                            annotated_type,
+                                        );
+                                    })
+                                    .or_insert(annotated_type);
+                            }
                         }
                     }
 

@@ -1695,3 +1695,25 @@ def bad() -> None:
     }
     with_headers(**kwargs)  # error: [invalid-argument-type]
 ```
+
+The same contextual inference should apply to overloaded calls by combining the matched keyword
+parameter types:
+
+```py
+from typing import Any, Literal, TypedDict, overload
+
+class InputMessage(TypedDict):
+    role: Literal["user"]
+    content: str
+
+@overload
+def create(*, input: list[InputMessage]) -> int: ...
+@overload
+def create(*, input: str) -> str: ...
+def create(**kwargs: Any) -> object: ...
+def ok(content: str) -> None:
+    kwargs: dict[str, Any] = {
+        "input": [{"role": "user", "content": content}],
+    }
+    create(**kwargs)
+```
