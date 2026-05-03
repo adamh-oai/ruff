@@ -303,13 +303,12 @@ pub(super) struct TypeInferenceBuilder<'db, 'ast> {
     /// is a stub file but we're still in a non-deferred region.
     deferred_state: DeferredExpressionState,
 
-    /// When set, deferred function annotations should ignore the current function's own recursive
-    /// binding for this name.
+    /// Deferred function annotations should ignore same-class method bindings with these names.
     ///
-    /// This avoids self-shadowing in cases like `async def list(self) -> list[str]: ...` while
+    /// This avoids method-shadowing in cases like `async def list(self) -> list[str]: ...` while
     /// still allowing deferred method annotations to resolve class-local type aliases, nested
     /// classes, and type variables.
-    deferred_function_annotation_self_name: Option<Name>,
+    deferred_function_annotation_hidden_names: FxIndexSet<Name>,
 
     /// For function definitions, the undecorated type of the function.
     undecorated_type: Option<Type<'db>>,
@@ -349,7 +348,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return_types_and_ranges: vec![],
             called_functions: FxIndexSet::default(),
             deferred_state: DeferredExpressionState::None,
-            deferred_function_annotation_self_name: None,
+            deferred_function_annotation_hidden_names: FxIndexSet::default(),
             expressions: FxHashMap::default(),
             expression_cache: None,
             qualifiers: FxHashMap::default(),
@@ -8033,9 +8032,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if self.is_deferred() {
             if let Some(name_expr) = expr_ref.as_name_expr()
                 && self
-                    .deferred_function_annotation_self_name
-                    .as_ref()
-                    .is_some_and(|self_name| self_name == &name_expr.id)
+                    .deferred_function_annotation_hidden_names
+                    .contains(&name_expr.id)
             {
                 return (Place::Undefined, None);
             }
@@ -9252,7 +9250,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             typevar_binding_context: _,
             inference_flags: _,
             deferred_state: _,
-            deferred_function_annotation_self_name: _,
+            deferred_function_annotation_hidden_names: _,
             called_functions: _,
             index: _,
             region: _,
@@ -9337,7 +9335,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             typevar_binding_context: _,
             inference_flags: _,
             deferred_state: _,
-            deferred_function_annotation_self_name: _,
+            deferred_function_annotation_hidden_names: _,
             index: _,
             region: _,
             cycle_recovery: _,
@@ -9379,7 +9377,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             typevar_binding_context: _,
             inference_flags: _,
             deferred_state: _,
-            deferred_function_annotation_self_name: _,
+            deferred_function_annotation_hidden_names: _,
             index: _,
             region: _,
             return_types_and_ranges: _,
@@ -9464,7 +9462,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             typevar_binding_context: _,
             inference_flags: _,
             deferred_state: _,
-            deferred_function_annotation_self_name: _,
+            deferred_function_annotation_hidden_names: _,
             called_functions: _,
             index: _,
             region: _,
@@ -9500,7 +9498,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             index,
             cycle_recovery,
             deferred_state,
-            ref deferred_function_annotation_self_name,
+            ref deferred_function_annotation_hidden_names,
             inference_flags,
             typevar_binding_context,
             ref expression_cache,
@@ -9529,8 +9527,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Ensure the speculative builder has the same inference context as the current one.
         builder.cycle_recovery = cycle_recovery;
         builder.deferred_state = deferred_state;
-        builder.deferred_function_annotation_self_name =
-            deferred_function_annotation_self_name.clone();
+        builder
+            .deferred_function_annotation_hidden_names
+            .clone_from(deferred_function_annotation_hidden_names);
         builder.typevar_binding_context = typevar_binding_context;
         builder.inference_flags = inference_flags;
         builder.expression_cache.clone_from(expression_cache);
@@ -9565,7 +9564,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             typevar_binding_context: _,
             inference_flags: _,
             deferred_state: _,
-            deferred_function_annotation_self_name: _,
+            deferred_function_annotation_hidden_names: _,
             called_functions: _,
             index: _,
             region: _,

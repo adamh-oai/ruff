@@ -1,5 +1,5 @@
 use crate::{
-    Db,
+    Db, FxIndexSet,
     reachability::ReachabilityConstraintsExtension,
     types::{
         KnownClass, KnownInstanceType, ParamSpecAttrKind, SpecialFormType, SubclassOfInner,
@@ -441,18 +441,36 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .index
             .node_scope(NodeWithScopeRef::Function(function))
             .to_scope_id(db, self.file());
-        let hide_self_name_in_annotations = function_body_scope.is_method_scope(db);
+        let hidden_method_names = function_body_scope
+            .class_definition_of_method(db)
+            .and_then(|definition| {
+                let DefinitionKind::Class(class) = definition.kind(db) else {
+                    return None;
+                };
+                Some(
+                    class
+                        .node(self.module())
+                        .body
+                        .iter()
+                        .filter_map(|stmt| {
+                            let ast::Stmt::FunctionDef(function) = stmt else {
+                                return None;
+                            };
+                            Some(function.name.id.clone())
+                        })
+                        .collect::<FxIndexSet<_>>(),
+                )
+            })
+            .unwrap_or_default();
 
         if !has_type_params {
-            let previous_self_name = hide_self_name_in_annotations.then(|| {
-                self.deferred_function_annotation_self_name
-                    .replace(function.name.id.clone())
-            });
+            let previous_hidden_names = std::mem::replace(
+                &mut self.deferred_function_annotation_hidden_names,
+                hidden_method_names,
+            );
             self.infer_return_type_annotation(function.returns.as_deref());
             self.infer_parameters(function.parameters.as_ref());
-            if let Some(previous_self_name) = previous_self_name {
-                self.deferred_function_annotation_self_name = previous_self_name;
-            }
+            self.deferred_function_annotation_hidden_names = previous_hidden_names;
         }
 
         if has_defaults {

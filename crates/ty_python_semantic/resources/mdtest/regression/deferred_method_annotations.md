@@ -29,3 +29,19 @@ async def test(c: C):
     reveal_type(await c.list())  # revealed: list[str]
     reveal_type(c.identity(1))  # revealed: Literal[1]
 ```
+
+## Deferred method annotations ignore sibling method bindings
+
+```py
+from __future__ import annotations
+
+class C:
+    def __init__(self, values: list[int]) -> None:
+        self.values = values
+
+    def list(self) -> list[int]:
+        return self.values
+
+    def after_list(self, values: list[str]) -> list[str]:
+        return values
+```
