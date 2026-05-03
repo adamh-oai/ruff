@@ -1151,8 +1151,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             (use_def.declarations_at_binding(binding), true)
         };
 
-        let (mut place_and_quals, conflicting) = place_from_declarations(self.db(), declarations)
-            .into_place_and_conflicting_declarations();
+        let declarations_result = place_from_declarations(self.db(), declarations);
+        let all_declarations_are_imports = declarations_result.all_declarations_are_imports();
+        let (mut place_and_quals, conflicting) =
+            declarations_result.into_place_and_conflicting_declarations();
 
         if let Some(conflicting) = conflicting {
             // TODO point out the conflicting declarations in the diagnostic?
@@ -1221,7 +1223,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .or_else(|| resolved_place.ignore_possibly_undefined());
 
         AddBinding {
-            declared_ty,
+            declared_ty: if all_declarations_are_imports {
+                None
+            } else {
+                declared_ty
+            },
             binding,
             node,
             qualifiers,

@@ -626,6 +626,7 @@ pub(crate) struct PlaceFromDeclarationsResult<'db> {
     /// Contains the first reachable declaration for this place, if any.
     /// This field is used for backreferences in diagnostics.
     pub(crate) first_declaration: Option<Definition<'db>>,
+    all_declarations_are_imports: bool,
 }
 
 impl<'db> PlaceFromDeclarationsResult<'db> {
@@ -633,12 +634,18 @@ impl<'db> PlaceFromDeclarationsResult<'db> {
         place_and_quals: PlaceAndQualifiers<'db>,
         conflicting_types: Box<indexmap::set::Slice<Type<'db>>>,
         first_declaration: Option<Definition<'db>>,
+        all_declarations_are_imports: bool,
     ) -> Self {
         PlaceFromDeclarationsResult {
             place_and_quals,
             conflicting_types: Some(conflicting_types),
             first_declaration,
+            all_declarations_are_imports,
         }
+    }
+
+    pub(crate) const fn all_declarations_are_imports(&self) -> bool {
+        self.first_declaration.is_some() && self.all_declarations_are_imports
     }
 
     pub(crate) fn ignore_conflicting_declarations(self) -> PlaceAndQualifiers<'db> {
@@ -1695,6 +1702,7 @@ fn place_from_declarations_impl<'db>(
     };
 
     let mut first_declaration = None;
+    let mut all_declarations_are_imports = true;
     let mut all_declarations_definitely_reachable = true;
 
     let mut types = declarations.filter_map(|declaration_with_constraint| {
@@ -1718,6 +1726,8 @@ fn place_from_declarations_impl<'db>(
             None
         } else {
             first_declaration.get_or_insert(declaration);
+            all_declarations_are_imports =
+                all_declarations_are_imports && declaration.kind(db).is_import();
             all_declarations_definitely_reachable =
                 all_declarations_definitely_reachable && static_reachability.is_always_true();
 
@@ -1748,12 +1758,18 @@ fn place_from_declarations_impl<'db>(
         .with_qualifiers(declared.qualifiers());
 
         if let Some(conflicting) = conflicting {
-            PlaceFromDeclarationsResult::conflict(place_and_quals, conflicting, first_declaration)
+            PlaceFromDeclarationsResult::conflict(
+                place_and_quals,
+                conflicting,
+                first_declaration,
+                all_declarations_are_imports,
+            )
         } else {
             PlaceFromDeclarationsResult {
                 place_and_quals,
                 conflicting_types: None,
                 first_declaration,
+                all_declarations_are_imports,
             }
         }
     } else {

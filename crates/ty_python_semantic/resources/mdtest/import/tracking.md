@@ -116,3 +116,26 @@ b = 1
 
 ```py
 ```
+
+## Optional import fallback
+
+An imported module name can be rebound like any other unannotated name. This is common in optional
+import guards, where the `except` branch assigns `None` to the imported alias.
+
+```py
+try:
+    import optional_mod as maybe_optional
+except Exception:
+    maybe_optional = None
+
+reveal_type(maybe_optional)  # revealed: <module 'optional_mod'> | None
+
+if maybe_optional is not None:
+    reveal_type(maybe_optional.VALUE)  # revealed: Literal[1]
+```
+
+`optional_mod.py`:
+
+```py
+VALUE = 1
+```
