@@ -2425,7 +2425,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     Err(err) => err.return_type(db).is_some_and(|ty| ty.is_never()),
                 };
 
-                if setattr_returns_never {
+                if setattr_returns_never
+                    && !object_ty.frozen_dataclass_base_allows_attribute_assignment(db, attribute)
+                {
                     if emit_diagnostics {
                         if let Some(builder) = self.context.report_lint(&INVALID_ASSIGNMENT, target)
                         {

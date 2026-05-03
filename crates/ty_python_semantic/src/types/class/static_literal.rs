@@ -812,6 +812,20 @@ impl<'db> StaticClassLiteral<'db> {
         }
     }
 
+    /// Returns the effective slotted status of this class if it's a dataclass-like class.
+    ///
+    /// Returns `Some(true)` for a dataclass-like class with `slots=True`, `Some(false)` for one
+    /// without generated slots, and `None` if the class is not dataclass-like.
+    pub(crate) fn is_slotted_dataclass(self, db: &'db dyn Db) -> Option<bool> {
+        if let field_policy @ CodeGeneratorKind::DataclassLike(_) =
+            CodeGeneratorKind::from_class(db, self.into(), None)?
+        {
+            Some(self.has_dataclass_param(db, field_policy, DataclassFlags::SLOTS))
+        } else {
+            None
+        }
+    }
+
     /// Checks if the given dataclass parameter flag is set for this class.
     /// This checks both the `dataclass_params` and `transformer_params`.
     fn has_dataclass_param(

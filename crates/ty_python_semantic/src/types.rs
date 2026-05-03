@@ -1007,6 +1007,31 @@ impl<'db> Type<'db> {
         }
     }
 
+    pub(crate) fn frozen_dataclass_base_allows_attribute_assignment(
+        self,
+        db: &'db dyn Db,
+        attribute: &str,
+    ) -> bool {
+        match self {
+            Type::NominalInstance(instance) => instance
+                .class(db)
+                .frozen_dataclass_base_allows_attribute_assignment(db, attribute),
+            Type::TypeVar(typevar) => typevar.typevar(db).upper_bound(db).is_some_and(|bound| {
+                bound.frozen_dataclass_base_allows_attribute_assignment(db, attribute)
+            }),
+            Type::Union(union) => union.elements(db).iter().all(|element| {
+                element.frozen_dataclass_base_allows_attribute_assignment(db, attribute)
+            }),
+            Type::Intersection(intersection) => intersection.positive(db).iter().any(|element| {
+                element.frozen_dataclass_base_allows_attribute_assignment(db, attribute)
+            }),
+            Type::TypeAlias(alias) => alias
+                .value_type(db)
+                .frozen_dataclass_base_allows_attribute_assignment(db, attribute),
+            _ => false,
+        }
+    }
+
     pub(crate) fn cycle_normalized(
         self,
         db: &'db dyn Db,

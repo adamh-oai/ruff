@@ -599,6 +599,36 @@ frozen = MyFrozenChildClass()
 frozen.x = 2  # error: [invalid-assignment]
 ```
 
+Non-field attributes on a non-dataclass subclass of a frozen dataclass are still assignable:
+
+```py
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class MyFrozenClass:
+    x: int = 1
+
+class MyFrozenChildClass(MyFrozenClass): ...
+
+frozen = MyFrozenChildClass()
+frozen.y = 2
+```
+
+Non-field attributes on subclasses of slotted frozen dataclasses are still rejected:
+
+```py
+from dataclasses import dataclass
+
+@dataclass(frozen=True, slots=True)
+class MySlottedFrozenClass:
+    x: int = 1
+
+class MySlottedFrozenChildClass(MySlottedFrozenClass): ...
+
+frozen = MySlottedFrozenChildClass()
+frozen.y = 2  # error: [invalid-assignment]
+```
+
 The same diagnostic is emitted if a frozen dataclass is inherited, and an attempt is made to delete
 an attribute:
 

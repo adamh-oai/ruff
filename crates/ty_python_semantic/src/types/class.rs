@@ -1051,6 +1051,63 @@ impl<'db> ClassType<'db> {
         }
     }
 
+    /// Return `true` if assignment to `attribute` is allowed even though the MRO contains a
+    /// synthesized `__setattr__` from a frozen dataclass base.
+    ///
+    /// CPython's generated frozen-dataclass `__setattr__` rejects all writes on exact instances of
+    /// the frozen dataclass, but on subclass instances it only rejects writes to that dataclass's
+    /// fields. Non-field attributes on non-slotted, non-dataclass subclasses are still assignable.
+    pub(crate) fn frozen_dataclass_base_allows_attribute_assignment(
+        self,
+        db: &'db dyn Db,
+        attribute: &str,
+    ) -> bool {
+        let Some((class, _)) = self.static_class_literal(db) else {
+            return false;
+        };
+
+        if class.is_frozen_dataclass(db) == Some(true) {
+            return false;
+        }
+
+        for base in self.iter_mro(db) {
+            let Some(base_class) = base.into_class() else {
+                return false;
+            };
+
+            if base_class
+                .own_class_member(db, None, "__setattr__")
+                .is_undefined()
+            {
+                continue;
+            }
+
+            let Some((base_class, specialization)) = base_class.static_class_literal(db) else {
+                return false;
+            };
+
+            if base_class.is_frozen_dataclass(db) != Some(true) {
+                return false;
+            }
+
+            if base_class.is_slotted_dataclass(db) == Some(true) {
+                return false;
+            }
+
+            let Some(field_policy @ CodeGeneratorKind::DataclassLike(_)) =
+                CodeGeneratorKind::from_static_class(db, base_class, specialization)
+            else {
+                return false;
+            };
+
+            return !base_class
+                .fields(db, specialization, field_policy)
+                .contains_key(attribute);
+        }
+
+        false
+    }
+
     /// Iterate over the method resolution order ("MRO") of the class, optionally applying an
     /// additional specialization to it if the class is generic.
     pub(super) fn iter_mro_specialized(
