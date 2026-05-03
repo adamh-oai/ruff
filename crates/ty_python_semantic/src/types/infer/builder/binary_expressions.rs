@@ -263,6 +263,50 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         Some(target_type)
     }
 
+    /// Handle unannotated local `dict |= dict` by widening the local dictionary specialization.
+    ///
+    /// The typeshed signature for `dict.__ior__` uses the existing value type of `self`, which is
+    /// correct for annotated dictionaries. For an unannotated local dictionary, though, the target
+    /// type is itself an inference result, so a literal-style update should contribute additional
+    /// key/value constraints instead of being rejected for disagreeing with the current inference.
+    pub(super) fn try_infer_dict_pep_584_augmented_assignment(
+        &mut self,
+        assignment: &ast::StmtAugAssign,
+        target_type: Type<'db>,
+        infer_value_ty: &mut dyn FnMut(&mut Self, TypeContext<'db>) -> Type<'db>,
+    ) -> Option<Type<'db>> {
+        if assignment.op != ast::Operator::BitOr {
+            return None;
+        }
+
+        let db = self.db();
+        let Some([target_key_ty, target_value_ty]) = target_type
+            .known_specialization(db, KnownClass::Dict)
+            .map(|specialization| specialization.types(db))
+        else {
+            return None;
+        };
+
+        let value_ty = infer_value_ty(self, TypeContext::default());
+        let Some([value_key_ty, value_value_ty]) = value_ty
+            .known_specialization(db, KnownClass::Dict)
+            .map(|specialization| specialization.types(db))
+        else {
+            return None;
+        };
+
+        let widened_key_ty = UnionBuilder::new(db)
+            .add(*target_key_ty)
+            .add(*value_key_ty)
+            .build();
+        let widened_value_ty = UnionBuilder::new(db)
+            .add(*target_value_ty)
+            .add(*value_value_ty)
+            .build();
+
+        Some(KnownClass::Dict.to_specialized_instance(db, &[widened_key_ty, widened_value_ty]))
+    }
+
     /// Maps an operation over each constraint of a constrained `TypeVar`.
     ///
     /// Returns the original `TypeVar` if each result is equivalent to its input constraint;

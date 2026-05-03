@@ -16,6 +16,27 @@ x += (3, 4)
 reveal_type(x)  # revealed: tuple[Literal[1, 2, 3, 4], ...]
 ```
 
+## Dictionary update
+
+```py
+def unannotated(flag: bool) -> None:
+    payload = {"event": "checkout"}
+    reveal_type(payload)  # revealed: dict[str, str]
+
+    payload |= {"shipping_address": None if flag else "available"}
+    reveal_type(payload)  # revealed: dict[str, str | Unknown]
+
+    precise_update: dict[str, str | None] = {"billing_address": None if flag else "available"}
+    payload |= precise_update
+    reveal_type(payload)  # revealed: dict[str, str | Unknown | None]
+
+def annotated(flag: bool) -> None:
+    payload: dict[str, str] = {"event": "checkout"}
+
+    # error: [unsupported-operator] "Operator `|=` is not supported between objects of type `dict[str, str]` and `dict[str, None | str]`"
+    payload |= {"shipping_address": None if flag else "available"}
+```
+
 ## Walrus target
 
 ```py

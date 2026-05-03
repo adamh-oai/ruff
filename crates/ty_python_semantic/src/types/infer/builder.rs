@@ -4290,7 +4290,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.infer_definition(assignment);
         } else {
             // Non-name assignment targets are inferred as ordinary expressions, not definitions.
-            self.infer_augment_assignment(assignment);
+            self.infer_augment_assignment(assignment, false);
 
             if let ast::Expr::Attribute(attr_expr) = assignment.target.as_ref() {
                 let object_ty = self.expression_type(&attr_expr.value);
@@ -4304,6 +4304,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         assignment: &ast::StmtAugAssign,
         target_type: Type<'db>,
         value_expr: &ast::Expr,
+        allow_unannotated_dict_update_widening: bool,
         infer_value_ty: &mut dyn FnMut(&mut Self, TypeContext<'db>) -> Type<'db>,
     ) -> Type<'db> {
         // If the target defines, e.g., `__iadd__`, infer the augmented assignment as a call to that
@@ -4339,12 +4340,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         assignment,
                         elem_type,
                         value_expr,
+                        allow_unannotated_dict_update_widening,
                         &mut |builder, tcx| infer_value_ty.infer_silent(builder, tcx),
                     )
                 })
             }
 
             _ => {
+                if allow_unannotated_dict_update_widening
+                    && let Some(dict_update_ty) = self.try_infer_dict_pep_584_augmented_assignment(
+                        assignment,
+                        target_type,
+                        infer_value_ty,
+                    )
+                {
+                    return dict_update_ty;
+                }
+
                 if let Some(typed_dict_update_ty) = self
                     .try_infer_typed_dict_pep_584_augmented_assignment(
                         assignment,
@@ -4403,12 +4415,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         assignment: &'ast ast::StmtAugAssign,
         definition: Definition<'db>,
     ) {
-        let target_ty = self.infer_augment_assignment(assignment);
-        self.add_binding(assignment.into(), definition)
-            .insert(self, target_ty);
+        let binding = self.add_binding(assignment.into(), definition);
+        let allow_unannotated_dict_update_widening =
+            binding.is_local && binding.declared_ty.is_none();
+        let target_ty =
+            self.infer_augment_assignment(assignment, allow_unannotated_dict_update_widening);
+        binding.insert(self, target_ty);
     }
 
-    fn infer_augment_assignment(&mut self, assignment: &ast::StmtAugAssign) -> Type<'db> {
+    fn infer_augment_assignment(
+        &mut self,
+        assignment: &ast::StmtAugAssign,
+        allow_unannotated_dict_update_widening: bool,
+    ) -> Type<'db> {
         let ast::StmtAugAssign {
             range: _,
             node_index: _,
@@ -4437,9 +4456,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => self.infer_expression(target, TypeContext::default()),
         };
 
-        self.infer_augmented_op(assignment, target_type, value, &mut |builder, tcx| {
-            builder.infer_expression(value, tcx)
-        })
+        self.infer_augmented_op(
+            assignment,
+            target_type,
+            value,
+            allow_unannotated_dict_update_widening,
+            &mut |builder, tcx| builder.infer_expression(value, tcx),
+        )
     }
 
     fn infer_dict_key_assignment_definition(
