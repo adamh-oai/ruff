@@ -44,13 +44,13 @@ literal, the empty dictionary branch uses the type inferred from the non-empty b
 ```py
 def _(flag: bool):
     options = {"metadata": {"source": "test"}, "limit": 1} if flag else {}
-    reveal_type(options)  # revealed: dict[str, dict[str, str] | int]
+    reveal_type(options)  # revealed: dict[str, Unknown]
 
     payload = {"model": "test", "labels": ["yes", "no"], **options}
-    reveal_type(payload)  # revealed: dict[str, str | list[str] | dict[str, str] | int]
+    reveal_type(payload)  # revealed: dict[str, Unknown]
 
     empty_first = {} if flag else {"metadata": {"source": "test"}, "limit": 1}
-    reveal_type(empty_first)  # revealed: dict[str, dict[str, str] | int]
+    reveal_type(empty_first)  # revealed: dict[str, Unknown]
 ```
 
 ## Condition with object that implements `__bool__` incorrectly

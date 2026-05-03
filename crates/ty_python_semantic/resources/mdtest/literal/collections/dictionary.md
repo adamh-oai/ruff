@@ -65,8 +65,36 @@ reveal_type(x)  # revealed: dict[int, (_: int) -> int]
 ## Mixed dict
 
 ```py
-# revealed: dict[str, int | tuple[int, int] | tuple[int, int, int]]
+# revealed: dict[str, Unknown]
 reveal_type({"a": 1, "b": (1, 2), "c": (1, 2, 3)})
+```
+
+## Non-strict heterogeneous dict values
+
+When a dict literal has no type context, heterogeneous value types fall back to `Unknown`. This
+avoids over-constraining mutable dictionary shapes from the first literal in a sequence of writes:
+
+```py
+blocks = [
+    {
+        "type": "header",
+        "text": {"type": "plain_text", "text": "Feedback", "emoji": True},
+    },
+]
+reveal_type(blocks)  # revealed: list[dict[str, Unknown]]
+
+blocks.append({
+    "type": "context",
+    "elements": [{"type": "mrkdwn", "text": "Tags"}],
+})
+blocks.extend([
+    {"type": "divider"},
+    {
+        "type": "section",
+        "fields": [{"type": "mrkdwn", "text": "Category"}],
+    },
+])
+reveal_type(blocks)  # revealed: list[dict[str, Unknown]]
 ```
 
 ## Dict comprehensions
@@ -85,7 +113,7 @@ individual keys:
 from typing import TypedDict
 
 x1 = {"a": 1, "b": "2"}
-reveal_type(x1)  # revealed: dict[str, int | str]
+reveal_type(x1)  # revealed: dict[str, Unknown]
 reveal_type(x1["a"])  # revealed: Literal[1]
 reveal_type(x1["b"])  # revealed: Literal["2"]
 
@@ -107,7 +135,7 @@ reveal_type(x3[2])  # revealed: TD
 
 x4 = {"a": 1, "b": {"c": 2, "d": "3"}}
 reveal_type(x4["a"])  # revealed: Literal[1]
-reveal_type(x4["b"])  # revealed: dict[str, int | str]
+reveal_type(x4["b"])  # revealed: dict[str, Unknown]
 reveal_type(x4["b"]["c"])  # revealed: Literal[2]
 reveal_type(x4["b"]["d"])  # revealed: Literal["3"]
 

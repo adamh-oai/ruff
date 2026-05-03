@@ -6443,10 +6443,31 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
+        // Match pyright's standard-mode behavior for heterogeneous dict values: keep key
+        // inference precise, but don't over-constrain mutable dict shapes from one literal.
+        let non_strict_dict_value_typevar =
+            if collection_class == KnownClass::Dict && elt_tcx_constraints.is_empty() {
+                elt_tys
+                    .clone()
+                    .nth(1)
+                    .map(|typevar| typevar.identity(self.db()))
+            } else {
+                None
+            };
+
         let class_type = collection_alias
             .origin(self.db())
             .apply_specialization(self.db(), |_| {
-                builder.build_with(generic_context, |_, lower, _| {
+                builder.build_with(generic_context, |typevar, lower, _| {
+                    if non_strict_dict_value_typevar
+                        .is_some_and(|identity| identity == typevar.identity(self.db()))
+                        && lower
+                            .as_union()
+                            .is_some_and(|union| union.elements(self.db()).len() > 1)
+                    {
+                        return Some(Type::unknown());
+                    }
+
                     // Promote singleton types to `T | Unknown` in inferred type parameters,
                     // so that e.g. `[None]` is inferred as `list[None | Unknown]`.
                     if elt_tcx_constraints.is_empty() {
