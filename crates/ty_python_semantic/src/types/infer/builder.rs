@@ -7202,6 +7202,101 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_call_expression_impl(call_expression, callable_type, tcx)
     }
 
+    fn infer_frozenset_literal_call(
+        &mut self,
+        arguments: &ast::Arguments,
+        call_expression_tcx: TypeContext<'db>,
+    ) -> Option<Type<'db>> {
+        if !arguments.keywords.is_empty() {
+            return None;
+        }
+
+        let [argument] = arguments.args.as_ref() else {
+            return None;
+        };
+
+        if argument.is_starred_expr() {
+            return None;
+        }
+
+        let expected_element_ty = call_expression_tcx
+            .annotation
+            .and_then(|annotation| {
+                annotation.known_specialization(self.db(), KnownClass::FrozenSet)
+            })
+            .and_then(|specialization| specialization.types(self.db()).first().copied());
+        let element_tcx = TypeContext::new(expected_element_ty);
+
+        let db = self.db();
+        let infer_element =
+            |builder: &mut Self, elt: &ast::Expr| builder.infer_expression(elt, element_tcx);
+
+        let result_element_ty = match argument {
+            ast::Expr::List(ast::ExprList { elts, .. }) => {
+                if elts.iter().any(ast::Expr::is_starred_expr) {
+                    return None;
+                }
+
+                let mut element_types = UnionBuilder::new(db);
+                for elt in elts {
+                    element_types = element_types.add(infer_element(self, elt));
+                }
+                let element_ty = if elts.is_empty() {
+                    expected_element_ty.unwrap_or(Type::unknown())
+                } else {
+                    element_types.build()
+                };
+
+                self.store_expression_type(
+                    argument,
+                    KnownClass::List.to_specialized_instance(db, &[element_ty]),
+                );
+                element_ty
+            }
+            ast::Expr::Set(ast::ExprSet { elts, .. }) => {
+                if elts.iter().any(ast::Expr::is_starred_expr) {
+                    return None;
+                }
+
+                let mut element_types = UnionBuilder::new(db);
+                for elt in elts {
+                    element_types = element_types.add(infer_element(self, elt));
+                }
+                let element_ty = element_types.build();
+
+                self.store_expression_type(
+                    argument,
+                    KnownClass::Set.to_specialized_instance(db, &[element_ty]),
+                );
+                element_ty
+            }
+            ast::Expr::Tuple(ast::ExprTuple { elts, .. }) => {
+                if elts.iter().any(ast::Expr::is_starred_expr) {
+                    return None;
+                }
+
+                let mut element_types = UnionBuilder::new(db);
+                let mut tuple_elements = Vec::with_capacity(elts.len());
+                for elt in elts {
+                    let element_ty = infer_element(self, elt);
+                    element_types = element_types.add(element_ty);
+                    tuple_elements.push(element_ty);
+                }
+                let element_ty = if elts.is_empty() {
+                    expected_element_ty.unwrap_or(Type::Never)
+                } else {
+                    element_types.build()
+                };
+
+                self.store_expression_type(argument, Type::heterogeneous_tuple(db, tuple_elements));
+                element_ty
+            }
+            _ => return None,
+        };
+
+        Some(KnownClass::FrozenSet.to_specialized_instance(db, &[result_element_ty]))
+    }
+
     fn infer_call_expression_impl(
         &mut self,
         call_expression: &ast::ExprCall,
@@ -7250,6 +7345,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .is_some_and(|class_literal| class_literal.is_known(self.db(), KnownClass::Dict))
             && let Some(ty) =
                 self.infer_keyword_only_dict_call(func, arguments, call_expression_tcx)
+        {
+            return ty;
+        }
+
+        if callable_type
+            .as_class_literal()
+            .is_some_and(|class_literal| class_literal.is_known(self.db(), KnownClass::FrozenSet))
+            && let Some(ty) = self.infer_frozenset_literal_call(arguments, call_expression_tcx)
         {
             return ty;
         }

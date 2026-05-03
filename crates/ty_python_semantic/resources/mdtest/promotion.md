@@ -95,6 +95,7 @@ Covariant collection literals are not promoted:
 ```py
 reveal_type((1, 2, 3))  # revealed: tuple[Literal[1], Literal[2], Literal[3]]
 reveal_type(frozenset((1, 2, 3)))  # revealed: frozenset[Literal[1, 2, 3]]
+reveal_type(frozenset({"a", "b", "c"}))  # revealed: frozenset[Literal["a", "b", "c"]]
 ```
 
 ## Invariant and contravariant return types are promoted
@@ -322,8 +323,12 @@ reveal_type(x3)  # revealed: Iterable[Literal[1, 2, 3]]
 x4: Iterable[Literal[1, 2, 3]] = list([1, 2, 3])  # error: [invalid-assignment]
 reveal_type(x4)  # revealed: Iterable[Literal[1, 2, 3]]
 
-x5: frozenset[Literal[1]] = frozenset([1])  # error: [invalid-assignment]
+x5: frozenset[Literal[1]] = frozenset([1])
 reveal_type(x5)  # revealed: frozenset[Literal[1]]
+
+values = [1]
+x6: frozenset[Literal[1]] = frozenset(values)  # error: [invalid-assignment]
+reveal_type(x6)  # revealed: frozenset[Literal[1]]
 
 class Sup1[T]:
     value: T
