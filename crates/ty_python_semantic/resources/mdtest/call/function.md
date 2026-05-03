@@ -1471,6 +1471,25 @@ def _(kwargs: Unknown):
     f(**kwargs)
 ```
 
+### Dynamic arguments to generic parameters
+
+Dynamic actual arguments should specialize type variables to the same dynamic type, rather than
+leaving them unsolved:
+
+```py
+from typing import Any, TypeVar
+from ty_extensions import Unknown
+
+T = TypeVar("T")
+
+def first(x: list[T]) -> T:
+    return x[0]
+
+def _(any_value: Any, unknown_value: Unknown):
+    reveal_type(first(any_value))  # revealed: Any
+    reveal_type(first(unknown_value))  # revealed: Unknown
+```
+
 ### Not a mapping
 
 ```py

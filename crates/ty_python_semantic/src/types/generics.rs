@@ -1792,6 +1792,58 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         self.insert_type_mapping(bound_typevar, ty);
     }
 
+    fn infer_dynamic_type_mappings(
+        &mut self,
+        formal: Type<'db>,
+        dynamic: Type<'db>,
+        polarity: TypeVarVariance,
+        mut f: impl FnMut(TypeVarAssignment<'db>) -> Option<Type<'db>>,
+    ) {
+        debug_assert!(matches!(dynamic, Type::Dynamic(_)));
+
+        struct CollectInferableTypeVars<'db> {
+            inferable: InferableTypeVars<'db>,
+            typevars: RefCell<FxOrderSet<BoundTypeVarInstance<'db>>>,
+            recursion_guard: TypeCollector<'db>,
+        }
+
+        impl<'db> TypeVisitor<'db> for CollectInferableTypeVars<'db> {
+            fn should_visit_lazy_type_attributes(&self) -> bool {
+                false
+            }
+
+            fn visit_bound_type_var_type(
+                &self,
+                db: &'db dyn Db,
+                bound_typevar: BoundTypeVarInstance<'db>,
+            ) {
+                if bound_typevar.is_inferable(db, self.inferable) {
+                    self.typevars.borrow_mut().insert(bound_typevar);
+                }
+            }
+
+            fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+                walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
+            }
+        }
+
+        let visitor = CollectInferableTypeVars {
+            inferable: self.inferable,
+            typevars: RefCell::new(FxOrderSet::default()),
+            recursion_guard: TypeCollector::default(),
+        };
+        visitor.visit_type(self.db, formal);
+
+        for bound_typevar in visitor.typevars.into_inner() {
+            if bound_typevar.is_paramspec(self.db) {
+                continue;
+            }
+
+            let variance = polarity.compose(formal.variance_of(self.db, bound_typevar));
+            self.add_type_mapping(bound_typevar, dynamic, variance, &mut f);
+        }
+    }
+
     /// Finds all of the valid specializations of a constraint set, and adds their type mappings to
     /// the specialization that this builder is building up.
     ///
@@ -2166,6 +2218,10 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 }
             }
 
+            (formal, actual @ Type::Dynamic(_)) => {
+                self.infer_dynamic_type_mappings(formal, actual, polarity, f);
+            }
+
             (Type::Intersection(formal_intersection), _) => {
                 // The actual type must be assignable to every (positive) element of the
                 // formal intersection, so we must infer type mappings for each of them. (The
@@ -2176,6 +2232,14 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 }
             }
             (_, Type::Intersection(actual_intersection)) => {
+                if let Some(dynamic) = actual_intersection
+                    .iter_positive(self.db)
+                    .find(|positive| matches!(positive, Type::Dynamic(_)))
+                {
+                    self.infer_map_impl(formal, dynamic, polarity, f, seen)?;
+                    return Ok(());
+                }
+
                 // Try to infer type mappings by checking against each intersection element. This
                 // is the dual of the `union_formal` arm above, and it handles cases like:
                 //
