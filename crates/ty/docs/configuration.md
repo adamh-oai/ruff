@@ -214,6 +214,9 @@ When enabled, ty maps common external checker codes such as `arg-type`,
 migrating projects that already have checker-specific suppressions and need ty to coexist
 with them.
 
+Unused external checker codes are not reported as stale by ty. They may still be used by the
+checker that owns the code.
+
 Defaults to `false`.
 
 **Default value**: `false`
@@ -247,6 +250,8 @@ Whether ty should respect `pyright: ignore[...]` comments.
 When enabled, ty maps common Pyright codes such as `reportArgumentType` and
 `reportAttributeAccessIssue` to equivalent ty diagnostics. This is useful when migrating
 projects that already use Pyright suppressions.
+
+Unused Pyright suppressions are not reported as stale by ty. They may still be used by Pyright.
 
 Defaults to `false`.
 
@@ -1209,4 +1214,3 @@ Defaults to `full`.
     ```
 
 ---
-

@@ -186,7 +186,9 @@ takes_user_payload({
     "name": "Alice",
 })  # type: ignore[arg-type]
 
-takes_int(1)  # error: [unused-type-ignore-comment]  # type: ignore[arg-type]
+takes_int(1)  # type: ignore[arg-type]
+takes_int(1)  # pyright: ignore[reportArgumentType]
+takes_int(1)  # error: [unused-type-ignore-comment]  # type: ignore[ty:invalid-argument-type]
 ```
 
 ## Unknown codes starting with `ty`

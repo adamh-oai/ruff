@@ -40,6 +40,12 @@ pub(super) fn check_unused_suppressions(context: &mut CheckSuppressionsContext) 
             continue;
         }
 
+        // Mypy- and Pyright-style codes are owned by their respective checkers. If configured, ty
+        // can use them as compatibility aliases, but it should not report them as stale.
+        if suppression.external_checker_code {
+            continue;
+        }
+
         // Compatibility aliases like `type: ignore[arg-type]` can expand to multiple ty lint
         // suppressions that share the same source-code range. Report that source code at most once.
         if last_unused_id == Some(suppression_id) {

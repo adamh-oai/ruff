@@ -472,6 +472,7 @@ impl<'a> IntoIterator for &'a Suppressions {
 pub(crate) struct Suppression {
     target: SuppressionTarget,
     kind: SuppressionKind,
+    external_checker_code: bool,
 
     /// The range of the code in this suppression.
     ///
@@ -657,6 +658,7 @@ impl<'a> SuppressionsBuilder<'a> {
                 push_ignore_suppression(Suppression {
                     target: SuppressionTarget::All,
                     kind: comment.kind(),
+                    external_checker_code: false,
                     comment_range: comment.range(),
                     range: comment.range(),
                     suppressed_range,
@@ -668,6 +670,7 @@ impl<'a> SuppressionsBuilder<'a> {
                 push_ignore_suppression(Suppression {
                     target: SuppressionTarget::Empty,
                     kind: comment.kind(),
+                    external_checker_code: false,
                     range: comment.range(),
                     comment_range: comment.range(),
                     suppressed_range,
@@ -700,6 +703,7 @@ impl<'a> SuppressionsBuilder<'a> {
                                 push_ignore_suppression(Suppression {
                                     target: SuppressionTarget::Lint(lint),
                                     kind: comment.kind(),
+                                    external_checker_code: false,
                                     range: code_range,
                                     comment_range: comment.range(),
                                     suppressed_range,
@@ -720,6 +724,7 @@ impl<'a> SuppressionsBuilder<'a> {
                             push_ignore_suppression(Suppression {
                                 target: SuppressionTarget::Lint(lint),
                                 kind: comment.kind(),
+                                external_checker_code: true,
                                 range: code_range,
                                 comment_range: comment.range(),
                                 suppressed_range,
