@@ -1099,6 +1099,10 @@ class Color(Enum):
 for color in Color:
     reveal_type(color)  # revealed: Color
 
+reveal_type([color for color in Color])  # revealed: list[Color]
+
+reveal_type([color for color in Color if color not in {Color.RED}])  # revealed: list[Color]
+
 # TODO: Should be `list[Color]`
 reveal_type(list(Color))  # revealed: list[Unknown]
 ```

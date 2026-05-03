@@ -174,6 +174,12 @@ def test(x: Literal["a", "b", "c"] | None | int = None):
         reveal_type(x)  # revealed: Literal["b"] | None | int
     else:
         reveal_type(x)  # revealed: Literal["a", "c"] | int
+
+def broad_rhs(x: Literal[1, 2], values: set[int]):
+    if x not in values:
+        reveal_type(x)  # revealed: Literal[1, 2]
+    else:
+        reveal_type(x)  # revealed: Literal[1, 2]
 ```
 
 ## No narrowing for the right-hand side (currently)

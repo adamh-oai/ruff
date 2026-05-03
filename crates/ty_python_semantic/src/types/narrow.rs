@@ -572,6 +572,13 @@ fn could_compare_equal<'db>(db: &'db dyn Db, left_ty: Type<'db>, right_ty: Type<
     }
 }
 
+fn is_single_valued_or_union<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
+    match ty.resolve_type_alias(db) {
+        Type::Union(union) => union.elements(db).iter().all(|ty| ty.is_single_valued(db)),
+        ty => ty.is_single_valued(db),
+    }
+}
+
 struct NarrowingConstraintsBuilder<'db, 'ast> {
     db: &'db dyn Db,
     module: &'ast ParsedModuleRef,
@@ -1073,6 +1080,13 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             .try_iterate(self.db)
             .ok()?
             .homogeneous_element_type(self.db);
+
+        // `not in` can only exclude values that are known explicitly. A broad iterable element
+        // type like `int`, `str`, or an enum instance does not mean the iterable contains every
+        // possible value of that type.
+        if !is_single_valued_or_union(self.db, rhs_values) {
+            return None;
+        }
 
         if lhs_ty.is_single_valued(self.db) || lhs_ty.is_union_of_single_valued(self.db) {
             // Exclude the RHS values from the entire (single-valued) LHS domain.
