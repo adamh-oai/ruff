@@ -30,9 +30,19 @@ pub(super) fn check_unused_suppressions(context: &mut CheckSuppressionsContext) 
             .saturating_sub(diagnostics.used_len()),
     );
 
+    let mut last_unused_id = None;
+
     // Collect all suppressions that are unused after type-checking.
     for suppression in all {
-        if diagnostics.is_used(suppression.id()) {
+        let suppression_id = suppression.id();
+
+        if diagnostics.is_used(suppression_id) {
+            continue;
+        }
+
+        // Compatibility aliases like `type: ignore[arg-type]` can expand to multiple ty lint
+        // suppressions that share the same source-code range. Report that source code at most once.
+        if last_unused_id == Some(suppression_id) {
             continue;
         }
 
@@ -52,6 +62,7 @@ pub(super) fn check_unused_suppressions(context: &mut CheckSuppressionsContext) 
         }
 
         unused.push(suppression);
+        last_unused_id = Some(suppression_id);
     }
 
     let mut unused_iter = unused

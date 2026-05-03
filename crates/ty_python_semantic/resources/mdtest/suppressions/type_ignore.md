@@ -185,6 +185,8 @@ def takes_user_payload(user: UserPayload) -> None: ...
 takes_user_payload({
     "name": "Alice",
 })  # type: ignore[arg-type]
+
+takes_int(1)  # error: [unused-type-ignore-comment]  # type: ignore[arg-type]
 ```
 
 ## Unknown codes starting with `ty`
