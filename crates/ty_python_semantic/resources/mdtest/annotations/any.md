@@ -14,6 +14,16 @@ def f():
     reveal_type(x)  # revealed: Any
 ```
 
+Local annotations should also use `Any` as the binding type:
+
+```py
+from typing import Any
+
+def f():
+    x: Any = 1
+    reveal_type(x)  # revealed: Any
+```
+
 ## Aliased to a different name
 
 If you alias `typing.Any` to another name, we still recognize that as a spelling of the Any type.

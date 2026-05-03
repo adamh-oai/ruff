@@ -1322,6 +1322,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 inferred_ty,
             } => {
                 let file_scope_id = self.scope().file_scope_id(self.db());
+                if self.index.scope(file_scope_id).kind() == ScopeKind::Function
+                    && matches!(declared_ty.inner_type(), Type::Dynamic(DynamicType::Any))
+                {
+                    return self.add_declaration_with_binding(
+                        node,
+                        definition,
+                        &DeclaredAndInferredType::AreTheSame(declared_ty),
+                    );
+                }
                 if file_scope_id.is_global() {
                     let place_table = self.index.place_table(file_scope_id);
                     let place = place_table.place(definition.place(self.db()));
