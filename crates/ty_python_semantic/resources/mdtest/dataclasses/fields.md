@@ -118,6 +118,29 @@ reveal_type(data.content)  # revealed: list[int]
 reveal_type(data.timestamp)  # revealed: datetime
 ```
 
+The factory itself can also prove that the field default is compatible when the inferred factory
+return type is broader than the declared field type:
+
+```py
+from collections import UserDict
+from dataclasses import dataclass, field
+
+class ImageTokenInfo: ...
+class ImageFrames(UserDict[int, ImageTokenInfo]): ...
+
+def make_base() -> UserDict[int, ImageTokenInfo]:
+    return UserDict()
+
+@dataclass
+class GoodDefault:
+    image_frames: ImageFrames = field(default_factory=ImageFrames)
+
+@dataclass
+class BadDefault:
+    # error: [invalid-assignment]
+    image_frames: ImageFrames = field(default_factory=make_base)
+```
+
 ## Literal defaults stay precise in field metadata
 
 Literal defaults on field specifiers should remain literal-valued so they can satisfy literal-union

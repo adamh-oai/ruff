@@ -1559,9 +1559,10 @@ impl<'db> Bindings<'db> {
                         };
 
                         let explicit_default_ty = get_argument_type("default", false);
-                        let has_default_value = explicit_default_ty.is_some()
-                            || get_argument_type("default_factory", false).is_some()
-                            || get_argument_type("factory", false).is_some();
+                        let default_factory_ty = get_argument_type("default_factory", false)
+                            .or_else(|| get_argument_type("factory", false));
+                        let has_default_value =
+                            explicit_default_ty.is_some() || default_factory_ty.is_some();
 
                         let init = get_argument_type("init", true);
                         let kw_only = get_argument_type("kw_only", true);
@@ -1698,7 +1699,15 @@ impl<'db> Bindings<'db> {
                         // are assignable to `T` if the default type of the field is assignable
                         // to `T`. Otherwise, we would error on `name: str = field(default="")`.
                         overload.set_return_type(Type::KnownInstance(KnownInstanceType::Field(
-                            FieldInstance::new(db, default_ty, init, kw_only, alias, converter),
+                            FieldInstance::new(
+                                db,
+                                default_ty,
+                                default_factory_ty,
+                                init,
+                                kw_only,
+                                alias,
+                                converter,
+                            ),
                         )));
                     }
 

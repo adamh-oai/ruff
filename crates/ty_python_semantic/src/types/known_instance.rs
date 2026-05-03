@@ -132,6 +132,9 @@ pub(super) fn walk_known_instance_type<'db, V: visitor::TypeVisitor<'db> + ?Size
             if let Some(default_ty) = field.default_type(db) {
                 visitor.visit_type(db, default_ty);
             }
+            if let Some(default_factory_ty) = field.default_factory_type(db) {
+                visitor.visit_type(db, default_factory_ty);
+            }
             if let Some((input_ty, output_ty)) = field.converter(db) {
                 visitor.visit_type(db, input_ty);
                 visitor.visit_type(db, output_ty);
@@ -355,6 +358,9 @@ pub struct FieldInstance<'db> {
     /// `default_factory` arguments to `dataclasses.field()`.
     pub default_type: Option<Type<'db>>,
 
+    /// The type of the factory callable if a `default_factory` or `factory` argument was provided.
+    pub default_factory_type: Option<Type<'db>>,
+
     /// Whether this field is part of the `__init__` signature, or not.
     pub init: bool,
 
@@ -404,9 +410,21 @@ impl<'db> FieldInstance<'db> {
             )),
             None => None,
         };
+        let default_factory_type = match self.default_factory_type(db) {
+            Some(factory_ty) if nested => {
+                Some(factory_ty.recursive_type_normalized_impl(db, div, true)?)
+            }
+            Some(factory_ty) => Some(
+                factory_ty
+                    .recursive_type_normalized_impl(db, div, true)
+                    .unwrap_or(div),
+            ),
+            None => None,
+        };
         Some(FieldInstance::new(
             db,
             default_type,
+            default_factory_type,
             self.init(db),
             self.kw_only(db),
             self.alias(db),

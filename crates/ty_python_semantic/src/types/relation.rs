@@ -13,8 +13,8 @@ use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::{
     ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ClassType, CycleDetector,
     IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType, LiteralValueTypeKind,
-    MemberLookupPolicy, PropertyInstanceType, ProtocolInstanceType, SubclassOfInner,
-    SubclassOfType, TypeVarBoundOrConstraints, UnionType, UpcastPolicy,
+    MemberLookupPolicy, Parameters, PropertyInstanceType, ProtocolInstanceType, Signature,
+    SubclassOfInner, SubclassOfType, TypeVarBoundOrConstraints, UnionType, UpcastPolicy,
 };
 use crate::{
     Db,
@@ -926,11 +926,22 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 if let Some((_, converter_output_type)) = field.converter(db) {
                     self.check_type_pair(db, converter_output_type, target)
                 } else {
-                    field
-                        .default_type(db)
-                        .when_none_or(db, self.constraints, |default_type| {
-                            self.check_type_pair(db, default_type, target)
-                        })
+                    let default_constraints =
+                        field
+                            .default_type(db)
+                            .when_none_or(db, self.constraints, |default_type| {
+                                self.check_type_pair(db, default_type, target)
+                            });
+
+                    if !default_constraints.is_never_satisfied(db) {
+                        default_constraints
+                    } else if let Some(default_factory_type) = field.default_factory_type(db) {
+                        let factory_type =
+                            Type::single_callable(db, Signature::new(Parameters::empty(), target));
+                        self.check_type_pair(db, default_factory_type, factory_type)
+                    } else {
+                        default_constraints
+                    }
                 }
             }
 
