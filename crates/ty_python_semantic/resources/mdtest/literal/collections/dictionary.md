@@ -203,6 +203,19 @@ reveal_type(x12[0][2]["a"])  # revealed: int
 reveal_type(x12[0][3]["b"])  # revealed: int
 ```
 
+## Any-valued dictionary lookup
+
+If the normal subscript result is `Any`, dictionary key narrowing does not replace that explicit
+dynamic value type with the initializer's literal shape.
+
+```py
+from typing import Any
+
+dynamic: dict[str, Any] = {"error": {"category": "bad"}}
+reveal_type(dynamic["error"])  # revealed: Any
+dynamic["error"].update({"detail": object()})
+```
+
 ## Dict unpacking in function calls
 
 Narrowing is also performed for dictionary unpacking expressions:

@@ -120,7 +120,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // Even if we can obtain the subscript type based on the assignments, we still perform default type inference
                     // (to store the expression type and to report errors).
                     let slice_ty = self.infer_expression(slice, TypeContext::default());
-                    self.infer_subscript_expression_types(subscript, value_ty, slice_ty, *ctx);
+                    let inferred_ty =
+                        self.infer_subscript_expression_types(subscript, value_ty, slice_ty, *ctx);
+                    if inferred_ty == Type::any() {
+                        return inferred_ty;
+                    }
                     return ty;
                 }
             }
