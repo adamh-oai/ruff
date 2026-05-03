@@ -3064,6 +3064,8 @@ class dict(MutableMapping[_KT, _VT]):
         """Return self|=value."""
 
     @overload
+    def __ior__(self, value: Mapping[_KT, _VT], /) -> Self: ...
+    @overload
     def __ior__(self, value: Iterable[tuple[_KT, _VT]], /) -> Self: ...
 
 @disjoint_base

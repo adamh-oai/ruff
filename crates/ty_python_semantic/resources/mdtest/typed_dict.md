@@ -1472,7 +1472,7 @@ static_assert(not    is_subtype_of( NotRequiredReadOnlyAny,  NotRequiredReadOnly
 All typed dictionaries can be assigned to `Mapping[str, object]`:
 
 ```py
-from typing import Mapping, TypedDict
+from typing import Any, Mapping, TypedDict
 
 class Person(TypedDict):
     name: str
@@ -1483,8 +1483,26 @@ alice = Person(name="Alice", age=30)
 _: Mapping[str, object] = alice
 # Follows from above.
 _: Mapping[str, Any] = alice
-# Also follows from above, because `update` accepts the `SupportsKeysAndGetItem` protocol.
+# Also follows from above, because `update` accepts mappings.
 {}.update(alice)
+
+class PartialPerson(TypedDict, total=False):
+    name: str
+    age: int
+
+partial: PartialPerson = {"name": "Alice"}
+
+object_dict: dict[str, object] = {}
+object_dict.update(partial)
+object_dict |= partial
+
+any_dict: dict[str, Any] = {}
+any_dict.update(partial)
+
+str_dict: dict[str, str] = {}
+# error: [no-matching-overload]
+str_dict.update(partial)
+
 # Not assignable.
 # error: [invalid-assignment] "Object of type `Person` is not assignable to `Mapping[str, int]`"
 _: Mapping[str, int] = alice
