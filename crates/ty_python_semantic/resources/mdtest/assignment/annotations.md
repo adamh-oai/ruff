@@ -45,6 +45,40 @@ x: int
 x = "foo"  # error: [invalid-assignment] "Object of type `Literal["foo"]` is not assignable to `int`"
 ```
 
+## Prior local annotation applies to sibling branches
+
+```py
+from typing import Literal
+
+Sentiment = Literal["positive", "negative"]
+
+def feedback_by_id(preference: str, first_id: str, second_id: str | None) -> dict[str, Sentiment]:
+    if preference == "first":
+        result: dict[str, Sentiment] = {first_id: "positive"}
+        if second_id is not None:
+            result[second_id] = "negative"
+        return result
+
+    if preference == "second":
+        result = {first_id: "negative"}
+        if second_id is not None:
+            result[second_id] = "positive"
+        reveal_type(result)  # revealed: dict[str, Literal["positive", "negative"]]
+        return result
+
+    result = {first_id: "negative"}
+    if second_id is not None:
+        result[second_id] = "negative"
+    reveal_type(result)  # revealed: dict[str, Literal["positive", "negative"]]
+    return result
+
+def rejects_bad_sibling_assignment(flag: bool) -> None:
+    if flag:
+        value: int = 1
+    else:
+        value = "bad"  # error: [invalid-assignment] "Object of type `Literal["bad"]` is not assignable to `int`"
+```
+
 ## Tuple annotations are understood
 
 ```toml

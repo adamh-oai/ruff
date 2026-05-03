@@ -610,7 +610,16 @@ pub(crate) fn place_from_declarations<'db>(
     db: &'db dyn Db,
     declarations: DeclarationsIterator<'_, 'db>,
 ) -> PlaceFromDeclarationsResult<'db> {
-    place_from_declarations_impl(db, declarations, RequiresExplicitReExport::No)
+    place_from_declarations_impl(db, declarations, RequiresExplicitReExport::No, |_| true)
+}
+
+/// Build a declared type from a filtered subset of a [`DeclarationsIterator`].
+pub(crate) fn place_from_declarations_if<'db>(
+    db: &'db dyn Db,
+    declarations: DeclarationsIterator<'_, 'db>,
+    include: impl Fn(Definition<'db>) -> bool,
+) -> PlaceFromDeclarationsResult<'db> {
+    place_from_declarations_impl(db, declarations, RequiresExplicitReExport::No, include)
 }
 
 type DeclaredTypeAndConflictingTypes<'db> = (
@@ -903,8 +912,9 @@ pub(crate) fn place_by_id<'db>(
         ConsideredDefinitions::AllReachable => use_def.reachable_declarations(place_id),
     };
 
-    let declared = place_from_declarations_impl(db, declarations, requires_explicit_reexport)
-        .ignore_conflicting_declarations();
+    let declared =
+        place_from_declarations_impl(db, declarations, requires_explicit_reexport, |_| true)
+            .ignore_conflicting_declarations();
 
     let all_considered_bindings = || match considered_definitions {
         ConsideredDefinitions::EndOfScope => use_def.end_of_scope_bindings(place_id),
@@ -1676,6 +1686,7 @@ fn place_from_declarations_impl<'db>(
     db: &'db dyn Db,
     declarations_iterator: DeclarationsIterator<'_, 'db>,
     requires_explicit_reexport: RequiresExplicitReExport,
+    include: impl Fn(Definition<'db>) -> bool,
 ) -> PlaceFromDeclarationsResult<'db> {
     let predicates = declarations_iterator.predicates();
     let reachability_constraints = declarations_iterator.reachability_constraints();
@@ -1715,7 +1726,7 @@ fn place_from_declarations_impl<'db>(
             return None;
         };
 
-        if is_non_exported(db, declaration, requires_explicit_reexport) {
+        if is_non_exported(db, declaration, requires_explicit_reexport) || !include(declaration) {
             return None;
         }
 

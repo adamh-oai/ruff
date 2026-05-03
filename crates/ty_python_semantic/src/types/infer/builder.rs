@@ -33,7 +33,8 @@ use crate::place::{
     TypeOrigin, builtins_module_scope, builtins_symbol, class_body_implicit_symbol,
     explicit_global_symbol, global_symbol, imported_symbol, loop_header_reachability,
     module_type_implicit_global_declaration, module_type_implicit_global_symbol, place,
-    place_from_bindings, place_from_declarations, typing_extensions_symbol,
+    place_from_bindings, place_from_declarations, place_from_declarations_if,
+    typing_extensions_symbol,
 };
 use crate::reachability::ReachabilityConstraintsExtension;
 use crate::types::add_inferred_python_version_hint_to_diagnostic;
@@ -1193,7 +1194,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         let declarations_result = place_from_declarations(self.db(), declarations);
-        let all_declarations_are_imports = declarations_result.all_declarations_are_imports();
+        let mut all_declarations_are_imports = declarations_result.all_declarations_are_imports();
         let (mut place_and_quals, conflicting) =
             declarations_result.into_place_and_conflicting_declarations();
 
@@ -1205,6 +1206,45 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     "Conflicting declared types for `{place}`: {}",
                     format_enumeration(conflicting.iter().map(|ty| ty.display(db)))
                 ));
+            }
+        }
+
+        if place_and_quals.place.is_undefined()
+            && is_local
+            && self.index.scope(file_scope_id).kind() == ScopeKind::Function
+            && place.as_symbol().is_some()
+        {
+            let symbol_id = place_id.expect_symbol();
+            let module = self.module();
+            let binding_start = binding.kind(db).target_range(module).start();
+            let prior_annotation_declarations = place_from_declarations_if(
+                db,
+                use_def.reachable_symbol_declarations(symbol_id),
+                |declaration| {
+                    matches!(declaration.kind(db), DefinitionKind::AnnotatedAssignment(_))
+                        && declaration.kind(db).target_range(module).start() < binding_start
+                },
+            );
+            let fallback_all_declarations_are_imports =
+                prior_annotation_declarations.all_declarations_are_imports();
+            let (fallback_place_and_quals, fallback_conflicting) =
+                prior_annotation_declarations.into_place_and_conflicting_declarations();
+
+            if !fallback_place_and_quals.place.is_undefined() {
+                place_and_quals = fallback_place_and_quals;
+                all_declarations_are_imports = fallback_all_declarations_are_imports;
+
+                if let Some(conflicting) = fallback_conflicting {
+                    // TODO point out the conflicting declarations in the diagnostic?
+                    let place = place_table.place(binding.place(db));
+                    if let Some(builder) = self.context.report_lint(&CONFLICTING_DECLARATIONS, node)
+                    {
+                        builder.into_diagnostic(format_args!(
+                            "Conflicting declared types for `{place}`: {}",
+                            format_enumeration(conflicting.iter().map(|ty| ty.display(db)))
+                        ));
+                    }
+                }
             }
         }
 
