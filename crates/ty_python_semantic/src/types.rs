@@ -1715,20 +1715,6 @@ impl<'db> Type<'db> {
             || (ty.is_enum(db) && !ty.overrides_equality(db))
     }
 
-    pub(crate) fn is_union_with_single_valued(&self, db: &'db dyn Db) -> bool {
-        let ty = self.resolve_type_alias(db);
-        ty.as_union().is_some_and(|union| {
-            union.elements(db).iter().any(|ty| {
-                ty.is_single_valued(db)
-                    || ty.is_bool(db)
-                    || ty.is_subtype_of(db, Type::literal_string())
-                    || (ty.is_enum(db) && !ty.overrides_equality(db))
-            })
-        }) || ty.is_bool(db)
-            || ty.is_subtype_of(db, Type::literal_string())
-            || (ty.is_enum(db) && !ty.overrides_equality(db))
-    }
-
     /// Create a promotable string literal.
     pub(crate) fn string_literal(db: &'db dyn Db, string: &str) -> Self {
         Self::LiteralValue(LiteralValueType::promotable(StringLiteralType::new(

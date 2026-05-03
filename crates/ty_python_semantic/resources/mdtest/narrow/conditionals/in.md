@@ -13,9 +13,37 @@ def _(x: int):
 ```py
 def _(x: str):
     if x in ("a", "b", "c"):
-        reveal_type(x)  # revealed: str
+        reveal_type(x)  # revealed: Literal["a", "b", "c"]
     else:
-        reveal_type(x)  # revealed: str
+        reveal_type(x)  # revealed: str & ~Literal["a"] & ~Literal["b"] & ~Literal["c"]
+```
+
+```py
+def _(x: str | None):
+    if x not in ("a", "b", "c"):
+        reveal_type(x)  # revealed: (str & ~Literal["a"] & ~Literal["b"] & ~Literal["c"]) | None
+    else:
+        reveal_type(x)  # revealed: Literal["a", "b", "c"]
+```
+
+```py
+from typing import Literal
+
+def normalize(value: str) -> Literal["a", "b"]:
+    if value not in ("a", "b"):
+        return "a"
+    return value
+```
+
+```py
+from typing import Literal
+
+def normalize(value: str | None) -> Literal["a", "b"] | None:
+    if value is None:
+        return None
+    if value not in ("a", "b"):
+        return "a"
+    return value
 ```
 
 ```py

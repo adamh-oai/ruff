@@ -583,6 +583,46 @@ fn is_single_valued_or_union<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
     }
 }
 
+fn is_string_literal_or_union<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
+    match ty.resolve_type_alias(db) {
+        Type::Union(union) => union
+            .elements(db)
+            .iter()
+            .all(|ty| ty.as_string_literal().is_some()),
+        ty => ty.as_string_literal().is_some(),
+    }
+}
+
+fn narrow_str_by_string_literals<'db>(
+    db: &'db dyn Db,
+    lhs_ty: Type<'db>,
+    rhs_ty: Type<'db>,
+    rhs_values: Type<'db>,
+) -> Option<Type<'db>> {
+    let str_ty = KnownClass::Str.to_instance(db);
+    if rhs_ty.resolve_type_alias(db).is_subtype_of(db, str_ty)
+        || !lhs_ty.is_subtype_of(db, str_ty)
+        || !is_string_literal_or_union(db, rhs_values)
+    {
+        return None;
+    }
+
+    Some(IntersectionType::from_two_elements(db, lhs_ty, rhs_values))
+}
+
+fn is_literal_membership_domain<'db>(
+    db: &'db dyn Db,
+    lhs_ty: Type<'db>,
+    rhs_ty: Type<'db>,
+    rhs_values: Type<'db>,
+) -> bool {
+    lhs_ty.is_single_valued(db)
+        || lhs_ty.is_subtype_of(db, Type::literal_string())
+        || lhs_ty.is_bool(db)
+        || (lhs_ty.is_enum(db) && !lhs_ty.overrides_equality(db))
+        || narrow_str_by_string_literals(db, lhs_ty, rhs_ty, rhs_values).is_some()
+}
+
 struct NarrowingConstraintsBuilder<'db, 'ast> {
     db: &'db dyn Db,
     module: &'ast ParsedModuleRef,
@@ -1162,18 +1202,23 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
     // since `eq` and `ne` are equivalent to `in` and `not in` with only one element in the RHS.
     fn evaluate_expr_in(&mut self, lhs_ty: Type<'db>, rhs_ty: Type<'db>) -> Option<Type<'db>> {
         let lhs_ty = lhs_ty.resolve_type_alias(self.db);
+        let rhs_values = rhs_ty
+            .try_iterate(self.db)
+            .ok()?
+            .homogeneous_element_type(self.db);
+
+        if let Some(narrowed) = narrow_str_by_string_literals(self.db, lhs_ty, rhs_ty, rhs_values) {
+            return Some(narrowed);
+        }
 
         if lhs_ty.is_single_valued(self.db) || lhs_ty.is_union_of_single_valued(self.db) {
-            rhs_ty
-                .try_iterate(self.db)
-                .ok()
-                .map(|iterable| iterable.homogeneous_element_type(self.db))
-        } else if lhs_ty.is_union_with_single_valued(self.db) {
-            let rhs_values = rhs_ty
-                .try_iterate(self.db)
-                .ok()?
-                .homogeneous_element_type(self.db);
-
+            Some(rhs_values)
+        } else if lhs_ty.as_union().is_some_and(|union| {
+            union
+                .elements(self.db)
+                .iter()
+                .any(|ty| is_literal_membership_domain(self.db, *ty, rhs_ty, rhs_values))
+        }) {
             let mut builder = UnionBuilder::new(self.db);
 
             // Add the narrowed values from the RHS first, to keep literals before broader types.
@@ -1181,15 +1226,8 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
 
             if let Some(lhs_union) = lhs_ty.as_union() {
                 for element in lhs_union.elements(self.db) {
-                    // Skip single-valued types (handled via RHS matching).
-                    if element.is_single_valued(self.db) {
-                        continue;
-                    }
-                    // Skip types that are handled specially (LiteralString, bool, enum).
-                    if element.is_subtype_of(self.db, Type::literal_string())
-                        || element.is_bool(self.db)
-                        || (element.is_enum(self.db) && !element.overrides_equality(self.db))
-                    {
+                    // Skip domains that are handled via RHS matching.
+                    if is_literal_membership_domain(self.db, *element, rhs_ty, rhs_values) {
                         continue;
                     }
                     // Skip types that cannot compare equal to any RHS value.
@@ -1220,26 +1258,30 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             return None;
         }
 
-        if lhs_ty.is_single_valued(self.db) || lhs_ty.is_union_of_single_valued(self.db) {
+        if lhs_ty.is_single_valued(self.db)
+            || lhs_ty.is_union_of_single_valued(self.db)
+            || narrow_str_by_string_literals(self.db, lhs_ty, rhs_ty, rhs_values).is_some()
+        {
             // Exclude the RHS values from the entire (single-valued) LHS domain.
             let complement = IntersectionBuilder::new(self.db)
                 .add_positive(lhs_ty)
                 .add_negative(rhs_values)
                 .build();
             Some(complement)
-        } else if lhs_ty.is_union_with_single_valued(self.db) {
-            // Split LHS into single-valued portion and the rest. Exclude RHS values from the
-            // single-valued portion, keep the rest intact.
+        } else if lhs_ty.as_union().is_some_and(|union| {
+            union
+                .elements(self.db)
+                .iter()
+                .any(|ty| is_literal_membership_domain(self.db, *ty, rhs_ty, rhs_values))
+        }) {
+            // Split LHS into domains that can be narrowed by literal membership and the rest. Exclude
+            // RHS values from the narrowable portion, keep the rest intact.
             let mut single_builder = UnionBuilder::new(self.db);
             let mut rest_builder = UnionBuilder::new(self.db);
 
             if let Some(lhs_union) = lhs_ty.as_union() {
                 for element in lhs_union.elements(self.db) {
-                    if element.is_single_valued(self.db)
-                        || element.is_subtype_of(self.db, Type::literal_string())
-                        || element.is_bool(self.db)
-                        || (element.is_enum(self.db) && !element.overrides_equality(self.db))
-                    {
+                    if is_literal_membership_domain(self.db, *element, rhs_ty, rhs_values) {
                         single_builder = single_builder.add(*element);
                     } else {
                         rest_builder = rest_builder.add(*element);
