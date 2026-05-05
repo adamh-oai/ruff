@@ -12,10 +12,10 @@ use crate::types::typed_dict::{
     TypedDictField, TypedDictFieldBuilder, TypedDictSchema, TypedDictType,
 };
 use crate::types::{
-    CallableType, ClassLiteral, ClassType, GenericAlias, IntersectionBuilder, IntersectionType,
-    KnownClass, KnownInstanceType, LiteralValueTypeKind, SpecialFormType, SubclassOfInner,
-    SubclassOfType, Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnionBuilder,
-    infer_expression_types,
+    CallableType, ClassBase, ClassLiteral, ClassType, GenericAlias, IntersectionBuilder,
+    IntersectionType, KnownClass, KnownInstanceType, LiteralValueTypeKind, SpecialFormType,
+    SubclassOfInner, SubclassOfType, Truthiness, Type, TypeContext, TypeVarBoundOrConstraints,
+    UnionBuilder, infer_expression_types,
 };
 use ty_python_core::expression::Expression;
 use ty_python_core::place::{PlaceExpr, PlaceTable, ScopedPlaceId};
@@ -977,6 +977,79 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         }
     }
 
+    fn visible_mapping_narrowing(db: &'db dyn Db, base_ty: Type<'db>) -> Option<Type<'db>> {
+        let Type::Union(union) = base_ty.resolve_type_alias(db) else {
+            return None;
+        };
+
+        let mut narrowed = UnionBuilder::new(db);
+        let mut has_mapping_arm = false;
+
+        for element in union.elements(db) {
+            let element = *element;
+            if Self::is_visibly_mapping_type(db, element) {
+                narrowed = narrowed.add(element);
+                has_mapping_arm = true;
+            } else if !Self::is_definitely_not_mapping(db, element) {
+                return None;
+            }
+        }
+
+        has_mapping_arm.then(|| narrowed.build())
+    }
+
+    fn is_visibly_mapping_type(db: &'db dyn Db, ty: Type<'db>) -> bool {
+        match ty.resolve_type_alias(db) {
+            Type::NominalInstance(instance) => instance
+                .class(db)
+                .iter_mro(db)
+                .filter_map(ClassBase::into_class)
+                .any(|class| class.is_known(db, KnownClass::Mapping)),
+            Type::ProtocolInstance(protocol) => protocol
+                .to_nominal_instance()
+                .is_some_and(|instance| instance.has_known_class(db, KnownClass::Mapping)),
+            Type::TypedDict(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_mapping_constraint(db: &'db dyn Db, constraint: Type<'db>) -> bool {
+        Self::is_visibly_mapping_type(db, constraint)
+    }
+
+    fn is_definitely_not_mapping(db: &'db dyn Db, ty: Type<'db>) -> bool {
+        match ty.resolve_type_alias(db) {
+            Type::Never => true,
+            Type::LiteralValue(literal) => matches!(
+                literal.kind(),
+                LiteralValueTypeKind::String(_)
+                    | LiteralValueTypeKind::Bytes(_)
+                    | LiteralValueTypeKind::Int(_)
+            ),
+            Type::NominalInstance(instance) => [
+                KnownClass::Bool,
+                KnownClass::Bytes,
+                KnownClass::Bytearray,
+                KnownClass::Complex,
+                KnownClass::Float,
+                KnownClass::FrozenSet,
+                KnownClass::Int,
+                KnownClass::List,
+                KnownClass::NoneType,
+                KnownClass::Set,
+                KnownClass::Str,
+                KnownClass::Tuple,
+            ]
+            .into_iter()
+            .any(|known| instance.class(db).is_known(db, known)),
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .all(|element| Self::is_definitely_not_mapping(db, *element)),
+            _ => false,
+        }
+    }
+
     /// Try to preserve generic parameters from an existing type while applying a runtime class
     /// narrowing constraint.
     ///
@@ -1831,6 +1904,15 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                             constraint = Self::specialize_class_constraint_from_base_type(
                                 self.db, base_ty, constraint,
                             );
+                            if Self::is_mapping_constraint(self.db, constraint)
+                                && let Some(narrowed_ty) =
+                                    Self::visible_mapping_narrowing(self.db, base_ty)
+                            {
+                                return NarrowingConstraints::from_iter([(
+                                    place,
+                                    NarrowingConstraint::replacement(narrowed_ty),
+                                )]);
+                            }
                         }
                         NarrowingConstraints::from_iter([(
                             place,

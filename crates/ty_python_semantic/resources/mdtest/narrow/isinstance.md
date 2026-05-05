@@ -709,6 +709,16 @@ def _(x: Any):
 def _(x: object):
     if isinstance(x, Mapping):
         reveal_type(dict(x))  # revealed: dict[object, object]
+
+def _(x: dict[str, object] | int):
+    if isinstance(x, Mapping):
+        reveal_type(x)  # revealed: dict[str, object]
+
+type JSONValue = str | int | float | bool | None | list[JSONValue] | dict[str, JSONValue]
+
+def _(x: JSONValue):
+    if isinstance(x, Mapping):
+        reveal_type(x)  # revealed: dict[str, JSONValue]
 ```
 
 When reading attributes from a top-materialized generic, only type parameters should be
