@@ -96,6 +96,483 @@ fn function<'a>(facts: &'a ModuleTypeFacts, name: &str) -> &'a FunctionTypeFact 
         .unwrap()
 }
 
+fn function_owns_binding(binding: &NominalBindingFact, function: &FunctionTypeFact) -> bool {
+    binding
+        .owner
+        .as_function()
+        .is_some_and(|(owner, _)| owner == &function.identity)
+}
+
+fn parameter_owns_binding(binding: &NominalBindingFact, index: u32) -> bool {
+    binding
+        .owner
+        .as_function()
+        .is_some_and(|(_, annotation)| annotation == AnnotationTarget::Parameter { index })
+}
+
+fn field<'a>(facts: &'a ModuleTypeFacts, class_name: &str, name: &str) -> &'a FieldTypeFact {
+    class(facts, class_name)
+        .instance_fields
+        .iter()
+        .find(|field| field.name == name)
+        .unwrap()
+}
+
+fn field_bindings<'a>(
+    facts: &'a ModuleTypeFacts,
+    field: &FieldTypeFact,
+) -> Vec<&'a NominalBindingFact> {
+    let reference = field
+        .annotation_reference()
+        .expect("actual annotated field definition");
+    facts.nominal_bindings.iter().filter(|binding| {
+        matches!(&binding.owner, NominalBindingOwner::Field { field } if field == &reference)
+    }).collect()
+}
+
+#[test]
+fn soac_nominal_field_bindings_preserve_actual_assignment_and_factory_scope() {
+    let source = r#"from __future__ import strict
+class GlobalTarget:
+    pass
+class GlobalHolder:
+    value: GlobalTarget
+def accept(value: GlobalTarget) -> GlobalTarget:
+    return value
+def family():
+    class Target:
+        pass
+    class Holder:
+        value: Target
+        Alias = Target
+        class_alias: Alias
+        own: Holder | None
+    def replace_target(value: type[Target]):
+        nonlocal Target
+        Target = value
+    return Target, Holder, replace_target
+"#;
+    let facts = export(source);
+    assert!(
+        facts.diagnostics.iter().all(
+            |diagnostic| diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
+        )
+    );
+    let global = field(&facts, "GlobalHolder", "value");
+    let global_definition = global
+        .annotation_definition
+        .as_ref()
+        .expect("class annotation provenance");
+    assert_eq!(
+        global_definition.definition_kind,
+        DefinitionKind::Assignment
+    );
+    assert_eq!(global_definition.module, facts.module);
+    assert_eq!(
+        &source[global_definition.source_range.start as usize
+            ..global_definition.source_range.end as usize],
+        "value: GlobalTarget"
+    );
+    let global_bindings = field_bindings(&facts, global);
+    assert_eq!(global_bindings.len(), 1);
+    assert_eq!(
+        global_bindings[0].binding,
+        class(&facts, "GlobalTarget").identity
+    );
+    assert_eq!(
+        global_bindings[0].binding_scope,
+        facts.module_body_identity()
+    );
+    let function_bindings: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|binding| function_owns_binding(binding, function(&facts, "accept")))
+        .collect();
+    assert_eq!(function_bindings.len(), 2);
+    assert_ne!(global_bindings[0].owner, function_bindings[0].owner);
+
+    let factory = function(&facts, "family");
+    let target = class(&facts, "family.<locals>.Target");
+    let holder = class(&facts, "family.<locals>.Holder");
+    for (name, scope, definition) in [
+        ("value", &factory.identity, &target.identity),
+        ("own", &factory.identity, &holder.identity),
+    ] {
+        let field = field(&facts, "family.<locals>.Holder", name);
+        let bindings = field_bindings(&facts, field);
+        assert_eq!(bindings.len(), 1, "{name}");
+        assert_eq!(&bindings[0].binding_scope, scope);
+        assert_eq!(&bindings[0].binding, definition);
+        assert_eq!(field.declaring_class.definition, holder.identity);
+    }
+    let class_alias = field_bindings(
+        &facts,
+        field(&facts, "family.<locals>.Holder", "class_alias"),
+    );
+    assert_eq!(class_alias.len(), 1);
+    assert_eq!(class_alias[0].binding_scope, holder.identity);
+    assert_eq!(
+        class_alias[0].binding.definition_kind,
+        DefinitionKind::Assignment
+    );
+    assert_ne!(class_alias[0].binding, target.identity);
+    assert_eq!(class_alias[0].class.definition, target.identity);
+    for binding in &facts.nominal_bindings {
+        assert_eq!(
+            &source[binding.expression_range.start as usize..binding.expression_range.end as usize],
+            binding.name
+        );
+    }
+    assert_eq!(
+        facts,
+        export_from(&database(source, AnalysisDialect::SoacStrictV1, true))
+    );
+}
+
+#[test]
+fn soac_nominal_field_bindings_preserve_dataclass_declarations_and_semantic_wrappers() {
+    let source = r#"from __future__ import strict
+from dataclasses import dataclass, InitVar
+from typing import Annotated, ClassVar, Optional, Union
+class Target:
+    pass
+Alias = Target
+@dataclass
+class Base:
+    base: Target
+    seed: InitVar[Target]
+    pair: Union[Target, Alias]
+    annotated: Annotated[Target, Alias]
+    optional: Optional[Target]
+    shared: ClassVar[Target] = Target()
+@dataclass
+class Child(Base):
+    own: Target
+"#;
+    let facts = export(source);
+    assert!(
+        facts.diagnostics.iter().all(
+            |diagnostic| diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
+        )
+    );
+    let base = class(&facts, "Base");
+    for (name, count) in [
+        ("base", 1),
+        ("seed", 1),
+        ("pair", 2),
+        ("annotated", 1),
+        ("optional", 1),
+        ("shared", 1),
+    ] {
+        let field = field(&facts, "Base", name);
+        assert_eq!(field.annotation_origin, AnnotationOrigin::Explicit);
+        assert_eq!(field.declaring_class.definition, base.identity);
+        let bindings = field_bindings(&facts, field);
+        assert_eq!(bindings.len(), count, "{name}");
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| binding.binding_scope == facts.module_body_identity())
+        );
+        if field.field_kind != FieldKind::ClassVariable {
+            assert_eq!(
+                field.annotation_reference(),
+                self::field(&facts, "Child", name).annotation_reference()
+            );
+        }
+    }
+    let pair = field_bindings(&facts, field(&facts, "Base", "pair"));
+    assert_eq!(pair[0].class, pair[1].class);
+    assert_ne!(pair[0].binding, pair[1].binding);
+    assert_ne!(pair[0].expression_range, pair[1].expression_range);
+    let own = field(&facts, "Child", "own");
+    assert_eq!(
+        own.declaring_class.definition,
+        class(&facts, "Child").identity
+    );
+    assert_eq!(field_bindings(&facts, own).len(), 1);
+    let generated = base
+        .methods
+        .iter()
+        .find(|method| method.name == "__init__")
+        .unwrap();
+    assert!(generated.generated.is_some());
+    assert!(generated.implementation.is_none());
+    assert!(
+        facts
+            .nominal_bindings
+            .iter()
+            .all(|binding| matches!(&binding.owner, NominalBindingOwner::Field { .. }))
+    );
+    assert_eq!(
+        facts,
+        export_from(&database(source, AnalysisDialect::SoacStrictV1, true))
+    );
+}
+
+#[test]
+fn soac_nominal_field_bindings_distinguish_method_annotations_from_inferred_assignments() {
+    let source = r#"from __future__ import strict
+class Target:
+    pass
+class Holder:
+    def __init__(self, value: Target):
+        self.explicit: Target = value
+        self.inferred = value
+    def ambiguous_one(self, value):
+        self.ambiguous: Target = value
+    def ambiguous_two(self, value):
+        self.ambiguous: Target = value
+def method_family():
+    class LocalTarget:
+        pass
+    class LocalHolder:
+        def __init__(self, value):
+            self.payload: LocalTarget = value
+    return LocalTarget, LocalHolder
+"#;
+    let facts = export(source);
+    assert!(
+        facts.diagnostics.iter().all(
+            |diagnostic| diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
+        )
+    );
+    let explicit = field(&facts, "Holder", "explicit");
+    assert_eq!(explicit.annotation_origin, AnnotationOrigin::Explicit);
+    let declaration = explicit
+        .annotation_definition
+        .as_ref()
+        .expect("method annotated assignment");
+    assert_eq!(
+        &source[declaration.source_range.start as usize..declaration.source_range.end as usize],
+        "self.explicit: Target = value"
+    );
+    assert_eq!(field_bindings(&facts, explicit).len(), 1);
+    let inferred = field(&facts, "Holder", "inferred");
+    assert_eq!(inferred.annotation_origin, AnnotationOrigin::Inferred);
+    assert!(inferred.annotation_definition.is_none());
+    let ambiguous = field(&facts, "Holder", "ambiguous");
+    assert_eq!(ambiguous.annotation_origin, AnnotationOrigin::Explicit);
+    assert!(
+        ambiguous.annotation_definition.is_none(),
+        "multiple declarations are not replaced by a guessed first definition"
+    );
+    let local = field(&facts, "method_family.<locals>.LocalHolder", "payload");
+    let bindings = field_bindings(&facts, local);
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(
+        bindings[0].binding_scope,
+        function(&facts, "method_family").identity
+    );
+    assert_eq!(
+        bindings[0].binding,
+        class(&facts, "method_family.<locals>.LocalTarget").identity
+    );
+    // This source field has no native provider/closure operand. Its signed
+    // source plan is not an invented runtime capture or admission permission.
+    assert!(
+        function(&facts, "method_family.<locals>.LocalHolder.__init__")
+            .signature
+            .parameters
+            .iter()
+            .all(|parameter| parameter.annotation_origin != AnnotationOrigin::Explicit)
+    );
+}
+
+#[test]
+fn soac_nominal_field_bindings_do_not_publish_partial_normalized_unions() {
+    let source = r#"from __future__ import strict
+def factory(flag: bool):
+    class Target:
+        pass
+    if flag:
+        Alias = Target
+    else:
+        Alias = Target
+    class Holder:
+        value: Target | Alias
+    def accept(value: Target | Alias) -> Target:
+        return value
+    return Holder, accept
+"#;
+    let facts = export(source);
+    assert!(
+        facts.diagnostics.iter().all(
+            |diagnostic| diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
+        )
+    );
+    let field = field(&facts, "factory.<locals>.Holder", "value");
+    assert!(matches!(field.value_type, StaticType::NominalClass(_)));
+    assert!(
+        field_bindings(&facts, field).is_empty(),
+        "one unresolved union alias cannot be dropped after equal class references normalize"
+    );
+    let function = function(&facts, "factory.<locals>.accept");
+    assert!(matches!(
+        function.signature.parameters[0].value_type,
+        StaticType::NominalClass(_)
+    ));
+    let bindings: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|binding| function_owns_binding(binding, function))
+        .collect();
+    assert_eq!(
+        bindings.len(),
+        1,
+        "the independently resolved return remains complete"
+    );
+    assert!(matches!(
+        bindings[0].owner.as_function(),
+        Some((_, AnnotationTarget::Return))
+    ));
+}
+
+#[test]
+fn soac_nominal_field_bindings_do_not_require_builtin_arms_or_annotated_metadata() {
+    let source = r#"from __future__ import strict
+import builtins
+from typing import Annotated as Metadata, Final as Frozen
+class Target:
+    pass
+class Optional:
+    pass
+class Holder:
+    number: Target | int
+    text: Target | builtins.str
+    floating: Target | float
+    absent: Target | None
+    type_objects: Target | type[Target]
+    mixed: Target | int | builtins.str | float | None
+    metadata: Metadata[Target, Optional]
+    final: Frozen[Target] = Target()
+    namesake: Optional | Target
+def accept(value: Metadata[Target | int | builtins.str | float | None, Optional]):
+    return value
+"#;
+    let facts = export(source);
+    assert!(
+        facts.diagnostics.iter().all(
+            |diagnostic| diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
+        )
+    );
+    for (name, count) in [
+        ("number", 1),
+        ("text", 1),
+        ("floating", 1),
+        ("absent", 1),
+        ("type_objects", 1),
+        ("mixed", 1),
+        ("metadata", 1),
+        ("final", 1),
+        ("namesake", 2),
+    ] {
+        let field = field(&facts, "Holder", name);
+        let bindings = field_bindings(&facts, field);
+        assert_eq!(bindings.len(), count, "{name}: {:?}", field.value_type);
+        if name != "namesake" {
+            assert_eq!(bindings[0].name, "Target");
+        }
+    }
+    let bindings: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|binding| function_owns_binding(binding, function(&facts, "accept")))
+        .collect();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].name, "Target");
+}
+
+#[test]
+fn soac_nominal_field_bindings_keep_external_declarations_and_invalidate_with_source() {
+    let base_source = "from __future__ import strict\nfrom dataclasses import dataclass\nclass Target: pass\n@dataclass\nclass Base:\n    inherited: Target\n";
+    let main_source = "from __future__ import strict\nfrom dataclasses import dataclass\nfrom base import Base, Target\n@dataclass\nclass Child(Base):\n    own: Target\n";
+    let system = TestSystem::default();
+    system
+        .memory_file_system()
+        .write_files_all([
+            (
+                "/project/ty.toml",
+                "[environment]\npython-version = '3.15'\n",
+            ),
+            ("/project/main.py", main_source),
+            ("/project/base.py", base_source),
+        ])
+        .unwrap();
+    let metadata =
+        ProjectMetadata::discover(ruff_db::system::SystemPath::new("/project"), &system).unwrap();
+    let mut db = ProjectDatabase::fallible_with_analysis_dialect(
+        metadata,
+        system.clone(),
+        AnalysisDialect::SoacStrictV1,
+    )
+    .unwrap();
+    let facts = export_from(&db);
+    assert!(
+        facts.diagnostics.iter().all(
+            |diagnostic| diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
+        )
+    );
+    let base_file = system_path_to_file(&db, "/project/base.py").unwrap();
+    let base = export_soac_module(&db, base_file, "base", ResolvedStrictPolicy::default())
+        .unwrap()
+        .facts;
+    let inherited = field(&facts, "Child", "inherited")
+        .annotation_reference()
+        .unwrap();
+    assert_eq!(
+        Some(inherited.clone()),
+        field(&base, "Base", "inherited").annotation_reference()
+    );
+    assert_eq!(inherited.annotation_definition.module, base.module);
+    assert_eq!(
+        inherited.declaring_class.source_digest,
+        Fingerprint::digest(base_source)
+    );
+    assert_eq!(
+        field_bindings(&facts, field(&facts, "Child", "inherited")).len(),
+        0
+    );
+    assert_eq!(
+        field_bindings(&base, field(&base, "Base", "inherited")).len(),
+        1
+    );
+    let own = field_bindings(&facts, field(&facts, "Child", "own"));
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].binding.module, facts.module);
+    assert_eq!(own[0].class.definition.module, base.module);
+    let changed_source = format!("{base_source}# changed declaring module\n");
+    system
+        .memory_file_system()
+        .write_file_all("/project/base.py", &changed_source)
+        .unwrap();
+    db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+        "/project/base.py".into(),
+    )]);
+    let changed = export_from(&db);
+    assert_eq!(changed.module, facts.module);
+    let changed_inherited = field(&changed, "Child", "inherited")
+        .annotation_reference()
+        .unwrap();
+    assert_ne!(changed_inherited, inherited);
+    assert_eq!(
+        changed_inherited.annotation_definition.source_range,
+        inherited.annotation_definition.source_range
+    );
+    assert_eq!(
+        changed_inherited.declaring_class.source_digest,
+        Fingerprint::digest(&changed_source)
+    );
+    system
+        .memory_file_system()
+        .write_file_all("/project/base.py", base_source)
+        .unwrap();
+    db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+        "/project/base.py".into(),
+    )]);
+    assert_eq!(export_from(&db), facts);
+}
+
 #[test]
 fn soac_implicit_class_cell_reaches_nested_lexical_scopes() {
     let source = r#"from __future__ import strict
@@ -668,7 +1145,7 @@ def factory():
         let leaves: Vec<_> = facts
             .nominal_bindings
             .iter()
-            .filter(|leaf| leaf.function == function.identity)
+            .filter(|leaf| function_owns_binding(leaf, function))
             .collect();
         assert_eq!(leaves.len(), count, "{name}");
         assert!(
@@ -685,7 +1162,7 @@ def factory():
         let leaves: Vec<_> = facts
             .nominal_bindings
             .iter()
-            .filter(|leaf| leaf.function == function.identity)
+            .filter(|leaf| function_owns_binding(leaf, function))
             .collect();
         assert_eq!(leaves.len(), 2);
         for leaf in leaves {
@@ -742,7 +1219,7 @@ fn soac_nominal_bindings_preserve_semantic_aliases_slots_and_union_leaves() {
     let bindings: Vec<_> = facts
         .nominal_bindings
         .iter()
-        .filter(|binding| binding.function == combine.identity)
+        .filter(|binding| function_owns_binding(binding, combine))
         .collect();
     assert_eq!(bindings.len(), 7);
     for binding in &bindings {
@@ -754,7 +1231,7 @@ fn soac_nominal_bindings_preserve_semantic_aliases_slots_and_union_leaves() {
     }
     let alias = bindings
         .iter()
-        .find(|binding| binding.annotation == AnnotationTarget::Parameter { index: 1 })
+        .find(|binding| parameter_owns_binding(binding, 1))
         .unwrap();
     assert_eq!(alias.name, "Alias");
     assert_eq!(alias.binding.module, facts.module);
@@ -763,7 +1240,7 @@ fn soac_nominal_bindings_preserve_semantic_aliases_slots_and_union_leaves() {
     assert_eq!(alias.class.definition.lexical_qualname, "Foreign");
     let local_alias = bindings
         .iter()
-        .find(|binding| binding.annotation == AnnotationTarget::Parameter { index: 2 })
+        .find(|binding| parameter_owns_binding(binding, 2))
         .unwrap();
     assert_eq!(local_alias.name, "LocalAlias");
     assert_ne!(local_alias.binding, local_alias.class.definition);
@@ -777,8 +1254,7 @@ fn soac_nominal_bindings_preserve_semantic_aliases_slots_and_union_leaves() {
         .nominal_bindings
         .iter()
         .filter(|binding| {
-            binding.function == duplicate.identity
-                && binding.annotation == AnnotationTarget::Parameter { index: 0 }
+            function_owns_binding(binding, duplicate) && parameter_owns_binding(binding, 0)
         })
         .collect();
     assert_eq!(leaves.len(), 2);
@@ -810,7 +1286,7 @@ def combined(owner: "Foreign | Alias", extra: Optional[Foreign]) -> Union[Foreig
         let leaves: Vec<_> = facts
             .nominal_bindings
             .iter()
-            .filter(|leaf| leaf.function == function.identity)
+            .filter(|leaf| function_owns_binding(leaf, function))
             .collect();
         assert_eq!(leaves.len(), count, "{name}");
         for leaf in leaves {
@@ -881,7 +1357,7 @@ def factory():
         let leaves: Vec<_> = facts
             .nominal_bindings
             .iter()
-            .filter(|leaf| leaf.function == function.identity)
+            .filter(|leaf| function_owns_binding(leaf, function))
             .collect();
         assert_eq!(leaves.len(), 2, "{name}");
         for leaf in leaves {
@@ -931,7 +1407,7 @@ def shadowed_factory():
             facts
                 .nominal_bindings
                 .iter()
-                .all(|leaf| leaf.function != function.identity)
+                .all(|leaf| !function_owns_binding(leaf, function))
         );
     }
     let shadowed = function(&facts, "shadowed_factory.<locals>.inner");
@@ -939,7 +1415,7 @@ def shadowed_factory():
     let leaves: Vec<_> = facts
         .nominal_bindings
         .iter()
-        .filter(|leaf| leaf.function == shadowed.identity)
+        .filter(|leaf| function_owns_binding(leaf, shadowed))
         .collect();
     assert_eq!(leaves.len(), 2);
     assert!(leaves.iter().all(|leaf| {
@@ -1016,8 +1492,7 @@ fn soac_nominal_bindings_use_actual_lexical_scopes_and_remove_ignored_contracts(
         .nominal_bindings
         .iter()
         .find(|binding| {
-            binding.function == method.identity
-                && binding.annotation == AnnotationTarget::Parameter { index: 1 }
+            function_owns_binding(binding, method) && parameter_owns_binding(binding, 1)
         })
         .unwrap();
     assert_eq!(local.binding_scope, class(&facts, "Container").identity);
@@ -1027,7 +1502,7 @@ fn soac_nominal_bindings_use_actual_lexical_scopes_and_remove_ignored_contracts(
     let inner_bindings: Vec<_> = facts
         .nominal_bindings
         .iter()
-        .filter(|binding| binding.function == inner.identity)
+        .filter(|binding| function_owns_binding(binding, inner))
         .collect();
     assert_eq!(inner_bindings.len(), 3);
     assert!(
@@ -1040,7 +1515,7 @@ fn soac_nominal_bindings_use_actual_lexical_scopes_and_remove_ignored_contracts(
             facts
                 .nominal_bindings
                 .iter()
-                .all(|binding| binding.function != function(&facts, name).identity)
+                .all(|binding| !function_owns_binding(binding, function(&facts, name)))
         );
     }
     assert!(
@@ -1061,7 +1536,7 @@ fn soac_nominal_bindings_distinguish_factory_aliases_from_direct_class_bindings(
     let direct_leaves: Vec<_> = facts
         .nominal_bindings
         .iter()
-        .filter(|leaf| leaf.function == direct.identity)
+        .filter(|leaf| function_owns_binding(leaf, direct))
         .collect();
     assert_eq!(direct_leaves.len(), 2);
     assert!(direct_leaves.iter().all(|leaf| {
@@ -1070,7 +1545,7 @@ fn soac_nominal_bindings_distinguish_factory_aliases_from_direct_class_bindings(
     let alias_leaves: Vec<_> = facts
         .nominal_bindings
         .iter()
-        .filter(|leaf| leaf.function == alias.identity)
+        .filter(|leaf| function_owns_binding(leaf, alias))
         .collect();
     assert_eq!(alias_leaves.len(), 2);
     assert!(alias_leaves.iter().all(|leaf| {
@@ -1086,7 +1561,7 @@ fn soac_nominal_bindings_distinguish_factory_aliases_from_direct_class_bindings(
     let leaves: Vec<_> = facts
         .nominal_bindings
         .iter()
-        .filter(|leaf| leaf.function == two.identity)
+        .filter(|leaf| function_owns_binding(leaf, two))
         .collect();
     assert_eq!(leaves.len(), 3);
     assert_eq!(leaves[0].class, leaves[1].class);
@@ -1099,7 +1574,7 @@ fn soac_nominal_bindings_distinguish_factory_aliases_from_direct_class_bindings(
     let leaves: Vec<_> = facts
         .nominal_bindings
         .iter()
-        .filter(|leaf| leaf.function == either.identity)
+        .filter(|leaf| function_owns_binding(leaf, either))
         .collect();
     assert_eq!(leaves.len(), 4);
 }

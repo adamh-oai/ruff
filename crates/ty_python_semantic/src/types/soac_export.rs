@@ -1027,9 +1027,11 @@ impl<'db> Exporter<'db> {
             {
                 self.nominal_annotation_leaves(
                     &self.model,
-                    &identity,
-                    facts::AnnotationTarget::Parameter {
-                        index: u32::try_from(index).ok()?,
+                    &facts::NominalBindingOwner::Function {
+                        function: identity.clone(),
+                        annotation: facts::AnnotationTarget::Parameter {
+                            index: u32::try_from(index).ok()?,
+                        },
                     },
                     annotation,
                     &parameter_type.value_type,
@@ -1042,8 +1044,10 @@ impl<'db> Exporter<'db> {
         {
             self.nominal_annotation_leaves(
                 &self.model,
-                &identity,
-                facts::AnnotationTarget::Return,
+                &facts::NominalBindingOwner::Function {
+                    function: identity.clone(),
+                    annotation: facts::AnnotationTarget::Return,
+                },
                 annotation,
                 &signature.return_type,
                 &mut nominal_bindings,
@@ -1068,40 +1072,60 @@ impl<'db> Exporter<'db> {
     fn nominal_annotation_leaves(
         &self,
         model: &SemanticModel<'db>,
-        function: &facts::SourceIdentity,
-        annotation: facts::AnnotationTarget,
+        owner: &facts::NominalBindingOwner,
         expression: &ast::Expr,
         contract: &facts::StaticType,
         output: &mut Vec<facts::NominalBindingFact>,
     ) {
+        let mut pending = Vec::new();
+        // A normalized class set cannot tell us that one alias was omitted.
+        // Publish all required leaves for this annotation owner, or none, so
+        // an unresolved alias never borrows another leaf's actual target.
+        if self.visit_nominal_annotation_leaves(model, owner, expression, contract, &mut pending) {
+            output.extend(pending);
+        }
+    }
+
+    fn visit_nominal_annotation_leaves(
+        &self,
+        model: &SemanticModel<'db>,
+        owner: &facts::NominalBindingOwner,
+        expression: &ast::Expr,
+        contract: &facts::StaticType,
+        output: &mut Vec<facts::NominalBindingFact>,
+    ) -> bool {
         if !contract.has_supported_boundary_shape() {
-            return;
+            return false;
+        }
+        if matches!(expression, ast::Expr::NoneLiteral(_))
+            || self.is_builtin_annotation_leaf(model, expression)
+        {
+            return true;
         }
         match expression {
             ast::Expr::Name(name) => {
-                if let Some(binding) =
-                    self.nominal_name_binding(model, function, annotation, name, contract)
-                {
-                    output.push(binding);
-                }
+                let Some(binding) = self.nominal_name_binding(model, owner, name, contract) else {
+                    return false;
+                };
+                output.push(binding);
+                true
             }
             ast::Expr::BinOp(binary) if binary.op == ast::Operator::BitOr => {
-                self.nominal_annotation_leaves(
+                let left = self.visit_nominal_annotation_leaves(
                     model,
-                    function,
-                    annotation,
+                    owner,
                     &binary.left,
                     contract,
                     output,
                 );
-                self.nominal_annotation_leaves(
+                let right = self.visit_nominal_annotation_leaves(
                     model,
-                    function,
-                    annotation,
+                    owner,
                     &binary.right,
                     contract,
                     output,
                 );
+                left && right
             }
             ast::Expr::Subscript(subscript)
                 if matches!(
@@ -1112,20 +1136,62 @@ impl<'db> Exporter<'db> {
                 ) =>
             {
                 if let ast::Expr::Tuple(tuple) = subscript.slice.as_ref() {
+                    let mut complete = true;
                     for element in &tuple.elts {
-                        self.nominal_annotation_leaves(
-                            model, function, annotation, element, contract, output,
+                        complete &= self.visit_nominal_annotation_leaves(
+                            model, owner, element, contract, output,
                         );
                     }
+                    complete
                 } else {
-                    self.nominal_annotation_leaves(
+                    self.visit_nominal_annotation_leaves(
                         model,
-                        function,
-                        annotation,
+                        owner,
                         &subscript.slice,
                         contract,
                         output,
-                    );
+                    )
+                }
+            }
+            ast::Expr::Subscript(subscript) => {
+                if matches!(subscript.value.inferred_type(model),
+                    Some(Type::ClassLiteral(class)) if class.known(self.db) == Some(KnownClass::Type))
+                {
+                    // The supported logical contract for type[T] checks the
+                    // value as a type object, not as an instance of T.
+                    return true;
+                }
+                let Some(Type::SpecialForm(form)) = subscript.value.inferred_type(model) else {
+                    return false;
+                };
+                match form {
+                    super::SpecialFormType::Type => true,
+                    super::SpecialFormType::Annotated => {
+                        // Metadata is not part of the declared value type and
+                        // must not introduce extra required nominal targets.
+                        if let ast::Expr::Tuple(tuple) = subscript.slice.as_ref()
+                            && let Some(value) = tuple.elts.first()
+                        {
+                            self.visit_nominal_annotation_leaves(
+                                model, owner, value, contract, output,
+                            )
+                        } else {
+                            false
+                        }
+                    }
+                    super::SpecialFormType::TypeQualifier(
+                        super::TypeQualifier::Final
+                        | super::TypeQualifier::ClassVar
+                        | super::TypeQualifier::InitVar,
+                    ) if matches!(owner, facts::NominalBindingOwner::Field { .. }) => self
+                        .visit_nominal_annotation_leaves(
+                            model,
+                            owner,
+                            &subscript.slice,
+                            contract,
+                            output,
+                        ),
+                    _ => false,
                 }
             }
             ast::Expr::StringLiteral(string) => {
@@ -1134,28 +1200,72 @@ impl<'db> Exporter<'db> {
                 // is required for both type and definition queries on these
                 // nodes, which are not in the module's ordinary AST.
                 if let Some((parsed, annotation_model)) = model.enter_string_annotation(string) {
-                    self.nominal_annotation_leaves(
+                    self.visit_nominal_annotation_leaves(
                         &annotation_model,
-                        function,
-                        annotation,
+                        owner,
                         parsed.expr(),
                         contract,
                         output,
-                    );
+                    )
+                } else {
+                    false
                 }
             }
             // Attribute access, type aliases, and arbitrary expressions need
             // a separate explicit operand plan. Never evaluate them or guess
             // an actual runtime object from a source identity.
-            _ => {}
+            _ => false,
         }
+    }
+
+    fn is_builtin_annotation_leaf(
+        &self,
+        model: &SemanticModel<'db>,
+        expression: &ast::Expr,
+    ) -> bool {
+        let Some(ty) = expression.inferred_type(model) else {
+            return false;
+        };
+        self.is_builtin_annotation_type(ty)
+    }
+
+    fn is_builtin_annotation_type(&self, ty: Type<'db>) -> bool {
+        fn builtins_only(value: &facts::StaticType) -> bool {
+            match value {
+                facts::StaticType::None
+                | facts::StaticType::ExactBuiltin(_)
+                | facts::StaticType::NominalBuiltin { .. }
+                | facts::StaticType::NumericWidening { .. } => true,
+                facts::StaticType::Union(elements) => elements.iter().all(builtins_only),
+                facts::StaticType::Optional(element) => builtins_only(element),
+                _ => false,
+            }
+        }
+        if let Type::Union(union) = ty {
+            return union
+                .elements(self.db)
+                .iter()
+                .all(|ty| self.is_builtin_annotation_type(*ty));
+        }
+        let instance = match ty {
+            // Type-expression inference can already project a class name to
+            // its instance type. Ordinary value expressions still require the
+            // class-object projection below.
+            Type::NominalInstance(_) => ty,
+            _ => {
+                let Some(instance) = ty.to_instance_approximation(self.db, &self.env) else {
+                    return false;
+                };
+                instance
+            }
+        };
+        builtins_only(&self.value_type(instance))
     }
 
     fn nominal_name_binding(
         &self,
         model: &SemanticModel<'db>,
-        function: &facts::SourceIdentity,
-        annotation: facts::AnnotationTarget,
+        owner: &facts::NominalBindingOwner,
         name: &ast::ExprName,
         contract: &facts::StaticType,
     ) -> Option<facts::NominalBindingFact> {
@@ -1220,8 +1330,7 @@ impl<'db> Exporter<'db> {
             _ => return None,
         };
         Some(facts::NominalBindingFact {
-            function: function.clone(),
-            annotation,
+            owner: owner.clone(),
             expression_range: source_range(name.range()),
             name: name.id.to_string(),
             class,
@@ -1438,6 +1547,7 @@ impl<'db> Exporter<'db> {
                 .own_synthesized_member(db, &self.env, None, None, "__init__")
                 .is_some();
         let mut fields = Vec::new();
+        let mut field_bindings = Vec::new();
         if let Some(generator) = generator {
             for (name, field) in class.fields(db, None, generator) {
                 let value_type = self.value_type(field.declared_ty);
@@ -1459,12 +1569,14 @@ impl<'db> Exporter<'db> {
                     .and_then(|definition| self.class_for_scope(definition.scope(db)))
                     .unwrap_or_else(|| own_reference.clone());
                 let default = self.field_default(field.first_declaration, default_ty);
-                fields.push(facts::FieldTypeFact {
+                let exported = facts::FieldTypeFact {
                     name: name.to_string(),
                     declaring_class,
                     uncertainty: uncertainty(&value_type),
                     value_type,
                     annotation_origin: self.field_annotation_origin(field.first_declaration),
+                    annotation_definition: self
+                        .field_annotation_definition(field.first_declaration),
                     field_kind: if init_only {
                         facts::FieldKind::InitOnly
                     } else {
@@ -1483,7 +1595,14 @@ impl<'db> Exporter<'db> {
                     },
                     default,
                     descriptor: facts::DescriptorFact::default(),
-                });
+                };
+                self.field_nominal_bindings(
+                    &exported,
+                    field.first_declaration,
+                    &own_reference,
+                    &mut field_bindings,
+                );
+                fields.push(exported);
             }
         }
         let mut field_names: BTreeSet<String> =
@@ -1524,12 +1643,13 @@ impl<'db> Exporter<'db> {
             if !matches!(descriptor.kind, facts::DescriptorKind::None) {
                 reasons.insert(facts::DynamicClassReason::UnsupportedDescriptor);
             }
-            fields.push(facts::FieldTypeFact {
+            let exported = facts::FieldTypeFact {
                 name,
                 declaring_class: own_reference.clone(),
                 uncertainty: uncertainty(&value_type),
                 value_type,
                 annotation_origin: self.field_annotation_origin(Some(declaration)),
+                annotation_definition: self.field_annotation_definition(Some(declaration)),
                 field_kind: if classvar {
                     facts::FieldKind::ClassVariable
                 } else if init_only {
@@ -1556,7 +1676,14 @@ impl<'db> Exporter<'db> {
                 initialization: facts::InitializationPolicy::MayBeAbsent,
                 default,
                 descriptor,
-            });
+            };
+            self.field_nominal_bindings(
+                &exported,
+                Some(declaration),
+                &own_reference,
+                &mut field_bindings,
+            );
+            fields.push(exported);
         }
         // Enumerate implicit names from the semantic index, then ask the same
         // instance-member query used for Python attribute checking for each type.
@@ -1578,9 +1705,14 @@ impl<'db> Exporter<'db> {
                 continue;
             };
             let value_type = self.value_type(place.ty);
-            fields.push(facts::FieldTypeFact {
+            let provenance = place.provenance.definition();
+            let declaring_class = provenance
+                .and_then(|definition| self.enclosing_class_for_scope(definition.scope(db)))
+                .unwrap_or_else(|| own_reference.clone());
+            let declaration = self.unique_implicit_annotation(provenance, &name);
+            let exported = facts::FieldTypeFact {
                 name,
-                declaring_class: own_reference.clone(),
+                declaring_class,
                 field_kind: if matches!(value_type, facts::StaticType::Callable(_)) {
                     facts::FieldKind::CallableInstanceField
                 } else {
@@ -1592,12 +1724,20 @@ impl<'db> Exporter<'db> {
                     TypeOrigin::Declared => facts::AnnotationOrigin::Explicit,
                     TypeOrigin::Inferred => facts::AnnotationOrigin::Inferred,
                 },
+                annotation_definition: self.field_annotation_definition(declaration),
                 read_policy: facts::FieldReadPolicy::PythonAttribute,
                 write_policy: facts::FieldWritePolicy::DeclaredField,
                 initialization: facts::InitializationPolicy::MayBeAbsent,
                 default: facts::DefaultFact::Missing,
                 descriptor: facts::DescriptorFact::default(),
-            });
+            };
+            self.field_nominal_bindings(
+                &exported,
+                declaration,
+                &own_reference,
+                &mut field_bindings,
+            );
+            fields.push(exported);
         }
         let mut methods = BTreeMap::new();
         let mut class_members = BTreeMap::new();
@@ -1746,6 +1886,7 @@ impl<'db> Exporter<'db> {
             facts::ClassOpenness::OpenSubclassFamily
         };
         class_uncertainty.insert(facts::UncertaintyReason::OpenWorld);
+        self.module.nominal_bindings.extend(field_bindings);
         self.module.classes.push(facts::ClassTypeFact {
             identity: identity.clone(),
             bases,
@@ -1785,6 +1926,113 @@ impl<'db> Exporter<'db> {
         let class = scope.node(self.db).as_class()?;
         let definition = index.expect_single_definition(class);
         self.class_reference(original_class_type(self.db, definition)?)
+    }
+
+    fn enclosing_class_scope(&self, mut scope: ScopeId<'db>) -> Option<ScopeId<'db>> {
+        loop {
+            if matches!(scope.node(self.db), NodeWithScopeKind::Class(_)) {
+                return Some(scope);
+            }
+            scope = scope
+                .scope(self.db)
+                .parent()?
+                .to_scope_id(self.db, scope.program_file(self.db));
+        }
+    }
+
+    fn enclosing_class_for_scope(&self, scope: ScopeId<'db>) -> Option<facts::ClassReference> {
+        self.class_for_scope(self.enclosing_class_scope(scope)?)
+    }
+
+    fn unique_implicit_annotation(
+        &self,
+        declaration: Option<Definition<'db>>,
+        name: &str,
+    ) -> Option<Definition<'db>> {
+        let declaration = declaration?;
+        if !matches!(
+            declaration.kind(self.db),
+            DefinitionKind::AnnotatedAssignment(_)
+        ) {
+            return None;
+        }
+        let scope = declaration.scope(self.db);
+        let class_scope = self.enclosing_class_scope(scope)?;
+        if scope == class_scope {
+            return Some(declaration);
+        }
+        // Ordinary instance-member inference intentionally chooses the first
+        // annotated method. That type is useful, but it does not prove a unique
+        // nominal binding source when other methods also annotate this field.
+        // Use the real semantic declaration query; do not scan annotation text
+        // or manufacture a source identity from the selected display type.
+        let mut found = false;
+        for (declarations, _) in crate::attribute_declarations(self.db, class_scope, name) {
+            for candidate in
+                declarations.filter_map(|declaration| declaration.declaration.definition())
+            {
+                if !matches!(
+                    candidate.kind(self.db),
+                    DefinitionKind::AnnotatedAssignment(_)
+                ) {
+                    continue;
+                }
+                if candidate != declaration {
+                    return None;
+                }
+                found = true;
+            }
+        }
+        found.then_some(declaration)
+    }
+
+    fn field_annotation_definition(
+        &self,
+        declaration: Option<Definition<'db>>,
+    ) -> Option<facts::SourceIdentity> {
+        let declaration = declaration?;
+        matches!(
+            declaration.kind(self.db),
+            DefinitionKind::AnnotatedAssignment(_)
+        )
+        .then(|| self.definition(declaration))
+        .flatten()
+    }
+
+    fn field_nominal_bindings(
+        &self,
+        field: &facts::FieldTypeFact,
+        declaration: Option<Definition<'db>>,
+        owning_class: &facts::ClassReference,
+        output: &mut Vec<facts::NominalBindingFact>,
+    ) {
+        // Inherited fields keep their original declaration and binding plan;
+        // a child namespace cannot re-authorize the base's actual targets.
+        if field.annotation_origin != facts::AnnotationOrigin::Explicit
+            || &field.declaring_class != owning_class
+        {
+            return;
+        }
+        let Some(reference) = field.annotation_reference() else {
+            return;
+        };
+        let Some(declaration) = declaration else {
+            return;
+        };
+        if declaration.program_file(self.db) != self.model.program_file() {
+            return;
+        }
+        let DefinitionKind::AnnotatedAssignment(assignment) = declaration.kind(self.db) else {
+            return;
+        };
+        let parsed = parsed_module(self.db, declaration.python_file(self.db)).load(self.db);
+        self.nominal_annotation_leaves(
+            &self.model,
+            &facts::NominalBindingOwner::Field { field: reference },
+            assignment.annotation(&parsed),
+            &field.value_type,
+            output,
+        );
     }
 
     fn field_annotation_origin(
