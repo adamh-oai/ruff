@@ -1952,6 +1952,40 @@ impl<'db> StaticClassLiteral<'db> {
                     specialization.map(|s| s.generic_context(db)),
                 )
             }
+            (field_policy @ CodeGeneratorKind::DataclassLike(_), "__repr__") => {
+                if !self.has_dataclass_param(db, field_policy, DataclassFlags::REPR) {
+                    return None;
+                }
+
+                let signature = Signature::new(
+                    Parameters::standard([Parameter::positional_or_keyword(Name::new_static(
+                        "self",
+                    ))
+                    .with_annotated_type(instance_ty)]),
+                    KnownClass::Str.to_instance(db, env),
+                );
+
+                Some(Type::function_like_callable(db, signature))
+            }
+            (field_policy @ CodeGeneratorKind::DataclassLike(_), "__eq__") => {
+                if !self.has_dataclass_param(db, field_policy, DataclassFlags::EQ) {
+                    return None;
+                }
+
+                let signature = Signature::new(
+                    Parameters::standard([
+                        Parameter::positional_or_keyword(Name::new_static("self"))
+                            .with_annotated_type(instance_ty),
+                        // Unlike ordering, equality accepts an unrelated object and can
+                        // delegate to its reflected comparison via NotImplemented.
+                        Parameter::positional_or_keyword(Name::new_static("other"))
+                            .with_annotated_type(KnownClass::Object.to_instance(db, env)),
+                    ]),
+                    KnownClass::Bool.to_instance(db, env),
+                );
+
+                Some(Type::function_like_callable(db, signature))
+            }
             (
                 field_policy @ CodeGeneratorKind::DataclassLike(_),
                 "__lt__" | "__le__" | "__gt__" | "__ge__",

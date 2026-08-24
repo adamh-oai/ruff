@@ -24,8 +24,9 @@ use ty_module_resolver::file_to_module;
 use ty_python_core::{
     AnalysisDialect, ProgramFile,
     definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind},
+    place_table,
     scope::{NodeWithScopeKind, ScopeId},
-    semantic_index,
+    semantic_index, use_def_map,
 };
 
 mod framework;
@@ -42,7 +43,7 @@ use super::{
     list_members::all_end_of_scope_members,
     signatures::{Parameter as TyParameter, ParameterKind as TyParameterKind},
 };
-use crate::place::{Place, TypeOrigin};
+use crate::place::{Place, TypeOrigin, place_from_bindings};
 use crate::{Db, HasDefinition, HasType, SemanticModel};
 
 /// An owned source path, never a Salsa file key. Virtual editor files are not
@@ -1652,6 +1653,9 @@ impl<'db> Exporter<'db> {
             }
         }
         if let Some(transform) = &mut transform {
+            let body_scope = class.body_scope(db);
+            let body_places = place_table(db, body_scope);
+            let body_use_def = use_def_map(db, body_scope);
             for name in [
                 "__init__",
                 "__repr__",
@@ -1666,7 +1670,21 @@ impl<'db> Exporter<'db> {
                 "__delattr__",
                 "__replace__",
             ] {
-                if methods.contains_key(name) {
+                // The ordinary member query tries the actual own binding before
+                // synthesis. Preserve that precedence here too, including lambdas
+                // and non-function assignments. An annotation alone is not a
+                // runtime binding and does not suppress dataclass generation.
+                let has_own_binding = body_places.symbol_id(name).is_some_and(|symbol| {
+                    place_from_bindings(
+                        db,
+                        &self.env,
+                        body_use_def.end_of_scope_symbol_bindings(symbol),
+                    )
+                    .place
+                    .ignore_possibly_undefined()
+                    .is_some()
+                });
+                if has_own_binding {
                     continue;
                 }
                 if let Some(ty) = class.own_synthesized_member(db, &self.env, None, None, name)

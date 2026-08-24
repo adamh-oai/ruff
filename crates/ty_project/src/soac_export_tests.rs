@@ -1128,6 +1128,254 @@ class Record(Base):
 }
 
 #[test]
+fn soac_dataclass_comparison_catalog_uses_generated_signatures_and_own_options() {
+    let facts = export(
+        r#"from __future__ import strict
+from dataclasses import dataclass
+@dataclass
+class Base:
+    value: int = 1
+@dataclass
+class Child(Base):
+    extra: int = 2
+class Inherited(Base):
+    pass
+@dataclass(repr=False, eq=False)
+class Disabled(Base):
+    pass
+@dataclass(repr=False)
+class EqualityOnly:
+    value: int = 1
+@dataclass(eq=False)
+class ReprOnly:
+    value: int = 1
+"#,
+    );
+    for (class_name, repr, eq) in [
+        ("Base", true, true),
+        ("Child", true, true),
+        ("Inherited", false, false),
+        ("Disabled", false, false),
+        ("EqualityOnly", false, true),
+        ("ReprOnly", true, false),
+    ] {
+        let record = class(&facts, class_name);
+        for (name, generated, parameter_names, return_type) in [
+            ("__repr__", repr, &["self"][..], BuiltinType::Str),
+            ("__eq__", eq, &["self", "other"][..], BuiltinType::Bool),
+        ] {
+            let method = record.methods.iter().find(|method| method.name == name);
+            assert_eq!(method.is_some(), generated, "{class_name}.{name}");
+            assert_eq!(
+                record
+                    .transform
+                    .as_ref()
+                    .is_some_and(|transform| transform.generated_methods.contains(name)),
+                generated,
+                "{class_name}.{name} must be in its own generated catalog only"
+            );
+            let Some(method) = method else { continue };
+            let origin = method.generated.as_ref().unwrap();
+            assert_eq!(origin.class.definition, record.identity);
+            assert_eq!(origin.name, name);
+            assert!(method.implementation.is_none());
+            assert_eq!(
+                method
+                    .signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.name.as_str())
+                    .collect::<Vec<_>>(),
+                parameter_names
+            );
+            for parameter in &method.signature.parameters {
+                assert_eq!(parameter.kind, ParameterKind::PositionalOrKeyword);
+                assert_eq!(parameter.default, DefaultFact::Missing);
+                assert_eq!(parameter.annotation_origin, AnnotationOrigin::Inferred);
+            }
+            assert_eq!(
+                method.signature.return_type,
+                StaticType::NominalBuiltin {
+                    builtin: return_type,
+                    allow_subclasses: true,
+                }
+            );
+            assert_eq!(
+                method.signature.return_annotation_origin,
+                AnnotationOrigin::Inferred,
+                "synthetic return typing is not a source annotation"
+            );
+            if name == "__eq__" {
+                assert_eq!(
+                    method.signature.parameters[1].value_type,
+                    StaticType::NominalBuiltin {
+                        builtin: BuiltinType::Object,
+                        allow_subclasses: true,
+                    },
+                    "dataclass equality accepts foreign objects too"
+                );
+            }
+        }
+        assert!(
+            !record
+                .transform
+                .as_ref()
+                .is_some_and(|transform| { transform.generated_methods.contains("__ne__") }),
+            "dataclasses do not generate __ne__"
+        );
+    }
+}
+
+#[test]
+fn soac_dataclass_comparison_catalog_preserves_explicit_and_assigned_overrides() {
+    let facts = export(
+        r#"from __future__ import strict
+from dataclasses import dataclass
+@dataclass
+class Explicit:
+    value: int = 1
+    def __repr__(self) -> str:
+        return "explicit"
+    def __eq__(self, other: object) -> bool:
+        return self is other
+@dataclass
+class Assigned:
+    value: int = 1
+    __repr__ = lambda self: "assigned"
+    __eq__ = lambda self, other: False
+"#,
+    );
+    for class_name in ["Explicit", "Assigned"] {
+        let record = class(&facts, class_name);
+        let transform = record.transform.as_ref().unwrap();
+        for name in ["__repr__", "__eq__"] {
+            assert!(!transform.generated_methods.contains(name));
+            if class_name == "Explicit" {
+                let method = record
+                    .methods
+                    .iter()
+                    .find(|method| method.name == name)
+                    .unwrap();
+                assert!(method.generated.is_none());
+                assert_eq!(
+                    method.implementation.as_ref().unwrap().lexical_qualname,
+                    format!("{class_name}.{name}")
+                );
+                assert_eq!(
+                    method.signature.return_annotation_origin,
+                    AnnotationOrigin::Explicit
+                );
+            } else {
+                assert!(!record.methods.iter().any(|method| method.name == name));
+                let member = record
+                    .class_members
+                    .iter()
+                    .find(|member| member.name == name)
+                    .unwrap();
+                assert!(matches!(member.value_type, StaticType::Callable(_)));
+                assert!(member.definition.is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn soac_dataclass_comparison_catalog_distinguishes_declarations_from_live_bindings() {
+    let declared = export(
+        r#"from __future__ import strict
+from dataclasses import dataclass
+from typing import Callable, ClassVar
+@dataclass
+class DeclaredOnly:
+    __repr__: ClassVar[Callable[[object], str]]
+    __eq__: ClassVar[Callable[[object, object], bool]]
+"#,
+    );
+    let deleted_source = r#"from __future__ import strict
+from dataclasses import dataclass
+@dataclass
+class Deleted:
+    def __repr__(self) -> str:
+        return "removed"
+    def __eq__(self, other: object) -> bool:
+        return False
+    del __repr__, __eq__
+"#;
+    let db = database(deleted_source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let diagnostics = ty_python_semantic::Db::check_file(&db, file);
+    // TODO: The preexisting override checker combines bound and unbound method
+    // views after `del`, rejecting this native-valid source. The raw prediction
+    // still describes generation, but this is deliberately not an admission test.
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .id()
+            .as_lint()
+            .is_some_and(|name| name.as_str() == "invalid-method-override")
+    }));
+    let deleted =
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    assert!(
+        deleted
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    );
+    for (facts, class_name) in [(&declared, "DeclaredOnly"), (&deleted, "Deleted")] {
+        let record = class(facts, class_name);
+        for name in ["__repr__", "__eq__"] {
+            assert!(
+                record
+                    .transform
+                    .as_ref()
+                    .unwrap()
+                    .generated_methods
+                    .contains(name),
+                "{class_name}.{name}: methods={:?}, class_members={:?}",
+                record.methods,
+                record.class_members
+            );
+            assert!(
+                record
+                    .methods
+                    .iter()
+                    .find(|method| method.name == name)
+                    .unwrap()
+                    .generated
+                    .is_some()
+            );
+        }
+    }
+
+    let db = database(
+        "from __future__ import strict\nfrom dataclasses import dataclass\n@dataclass\nclass NonCallable:\n    __repr__ = 42\n    __eq__ = None\nNonCallable().__repr__()\n",
+        AnalysisDialect::SoacStrictV1,
+        false,
+    );
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let facts =
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    assert!(
+        facts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    );
+    let record = class(&facts, "NonCallable");
+    for name in ["__repr__", "__eq__"] {
+        assert!(
+            !record
+                .transform
+                .as_ref()
+                .unwrap()
+                .generated_methods
+                .contains(name)
+        );
+        assert!(!record.methods.iter().any(|method| method.name == name));
+    }
+}
+
+#[test]
 fn soac_export_uses_checker_dataclass_fields_options_and_synthesized_signature() {
     let facts = export(
         "from __future__ import strict\nfrom dataclasses import dataclass, field, InitVar\nfrom typing import ClassVar\n@dataclass\nclass Base:\n    first: int = 1\n@dataclass(slots=True, kw_only=True)\nclass Child(Base):\n    value: str = 'x'\n    temporary: InitVar[int] = 2\n    shared: ClassVar[int] = 3\n    items: list[int] = field(default_factory=list)\n",

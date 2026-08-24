@@ -28,7 +28,7 @@ reveal_type(alice1.age)  # revealed: int | None
 reveal_type(repr(alice1))  # revealed: str
 
 reveal_type(alice1 == alice2)  # revealed: bool
-reveal_type(alice1 == "Alice")  # revealed: Literal[False]
+reveal_type(alice1 == "Alice")  # revealed: bool
 
 bob = Person("Bob")
 bob2 = Person("Bob", None)
@@ -398,6 +398,17 @@ class WithoutRepr:
 reveal_type(WithoutRepr(1).__repr__)  # revealed: bound method WithoutRepr.__repr__() -> str
 ```
 
+The generated method has a normal `self` parameter, rather than the inherited
+`object.__repr__` signature:
+
+```py
+@dataclass
+class WithRepr:
+    x: int
+
+WithRepr.__repr__(self=WithRepr(1))
+```
+
 ### `eq`
 
 The same is true for `__eq__`. Setting `eq=False` disables the generated `__eq__` method, but
@@ -411,6 +422,27 @@ class WithoutEq:
     x: int
 
 reveal_type(WithoutEq(1) == WithoutEq(2))  # revealed: bool
+```
+
+The generated method accepts `other` as a keyword, including an unrelated object.
+An explicit method in the class body still takes precedence over synthesis:
+
+```py
+@dataclass
+class WithEq:
+    x: int
+
+WithEq.__eq__(self=WithEq(1), other=object())
+WithEq(1).__eq__(other="foreign")
+
+@dataclass
+class ExplicitEq:
+    x: int
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+ExplicitEq(1).__eq__(other=object())
 ```
 
 ### `order`
@@ -2833,9 +2865,9 @@ The generated methods have the following signatures:
 ```py
 reveal_type(Person.__init__)  # revealed: (self: Person, name: str, age: int | None = None) -> None
 
-reveal_type(Person.__repr__)  # revealed: def __repr__(self) -> str
+reveal_type(Person.__repr__)  # revealed: (self: Person) -> str
 
-reveal_type(Person.__eq__)  # revealed: def __eq__(self, value: object, /) -> bool
+reveal_type(Person.__eq__)  # revealed: (self: Person, other: object) -> bool
 ```
 
 ## Function-like behavior of synthesized methods
