@@ -1555,6 +1555,150 @@ class Deleted:
 }
 
 #[test]
+fn soac_dataclass_kw_only_markers_are_not_storage_fields() {
+    let source = r#"from __future__ import strict
+from dataclasses import dataclass, KW_ONLY as Marker
+from typing import ClassVar
+@dataclass(init=False)
+class Record:
+    first: int = 1
+    shared: ClassVar[int] = 2
+    delimiter: Marker
+    after: str = "value"
+@dataclass
+class WithInit:
+    first: int = 1
+    arbitrary_marker_name: Marker
+    after: int = 2
+@dataclass
+class Base:
+    delimiter: int = 3
+@dataclass(init=False)
+class Child(Base):
+    delimiter: Marker
+    after: int = 4
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace("import strict", "import strict, annotations"),
+    ] {
+        let facts = export(&source);
+        let record = class(&facts, "Record");
+        assert!(
+            !record
+                .transform
+                .as_ref()
+                .unwrap()
+                .dataclass_options
+                .as_ref()
+                .unwrap()
+                .init
+        );
+        assert!(
+            record
+                .instance_fields
+                .iter()
+                .all(|field| field.name != "delimiter")
+        );
+        assert_eq!(
+            record
+                .instance_fields
+                .iter()
+                .filter(|field| field.field_kind != FieldKind::ClassVariable)
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "after"]
+        );
+        assert_eq!(
+            record
+                .instance_fields
+                .iter()
+                .find(|field| field.name == "shared")
+                .unwrap()
+                .field_kind,
+            FieldKind::ClassVariable
+        );
+        let with_init = class(&facts, "WithInit");
+        assert!(
+            with_init
+                .instance_fields
+                .iter()
+                .all(|field| field.name != "arbitrary_marker_name")
+        );
+        let init = with_init
+            .methods
+            .iter()
+            .find(|method| method.name == "__init__")
+            .unwrap();
+        assert_eq!(
+            init.signature
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == "after")
+                .unwrap()
+                .kind,
+            ParameterKind::KeywordOnly
+        );
+        let child = class(&facts, "Child");
+        let inherited = child
+            .instance_fields
+            .iter()
+            .find(|field| field.name == "delimiter")
+            .unwrap();
+        assert_eq!(
+            inherited.declaring_class.definition.lexical_qualname,
+            "Base"
+        );
+        assert_eq!(
+            inherited.value_type,
+            StaticType::NominalBuiltin {
+                builtin: BuiltinType::Int,
+                allow_subclasses: true
+            }
+        );
+    }
+}
+
+#[test]
+fn soac_dataclass_kw_only_exclusion_uses_semantic_marker_and_generator_role() {
+    let source = r#"from __future__ import strict
+from dataclasses import dataclass, KW_ONLY as Marker
+class Plain:
+    delimiter: Marker
+class KW_ONLY:
+    pass
+@dataclass
+class Namesake:
+    real: KW_ONLY
+@dataclass
+class FieldName:
+    KW_ONLY: int = 5
+"#;
+    let facts = export(source);
+    assert!(
+        class(&facts, "Plain")
+            .instance_fields
+            .iter()
+            .any(|field| field.name == "delimiter")
+    );
+    let field = &class(&facts, "Namesake").instance_fields[0];
+    assert_eq!(field.name, "real");
+    let StaticType::NominalClass(reference) = &field.value_type else {
+        panic!("a user class named KW_ONLY is a real nominal field");
+    };
+    assert_eq!(reference.definition.lexical_qualname, "KW_ONLY");
+    let fields = &class(&facts, "FieldName").instance_fields;
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "KW_ONLY");
+    assert_eq!(
+        fields[0].value_type,
+        StaticType::NominalBuiltin {
+            builtin: BuiltinType::Int,
+            allow_subclasses: true
+        }
+    );
+}
+#[test]
 fn soac_export_uses_checker_dataclass_fields_options_and_synthesized_signature() {
     let facts = export(
         "from __future__ import strict\nfrom dataclasses import dataclass, field, InitVar\nfrom typing import ClassVar\n@dataclass\nclass Base:\n    first: int = 1\n@dataclass(slots=True, kw_only=True)\nclass Child(Base):\n    value: str = 'x'\n    temporary: InitVar[int] = 2\n    shared: ClassVar[int] = 3\n    items: list[int] = field(default_factory=list)\n",

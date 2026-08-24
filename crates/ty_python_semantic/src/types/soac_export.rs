@@ -1489,11 +1489,23 @@ impl<'db> Exporter<'db> {
         let mut field_names: BTreeSet<String> =
             fields.iter().map(|field| field.name.clone()).collect();
         for (name, qualifiers, declaration) in class.own_annotated_qualifiers(db) {
+            let declared = super::inferred_declaration(db, declaration);
+            // The generator's field query already removes KW_ONLY markers.
+            // Do not reintroduce one from the annotation-history append pass,
+            // including when no generated constructor exists. Only the actual
+            // dataclass-like role and semantic sentinel identity authorize this
+            // exclusion; ordinary annotations and namesakes remain real fields.
+            if generator.is_some_and(|generator| generator.is_dataclass_like())
+                && declared.declared().is_some_and(|declared| {
+                    declared.inner_type().is_instance_of(db, KnownClass::KwOnly)
+                })
+            {
+                continue;
+            }
             let name = name.to_string();
             if !field_names.insert(name.clone()) {
                 continue;
             }
-            let declared = super::inferred_declaration(db, declaration);
             let value_type = declared
                 .declared()
                 .map(|declared| self.value_type(declared.inner_type()))
