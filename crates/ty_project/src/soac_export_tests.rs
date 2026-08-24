@@ -51,7 +51,7 @@ pub(super) fn database_with_options(
     db
 }
 
-fn export_from(db: &ProjectDatabase) -> ModuleTypeFacts {
+fn export_proposal_from(db: &ProjectDatabase) -> ModuleTypeFacts {
     let file = system_path_to_file(db, "/project/main.py").unwrap();
     let exported = export_soac_module(db, file, "main", ResolvedStrictPolicy::default()).unwrap();
     let mut facts = exported.facts;
@@ -70,7 +70,12 @@ fn export_from(db: &ProjectDatabase) -> ModuleTypeFacts {
             type_contract: None,
         })
         .collect();
-    let facts = facts.canonicalized().unwrap();
+    facts.canonicalized().unwrap()
+}
+
+fn export_from(db: &ProjectDatabase) -> ModuleTypeFacts {
+    let facts = export_proposal_from(db);
+    let file = system_path_to_file(db, "/project/main.py").unwrap();
     let source = ruff_db::source::source_text(db, file);
     validate_module_facts(&facts, Some(source.as_bytes())).unwrap();
     facts
@@ -3509,7 +3514,7 @@ def invoke(name):
         assert_eq!(elements.iter().filter(|element| element.is_none(&db)).count(), 1);
     }
 
-    let facts = export_from(&db);
+    let facts = export_proposal_from(&db);
     let reader = &function(&facts, "read_name").identity;
     let site = facts.attribute_sites.iter().find(|site|
         &site.identity.enclosing_function == reader && site.name == "__name__"
@@ -3534,6 +3539,11 @@ def invoke(name):
     assert_eq!(calls[0].binding, CallBindingFact::Dynamic);
     assert_eq!(calls[0].uncertainty, CallUncertainty::Dynamic);
     assert_eq!(calls[0].candidate_targets, vec![CallableTargetFact::Dynamic]);
+    let actual_source = ruff_db::source::source_text(&db, file);
+    assert!(matches!(
+        validate_module_facts(&facts, Some(actual_source.as_bytes())),
+        Err(ContractError::BlockingDiagnostic(_))
+    ));
 }
 
 #[test]
@@ -3568,7 +3578,7 @@ def invalid():
             "{diagnostics:?}"
         );
         if strict {
-            let facts = export_from(&db);
+            let facts = export_proposal_from(&db);
             assert_eq!(
                 facts.diagnostics.iter().filter(|diagnostic|
                     diagnostic.code == DiagnosticCode::CheckerError
@@ -3577,6 +3587,11 @@ def invalid():
                 ).count(),
                 3
             );
+            let actual_source = ruff_db::source::source_text(&db, file);
+            assert!(matches!(
+                validate_module_facts(&facts, Some(actual_source.as_bytes())),
+                Err(ContractError::BlockingDiagnostic(_))
+            ));
         }
     }
 }
@@ -3614,7 +3629,7 @@ def invalid(sys: Namespace, registry: dict[str, ModuleType]):
             "{diagnostics:?}"
         );
         if strict {
-            let facts = export_from(&db);
+            let facts = export_proposal_from(&db);
             assert_eq!(
                 facts.diagnostics.iter().filter(|diagnostic|
                     diagnostic.code == DiagnosticCode::CheckerError
@@ -3623,6 +3638,11 @@ def invalid(sys: Namespace, registry: dict[str, ModuleType]):
                 ).count(),
                 2
             );
+            let actual_source = ruff_db::source::source_text(&db, file);
+            assert!(matches!(
+                validate_module_facts(&facts, Some(actual_source.as_bytes())),
+                Err(ContractError::BlockingDiagnostic(_))
+            ));
         }
     }
 }
