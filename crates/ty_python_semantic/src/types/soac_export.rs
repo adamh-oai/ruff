@@ -510,6 +510,8 @@ impl<'db> Exporter<'db> {
         let program_file = definition.program_file(db);
         let parsed = parsed_module(db, program_file.python_file(db)).load(db);
         let (kind, name) = match definition.kind(db) {
+            // Compiler-tail metadata has no source assignment or executable binding receipt.
+            DefinitionKind::ClassStaticAttributes(_) => return None,
             DefinitionKind::Class(node) => (
                 facts::DefinitionKind::Class,
                 node.node(&parsed).name.to_string(),
@@ -1806,7 +1808,19 @@ impl<'db> Exporter<'db> {
         let mut methods = BTreeMap::new();
         let mut class_members = BTreeMap::new();
         let class_places = place_table(db, class.body_scope(db));
+        let class_bindings = use_def_map(db, class.body_scope(db));
         for member in all_end_of_scope_members(db, class.body_scope(db)) {
+            if class_places.symbol_id(member.member.name.as_str()).is_some_and(|symbol| {
+                class_bindings.end_of_scope_symbol_bindings(symbol).any(|binding| {
+                    binding.binding.definition().is_some_and(|definition| {
+                        matches!(definition.kind(db), DefinitionKind::ClassStaticAttributes(_))
+                    })
+                })
+            }) {
+                // A compiler-created metadata value is not a user-authored class default or a
+                // layout/field capability. Do not relabel its overwritten source predecessor.
+                continue;
+            }
             // A class body can write a global or nonlocal cell, but that does not
             // install a binding in its prepared namespace. The scope iterator
             // includes those writes for flow analysis; they are not members.

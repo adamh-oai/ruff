@@ -1221,6 +1221,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             DefinitionKind::Class(class) => {
                 self.infer_class_definition(class.node(self.module()), definition);
             }
+            DefinitionKind::ClassStaticAttributes(class) => {
+                let db = self.db();
+                let env = self.program_environment();
+                let ty = Type::homogeneous_tuple(db, env, KnownClass::Str.to_instance(db, env));
+                self.add_binding(class.node(self.module()).into(), definition)
+                    .insert(self, ty);
+            }
             DefinitionKind::TypeAlias(type_alias) => {
                 self.infer_type_alias_definition(type_alias.node(self.module()), definition);
             }

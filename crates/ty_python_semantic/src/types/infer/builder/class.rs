@@ -8,7 +8,7 @@ use crate::types::{
     callable::CallableFunctionProvenance,
     function::KnownFunction,
     infer::{
-        TypeInferenceBuilder,
+        TypeInferenceBuilder, infer_definition_types,
         builder::{DeclaredAndInferredType, DeferredExpressionState},
         original_class_type,
     },
@@ -16,11 +16,34 @@ use crate::types::{
 };
 use ruff_python_ast::{self as ast, helpers::any_over_expr};
 use ty_module_resolver::{ImportingFile, KnownModule, file_to_module};
-use ty_python_core::{definition::Definition, scope::NodeWithScopeRef};
+use ty_python_core::{
+    definition::{Definition, DefinitionKind},
+    scope::NodeWithScopeRef,
+};
 
 impl<'db> TypeInferenceBuilder<'db, '_> {
     pub(super) fn infer_class_body(&mut self, class: &ast::StmtClassDef) {
         self.infer_body(&class.body);
+        let scope = self.scope().file_scope_id(self.db());
+        let table = self.index.place_table(scope);
+        let tail = table.symbol_id("__static_attributes__").and_then(|symbol| {
+            self.index
+                .use_def_map(scope)
+                .end_of_scope_symbol_bindings(symbol)
+                .filter_map(|binding| binding.binding.definition())
+                .find(|definition| {
+                    matches!(
+                        definition.kind(self.db()),
+                        DefinitionKind::ClassStaticAttributes(_)
+                    )
+                })
+        });
+        if let Some(definition) = tail {
+            // Infer the real end-of-body binding even if no later source expression reads it.
+            // This also checks an explicit incompatible declaration through normal assignment
+            // inference, without publishing the metadata to earlier body expressions.
+            self.extend_definition(definition, infer_definition_types(self.db(), definition));
+        }
     }
 
     pub(super) fn infer_class_type_params(&mut self, class: &ast::StmtClassDef) {

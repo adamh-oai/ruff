@@ -2727,7 +2727,8 @@ mod resolve_definition {
                 };
                 name.id.as_str()
             }
-            DefinitionKind::TypeAlias(_)
+            DefinitionKind::ClassStaticAttributes(_)
+            | DefinitionKind::TypeAlias(_)
             | DefinitionKind::Import(_)
             | DefinitionKind::ImportFrom(_)
             | DefinitionKind::ImportFromSubmodule(_)

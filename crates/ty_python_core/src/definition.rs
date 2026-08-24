@@ -928,6 +928,9 @@ pub enum DefinitionKind<'db> {
     StarImport(StarImportDefinitionKind),
     Function(AstNodeRef<ast::StmtFunctionDef>),
     Class(AstNodeRef<ast::StmtClassDef>),
+    /// Compiler-owned, inferred namespace binding emitted after the original class body.
+    /// Not a source assignment, declaration, instance field, or runtime capability.
+    ClassStaticAttributes(AstNodeRef<ast::StmtClassDef>),
     TypeAlias(AstNodeRef<ast::StmtTypeAlias>),
     NamedExpression(AstNodeRef<ast::ExprNamed>),
     Assignment(AssignmentDefinitionKind<'db>),
@@ -952,6 +955,7 @@ pub enum DefinitionKind<'db> {
 impl<'db> DefinitionKind<'db> {
     pub(crate) fn is_reexported(&self) -> bool {
         match self {
+            DefinitionKind::ClassStaticAttributes(_) => false,
             DefinitionKind::Import(import) => import.is_reexported(),
             DefinitionKind::ImportFrom(import) => import.is_reexported(),
             DefinitionKind::ImportFromSubmodule(_) => true,
@@ -1007,11 +1011,13 @@ impl<'db> DefinitionKind<'db> {
     }
 
     /// Returns `true` if this definition is user-visible (i.e., not an internal
-    /// synthetic definition like a loop header or nested bindings definition).
+    /// compiler-tail binding, loop header, or nested bindings definition).
     pub const fn is_user_visible(&self) -> bool {
         !matches!(
             self,
-            DefinitionKind::LoopHeader(_) | DefinitionKind::NestedBindings(_)
+            DefinitionKind::ClassStaticAttributes(_)
+                | DefinitionKind::LoopHeader(_)
+                | DefinitionKind::NestedBindings(_)
         )
     }
 
@@ -1027,6 +1033,9 @@ impl<'db> DefinitionKind<'db> {
             DefinitionKind::StarImport(import) => import.alias(module).range(),
             DefinitionKind::Function(function) => function.node(module).name.range(),
             DefinitionKind::Class(class) => class.node(module).name.range(),
+            DefinitionKind::ClassStaticAttributes(class) => {
+                TextRange::empty(class.node(module).range().end())
+            }
             DefinitionKind::TypeAlias(type_alias) => type_alias.node(module).name.range(),
             DefinitionKind::NamedExpression(named) => named.node(module).target.range(),
             DefinitionKind::Assignment(assignment) => assignment.target(module).range(),
@@ -1077,6 +1086,9 @@ impl<'db> DefinitionKind<'db> {
             DefinitionKind::StarImport(import) => import.import(module).range(),
             DefinitionKind::Function(function) => function.node(module).range(),
             DefinitionKind::Class(class) => class.node(module).range(),
+            DefinitionKind::ClassStaticAttributes(class) => {
+                TextRange::empty(class.node(module).range().end())
+            }
             DefinitionKind::TypeAlias(type_alias) => type_alias.node(module).range(),
             DefinitionKind::NamedExpression(named) => named.node(module).range(),
             DefinitionKind::Assignment(assign) => {
@@ -1150,7 +1162,8 @@ impl<'db> DefinitionKind<'db> {
                 }
             }
             // all of these bind values without declaring a type
-            DefinitionKind::DictKeyAssignment(_)
+            DefinitionKind::ClassStaticAttributes(_)
+            | DefinitionKind::DictKeyAssignment(_)
             | DefinitionKind::NamedExpression(_)
             | DefinitionKind::Assignment(_)
             | DefinitionKind::AugmentedAssignment(_)

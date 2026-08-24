@@ -67,7 +67,7 @@ use crate::use_def::{
 };
 use crate::{Db, Statement, StatementNodeKey};
 use crate::{
-    DefinitionsByNode, EvaluationMode, ExpressionsScopeMap, LoopHeader, LoopHeaderId,
+    DefinitionsByNode, DescendantsIter, EvaluationMode, ExpressionsScopeMap, LoopHeader, LoopHeaderId,
     NarrowingAliasPredicate, PossiblyNarrowedPlaces, SemanticIndex, VisibleAncestorsIter,
 };
 use crate::{HasTrackedScope, ImplicitClassCell};
@@ -807,7 +807,14 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     ///     inner2()
     /// ```
     fn update_lazy_snapshots(&mut self, symbol: ScopedSymbolId) {
-        let current_scope = self.current_scope();
+        self.update_lazy_snapshots_in_scope(self.current_scope(), symbol);
+    }
+
+    fn update_lazy_snapshots_in_scope(
+        &mut self,
+        current_scope: FileScopeId,
+        symbol: ScopedSymbolId,
+    ) {
         let current_place_table = &self.place_tables[current_scope];
         let symbol = current_place_table.symbol(symbol);
         // Optimization: if this is the first binding of the symbol we've seen, there can't be any
@@ -3256,6 +3263,163 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         }
     }
 
+    /// Add the compiler's ordered class-tail store after original lexical scopes are complete.
+    ///
+    /// The store is absent from the source AST and from symtable's original local declarations:
+    /// its target can be a namespace, an explicit global, or a captured cell. In particular, a
+    /// method-only capture and a later enclosing local declaration must be resolved before adding
+    /// a namespace binding. Classify every scope before adding any compiler-created symbols.
+    fn bind_class_static_attributes(&mut self) {
+        if self.python_version < PythonVersion::PY313 || self.source_type.is_stub() {
+            return;
+        }
+
+        let classes = self
+            .scopes
+            .iter_enumerated()
+            .filter_map(|(scope, data)| {
+                let class = data.node().as_class()?;
+                self.class_static_attributes_are_namespace_bound(scope)
+                    .then(|| (scope, class.clone()))
+            })
+            .collect::<Vec<_>>();
+
+        for (scope, class) in classes {
+            let (symbol, added) = self.place_tables[scope]
+                .add_symbol(Symbol::new(Name::new_static("__static_attributes__")));
+            let place = symbol.into();
+            if added {
+                self.use_def_maps[scope].add_place(place);
+            }
+            self.place_tables[scope].mark_bound(place);
+            let definition = Definition::new(
+                self.db,
+                self.scope_ids_by_scope[scope],
+                place,
+                DefinitionKind::ClassStaticAttributes(class),
+                false,
+            );
+            // Earlier source uses and eager snapshots retain their bindings. Lazy snapshots
+            // follow the ordinary later-binding update below; no outer cell/global write is
+            // modeled by this namespace-only producer. Class symbols have no member kills.
+            self.use_def_maps[scope].record_binding(
+                place,
+                definition,
+                PreviousDefinitions::AreShadowed,
+                FutureDefinitions::ShadowThisOne,
+            );
+            self.update_lazy_snapshots_in_scope(scope, symbol);
+        }
+    }
+
+    fn class_static_attributes_are_namespace_bound(&self, class_scope: FileScopeId) -> bool {
+        const NAME: &str = "__static_attributes__";
+        let table = &self.place_tables[class_scope];
+        if let Some(symbol) = table.symbol_id(NAME).map(|id| table.symbol(id)) {
+            if symbol.is_global() || symbol.is_nonlocal() {
+                return false;
+            }
+            // Original class locals keep their namespace target even when a method forwards a
+            // distinct enclosing cell with the same name (CPython's DEF_FREE_CLASS).
+            if symbol.is_local() {
+                return true;
+            }
+            if symbol.is_used()
+                && self.static_attributes_enclosing_local(class_scope).is_some()
+            {
+                return false;
+            }
+        }
+
+        for (scope, data) in DescendantsIter::new(&self.scopes, class_scope) {
+            let table = &self.place_tables[scope];
+            let Some(symbol) = table.symbol_id(NAME).map(|id| table.symbol(id)) else {
+                continue;
+            };
+
+            if symbol.is_local()
+                && matches!(
+                    data.node(),
+                    NodeWithScopeKind::ListComprehension(_)
+                        | NodeWithScopeKind::SetComprehension(_)
+                        | NodeWithScopeKind::DictComprehension(_)
+                )
+            {
+                // An inlined comprehension can import a captured CELL into the class's native
+                // code unit, unlike a plain LOCAL loop variable. The index deliberately retains
+                // separate comprehension scopes, so do not claim a namespace store when an actual
+                // descendant can capture this local. Method/lambda/generator/helper code units
+                // are distinct from the class code unit.
+                let mut parent = data.parent();
+                while let Some(id) = parent {
+                    if !matches!(
+                        self.scopes[id].node(),
+                        NodeWithScopeKind::ListComprehension(_)
+                            | NodeWithScopeKind::SetComprehension(_)
+                            | NodeWithScopeKind::DictComprehension(_)
+                    ) {
+                        break;
+                    }
+                    parent = self.scopes[id].parent();
+                }
+                if parent == Some(class_scope)
+                    && DescendantsIter::new(&self.scopes, scope).any(|(nested, _)| {
+                        let table = &self.place_tables[nested];
+                        table.symbol_id(NAME).is_some_and(|id| {
+                            let symbol = table.symbol(id);
+                            !symbol.is_local()
+                                && !symbol.is_global()
+                                && (symbol.is_used() || symbol.is_nonlocal())
+                                && self.static_attributes_enclosing_local(nested) == Some(scope)
+                        })
+                    })
+                {
+                    return false;
+                }
+            }
+
+            if symbol.is_global()
+                || symbol.is_local()
+                || !(symbol.is_used() || symbol.is_nonlocal())
+            {
+                continue;
+            }
+            if self
+                .static_attributes_enclosing_local(scope)
+                .is_some_and(|owner| owner < class_scope)
+            {
+                // A child FREE passed through this class affects its compiler tail even when
+                // the class has no original symbol of its own. A child-local CELL does not.
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Resolve the original name through the existing completed lexical scopes, including the
+    /// explicit-global barrier. This is not a runtime capture layout or a second symbol table.
+    fn static_attributes_enclosing_local(&self, scope: FileScopeId) -> Option<FileScopeId> {
+        for (ancestor, _) in self.visible_ancestor_scopes(scope).skip(1) {
+            if ancestor.is_global() {
+                return None;
+            }
+            let table = &self.place_tables[ancestor];
+            let Some(symbol) = table
+                .symbol_id("__static_attributes__")
+                .map(|id| table.symbol(id))
+            else {
+                continue;
+            };
+            if symbol.is_global() {
+                return None;
+            }
+            if symbol.is_local() {
+                return Some(ancestor);
+            }
+        }
+        None
+    }
+
     pub(super) fn build(mut self) -> SemanticIndex<'db> {
         self.visit_body(self.module.suite());
 
@@ -3265,6 +3429,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         assert!(self.scope_stack.is_empty());
 
         assert_eq!(&self.current_assignments, &[]);
+        self.bind_class_static_attributes();
 
         let ast_ids = super::ast_ids::AstIds::from_builders(self.ast_ids);
 

@@ -33,6 +33,7 @@ fn should_consider_definition(kind: &DefinitionKind<'_>) -> bool {
         | DefinitionKind::StarImport(_)
         | DefinitionKind::Function(_)
         | DefinitionKind::Class(_)
+        | DefinitionKind::ClassStaticAttributes(_)
         | DefinitionKind::TypeAlias(_)
         | DefinitionKind::AugmentedAssignment(_)
         | DefinitionKind::DictKeyAssignment(_)
