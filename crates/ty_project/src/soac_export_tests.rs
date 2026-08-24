@@ -620,3 +620,151 @@ fn soac_export_explicit_interpreter_paths_do_not_guess_from_an_uninstalled_prefi
             .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
     );
 }
+
+fn inheritance_database(base: &str, unrelated_first: bool) -> (ProjectDatabase, TestSystem) {
+    let system = TestSystem::default();
+    system.memory_file_system().write_files_all([
+        ("/project/ty.toml", "[environment]\npython-version = '3.15'\n"),
+        ("/project/base.py", base),
+        ("/project/bridge.py", "from __future__ import strict\nfrom base import Base\nclass Middle(Base): pass\n"),
+        ("/project/main.py", "from __future__ import strict\nfrom bridge import Middle\nclass Child(Middle):\n    def __init__(self):\n        super().__init__()\n        self.own: int = 3\n"),
+        ("/project/ordinary.py", "class Foreign: pass\n"),
+        ("/project/unrelated.py", "class Unrelated: pass\n"),
+    ]).unwrap();
+    let metadata =
+        ProjectMetadata::discover(ruff_db::system::SystemPath::new("/project"), &system).unwrap();
+    let db = ProjectDatabase::fallible_with_analysis_dialect(
+        metadata,
+        system.clone(),
+        AnalysisDialect::SoacStrictV1,
+    )
+    .unwrap();
+    if unrelated_first {
+        let file = system_path_to_file(&db, "/project/unrelated.py").unwrap();
+        let _ = ty_python_semantic::Db::check_file(&db, file);
+    }
+    (db, system)
+}
+
+#[test]
+fn soac_export_external_strict_bases_are_semantic_proposals_not_mutable_by_location() {
+    let source = "from __future__ import strict\nclass Base:\n    def __init__(self):\n        self.inherited: int = 1\n";
+    let (first, _) = inheritance_database(source, false);
+    let (second, _) = inheritance_database(source, true);
+    let facts = export_from(&first);
+    assert_eq!(facts, export_from(&second));
+    let child = class(&facts, "Child");
+    assert_eq!(child.participation, ParticipationProposal::Candidate);
+    assert!(child.inheritance.complete);
+    assert_eq!(child.bases[0].definition.module.module_name, "bridge");
+    let ancestor = child
+        .inheritance
+        .linearized_bases
+        .iter()
+        .find(|base| base.definition.module.module_name == "base")
+        .unwrap();
+    let base_file = system_path_to_file(&first, "/project/base.py").unwrap();
+    let base =
+        export_soac_module(&first, base_file, "base", ResolvedStrictPolicy::default()).unwrap();
+    assert_eq!(ancestor.definition, base.facts.classes[0].identity);
+    assert_eq!(ancestor.source_digest, Fingerprint::digest(source));
+    assert!(
+        facts
+            .consumed_dependencies
+            .iter()
+            .any(|dependency| dependency.module == ancestor.definition.module
+                && dependency.source_digest == ancestor.source_digest)
+    );
+    assert!(!facts.function_has_statically_dynamic_class_owner(
+        &child.methods[0].implementation.clone().unwrap()
+    ));
+    assert_eq!(
+        child.instance_fields[0].annotation_origin,
+        AnnotationOrigin::Explicit
+    );
+}
+
+#[test]
+fn soac_export_external_strict_bases_propagate_real_dynamic_classification() {
+    for source in [
+        "class Base: pass\n",
+        "from __future__ import strict\nclass Meta(type): pass\nclass Base(metaclass=Meta): pass\n",
+        "from __future__ import strict\ndef dynamic[T](value: T) -> T: return value\n@dynamic\nclass Base: pass\n",
+        "from __future__ import strict\nclass Base:\n    value: int = 'bad'  # ty: ignore[invalid-assignment]\n",
+        "from __future__ import strict\nfrom ordinary import Foreign\nclass Base(Foreign): pass\n",
+        "from __future__ import strict\nclass Base:\n    def __getattr__(self, name: str) -> int: return 1\n",
+        "from __future__ import strict\nclass Descriptor:\n    def __get__(self, instance, owner): return 1\nclass Base:\n    item = Descriptor()\n",
+        // The caller does not know a different file's adapter policy. The
+        // importer must not authorize that transform with its own policy.
+        "from __future__ import strict\nfrom dataclasses import dataclass\n@dataclass\nclass Base:\n    value: int = 1\n",
+    ] {
+        let (db, _) = inheritance_database(source, false);
+        let facts = export_from(&db);
+        let child = class(&facts, "Child");
+        assert!(
+            matches!(&child.participation, ParticipationProposal::Dynamic(reasons)
+            if reasons.contains(&DynamicClassReason::MutableBase)),
+            "{source}"
+        );
+        assert!(
+            facts.function_has_statically_dynamic_class_owner(
+                &child.methods[0].implementation.clone().unwrap()
+            ),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn soac_export_external_base_ignores_remain_scoped_to_the_actual_owner() {
+    let source = "from __future__ import strict\nclass Damaged:\n    value: int = 'bad'  # ty: ignore[invalid-assignment]\nclass Base: pass\n";
+    let (db, _) = inheritance_database(source, false);
+    assert_eq!(
+        class(&export_from(&db), "Child").participation,
+        ParticipationProposal::Candidate
+    );
+}
+
+#[test]
+fn soac_export_external_base_source_changes_invalidate_transitive_queries() {
+    let source = "from __future__ import strict\nclass Base: pass\n";
+    let (mut db, system) = inheritance_database(source, false);
+    let initial = export_from(&db);
+    assert_eq!(
+        class(&initial, "Child").participation,
+        ParticipationProposal::Candidate
+    );
+    for changed in [
+        "class Base: pass\n",
+        "from __future__ import strict\ndef dynamic[T](value: T) -> T: return value\n@dynamic\nclass Base: pass\n",
+    ] {
+        system
+            .memory_file_system()
+            .write_file_all("/project/base.py", changed)
+            .unwrap();
+        db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+            "/project/base.py".into(),
+        )]);
+        let facts = export_from(&db);
+        assert_eq!(facts.module, initial.module);
+        assert!(
+            matches!(&class(&facts, "Child").participation, ParticipationProposal::Dynamic(reasons)
+            if reasons.contains(&DynamicClassReason::MutableBase))
+        );
+        assert!(
+            facts
+                .consumed_dependencies
+                .iter()
+                .any(|dependency| dependency.module.module_name == "base"
+                    && dependency.source_digest == Fingerprint::digest(changed))
+        );
+    }
+    system
+        .memory_file_system()
+        .write_file_all("/project/base.py", source)
+        .unwrap();
+    db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+        "/project/base.py".into(),
+    )]);
+    assert_eq!(export_from(&db), initial);
+}

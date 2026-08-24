@@ -34,7 +34,7 @@ pub(crate) use strict::register_lints;
 use super::{
     CallArguments, ClassBase, ClassLiteral, DataclassFlags, DynamicType, KnownClass,
     LiteralValueTypeKind, ProgramEnvironment, Signature, Type, TypeQualifiers,
-    class::{CodeGeneratorKind, FieldKind as TyFieldKind},
+    class::{CodeGeneratorKind, FieldKind as TyFieldKind, StaticClassLiteral},
     function::{FunctionDecorators, KnownFunction},
     infer::{infer_definition_types, original_class_type},
     list_members::all_end_of_scope_members,
@@ -94,6 +94,16 @@ pub fn export_soac_module(
     module_name: &str,
     policy: facts::ResolvedStrictPolicy,
 ) -> Result<SoacModuleExport, facts::ContractError> {
+    export_soac_module_impl(db, file, module_name, policy, true)
+}
+
+fn export_soac_module_impl(
+    db: &dyn Db,
+    file: File,
+    module_name: &str,
+    policy: facts::ResolvedStrictPolicy,
+    resolve_external_bases: bool,
+) -> Result<SoacModuleExport, facts::ContractError> {
     let program_file = db.program_file(file);
     if program_file.analysis_policy(db).dialect != AnalysisDialect::SoacStrictV1 {
         return Err(facts::ContractError::InvalidPolicy(
@@ -141,6 +151,7 @@ pub fn export_soac_module(
         dependencies: RefCell::new(BTreeMap::new()),
         invalid_dependency: Cell::new(false),
         used_suppressions: Vec::new(),
+        resolve_external_bases,
     };
     exporter.globals(program_file);
     exporter.visit_body(parsed.suite());
@@ -215,6 +226,62 @@ struct Exporter<'db> {
     dependencies: RefCell<BTreeMap<String, SoacSourceDependency>>,
     invalid_dependency: Cell<bool>,
     used_suppressions: Vec<crate::suppression::FileSuppressionId>,
+    /// The incremental base query first computes local proposals using this
+    /// same classifier, then combines the actual semantic MRO recursively.
+    /// Disabling this step internally avoids unrelated classes in an imported
+    /// module introducing artificial recursion into the selected base query.
+    resolve_external_bases: bool,
+}
+
+/// Class location is not evidence that its bindings remain mutable. Reuse the
+/// complete semantic classifier and suppression normalization for the defining
+/// file, then require candidate proposals throughout the real resolved MRO.
+/// The query publishes only a logical proposal, never runtime base authority.
+#[salsa::tracked(
+    returns(copy),
+    cycle_initial=|_, _, _| false,
+    heap_size=ruff_memory_usage::heap_size,
+)]
+fn external_strict_base_is_candidate<'db>(db: &'db dyn Db, class: StaticClassLiteral<'db>) -> bool {
+    let file = class.program_file(db);
+    let Some(module) = file_to_module(db, file.resolver_file(db)) else {
+        return false;
+    };
+    // The four-argument public export API has only the importing file's
+    // effective policy. Do not apply that policy to another file's transform.
+    // External dataclasses remain dynamic until an explicit per-file adapter
+    // policy context is available. Plain strict classes need no such adapter.
+    let mut policy = facts::ResolvedStrictPolicy::default();
+    policy.adapters.dataclasses = facts::StdlibDataclassPolicy::Dynamic;
+    let Ok(export) =
+        export_soac_module_impl(db, file.file(db), module.name(db).as_str(), policy, false)
+    else {
+        return false;
+    };
+    if export.facts.source_dialect != facts::SourceDialect::SoacStrict
+        || export.facts.diagnostics.iter().any(|diagnostic| {
+            !diagnostic.suppressed && diagnostic.severity == facts::DiagnosticSeverity::Error
+        })
+    {
+        return false;
+    }
+    let parsed = parsed_module(db, file.python_file(db)).load(db);
+    let definition_range = source_range(class.definition(db).kind(db).full_range(&parsed));
+    if !export.facts.classes.iter().any(|proposal| {
+        proposal.identity.source_range == definition_range
+            && proposal.participation == facts::ParticipationProposal::Candidate
+    }) || class.try_mro(db, None).is_err()
+    {
+        return false;
+    }
+    class.iter_mro(db, None).skip(1).all(|base| match base {
+        ClassBase::Class(base) if base.known(db) == Some(KnownClass::Object) => true,
+        ClassBase::Class(base) => base
+            .class_literal(db)
+            .as_static()
+            .is_some_and(|base| external_strict_base_is_candidate(db, base)),
+        _ => false,
+    })
 }
 
 fn source_range(range: TextRange) -> facts::SourceRange {
@@ -985,8 +1052,12 @@ impl<'db> Exporter<'db> {
         for base in class.iter_mro(db, None).skip(1) {
             if let ClassBase::Class(base) = base {
                 if let Some(reference) = self.class_reference(base.class_literal(db)) {
-                    if reference.definition.module.module_name != self.module.module.module_name
+                    if self.resolve_external_bases
                         && base.known(db) != Some(KnownClass::Object)
+                        && base.class_literal(db).as_static().is_none_or(|base| {
+                            base.file(db) != self.model.program_file().file(db)
+                                && !external_strict_base_is_candidate(db, base)
+                        })
                     {
                         reasons.insert(facts::DynamicClassReason::MutableBase);
                     }
