@@ -97,6 +97,173 @@ fn function<'a>(facts: &'a ModuleTypeFacts, name: &str) -> &'a FunctionTypeFact 
 }
 
 #[test]
+fn soac_nominal_bindings_preserve_semantic_aliases_slots_and_union_leaves() {
+    let source = "from __future__ import strict\nfrom typing import Optional, Union\nfrom external import Foreign as Alias\nclass Local: pass\nLocalAlias = Local\ndef combine(a: Local, b: Alias, c: Optional[LocalAlias], d: Union[Local, Alias]) -> Local | Alias:\n    return a\ndef duplicate(value: Local | LocalAlias) -> Local:\n    return value\n";
+    let facts = export(source);
+    let combine = function(&facts, "combine");
+    let bindings: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|binding| binding.function == combine.identity)
+        .collect();
+    assert_eq!(bindings.len(), 7);
+    for binding in &bindings {
+        assert_eq!(binding.binding_scope, facts.module_body_identity());
+        assert_eq!(
+            &source[binding.expression_range.start as usize..binding.expression_range.end as usize],
+            binding.name
+        );
+    }
+    let alias = bindings
+        .iter()
+        .find(|binding| binding.annotation == AnnotationTarget::Parameter { index: 1 })
+        .unwrap();
+    assert_eq!(alias.name, "Alias");
+    assert_eq!(alias.binding.module, facts.module);
+    assert_eq!(alias.binding.definition_kind, DefinitionKind::Assignment);
+    assert_eq!(alias.class.definition.module.module_name, "external");
+    assert_eq!(alias.class.definition.lexical_qualname, "Foreign");
+    let local_alias = bindings
+        .iter()
+        .find(|binding| binding.annotation == AnnotationTarget::Parameter { index: 2 })
+        .unwrap();
+    assert_eq!(local_alias.name, "LocalAlias");
+    assert_ne!(local_alias.binding, local_alias.class.definition);
+
+    let duplicate = function(&facts, "duplicate");
+    assert!(matches!(
+        duplicate.signature.parameters[0].value_type,
+        StaticType::NominalClass(_)
+    ));
+    let leaves: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|binding| {
+            binding.function == duplicate.identity
+                && binding.annotation == AnnotationTarget::Parameter { index: 0 }
+        })
+        .collect();
+    assert_eq!(leaves.len(), 2);
+    assert_eq!(leaves[0].class, leaves[1].class);
+    assert_ne!(leaves[0].binding, leaves[1].binding);
+    assert_ne!(leaves[0].expression_range, leaves[1].expression_range);
+    assert_eq!(
+        facts,
+        export_from(&database(source, AnalysisDialect::SoacStrictV1, true))
+    );
+}
+
+#[test]
+fn soac_nominal_bindings_use_actual_lexical_scopes_and_remove_ignored_contracts() {
+    let source = "from __future__ import strict\nfrom typing import Any\nclass Root: pass\nclass Container:\n    Alias = Root\n    def method(self, value: Alias) -> Root:\n        return value\ndef outer():\n    class Nested: pass\n    Alias = Nested\n    def inner(a: Nested, b: Alias) -> Nested:\n        return a\n    return inner\ndef ignored(value: Root) -> Root:\n    return 1  # ty: ignore[invalid-return-type]\ndef unsupported(value: list[Root], dynamic: Any):\n    pass\n";
+    let facts = export(source);
+    let method = function(&facts, "Container.method");
+    let local = facts
+        .nominal_bindings
+        .iter()
+        .find(|binding| {
+            binding.function == method.identity
+                && binding.annotation == AnnotationTarget::Parameter { index: 1 }
+        })
+        .unwrap();
+    assert_eq!(local.binding_scope, class(&facts, "Container").identity);
+    assert_eq!(local.binding.definition_kind, DefinitionKind::Assignment);
+    let outer = function(&facts, "outer");
+    let inner = function(&facts, "outer.<locals>.inner");
+    let inner_bindings: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|binding| binding.function == inner.identity)
+        .collect();
+    assert_eq!(inner_bindings.len(), 3);
+    assert!(
+        inner_bindings
+            .iter()
+            .all(|binding| binding.binding_scope == outer.identity)
+    );
+    for name in ["ignored", "unsupported"] {
+        assert!(
+            facts
+                .nominal_bindings
+                .iter()
+                .all(|binding| binding.function != function(&facts, name).identity)
+        );
+    }
+    assert!(
+        facts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.suppressed)
+    );
+}
+
+#[test]
+fn soac_nominal_bindings_distinguish_factory_aliases_from_direct_class_bindings() {
+    let source = "from __future__ import strict\ndef factory():\n    class Local:\n        def direct(self, value: Local) -> Local:\n            return value\n        def alias(self, value: Alias) -> Alias:\n            return value\n    Alias = Local\n    First = Local\n    Second = Local\n    def two(first: First, second: Second) -> Second:\n        return second\n    def either(value: First | Second) -> First | Second:\n        return value\n    return Local, two, either\n";
+    let facts = export(source);
+    let direct = function(&facts, "factory.<locals>.Local.direct");
+    let alias = function(&facts, "factory.<locals>.Local.alias");
+    let local = class(&facts, "factory.<locals>.Local");
+    let direct_leaves: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|leaf| leaf.function == direct.identity)
+        .collect();
+    assert_eq!(direct_leaves.len(), 2);
+    assert!(direct_leaves.iter().all(|leaf| {
+        leaf.binding == local.identity && leaf.binding_scope == function(&facts, "factory").identity
+    }));
+    let alias_leaves: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|leaf| leaf.function == alias.identity)
+        .collect();
+    assert_eq!(alias_leaves.len(), 2);
+    assert!(alias_leaves.iter().all(|leaf| {
+        leaf.class.definition == local.identity
+            && leaf.binding != local.identity
+            && leaf.binding_scope == function(&facts, "factory").identity
+    }));
+    let two = function(&facts, "factory.<locals>.two");
+    assert_eq!(
+        two.signature.parameters[0].value_type,
+        two.signature.parameters[1].value_type
+    );
+    let leaves: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|leaf| leaf.function == two.identity)
+        .collect();
+    assert_eq!(leaves.len(), 3);
+    assert_eq!(leaves[0].class, leaves[1].class);
+    assert_ne!(leaves[0].binding, leaves[1].binding);
+    let either = function(&facts, "factory.<locals>.either");
+    assert!(matches!(
+        either.signature.parameters[0].value_type,
+        StaticType::NominalClass(_)
+    ));
+    let leaves: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|leaf| leaf.function == either.identity)
+        .collect();
+    assert_eq!(leaves.len(), 4);
+}
+
+#[test]
+fn soac_nominal_factory_call_unknowns_do_not_gain_lexical_binding_plans() {
+    let source = "from __future__ import strict\ndef factory():\n    class Local: pass\n    return Local\nAlias = factory()\ndef unchecked(value: Alias) -> Alias:\n    return value\n";
+    let facts = export(source);
+    let unchecked = function(&facts, "unchecked");
+    assert_eq!(
+        unchecked.signature.parameters[0].value_type,
+        StaticType::Unknown
+    );
+    assert_eq!(unchecked.signature.return_type, StaticType::Unknown);
+    assert!(facts.nominal_bindings.is_empty());
+}
+
+#[test]
 fn soac_export_is_owned_deterministic_and_preserves_original_byte_identities() {
     let source = "\"\"\"δ original bytes\"\"\"\nfrom __future__ import strict\nfrom typing import final\n@final\nclass Leaf:\n    value: int\n    def method(self, x: float) -> int:\n        return 1\ndef outer():\n    class Nested:\n        value: str\n    return Nested\n";
     let one = export_from(&database(source, AnalysisDialect::SoacStrictV1, false));

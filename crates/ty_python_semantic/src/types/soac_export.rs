@@ -36,6 +36,7 @@ use super::{
     LiteralValueTypeKind, ProgramEnvironment, Signature, Type, TypeQualifiers,
     class::{CodeGeneratorKind, FieldKind as TyFieldKind, StaticClassLiteral},
     function::{FunctionDecorators, KnownFunction},
+    ide_support::{ImportAliasResolution, definitions_for_name},
     infer::{infer_definition_types, original_class_type},
     list_members::all_end_of_scope_members,
     signatures::ParameterKind as TyParameterKind,
@@ -945,6 +946,35 @@ impl<'db> Exporter<'db> {
                 .uncertainty
                 .insert(facts::UncertaintyReason::UnsupportedType);
         }
+        let mut nominal_bindings = Vec::new();
+        for (index, parameter) in node.parameters.iter().enumerate() {
+            if let Some(annotation) = parameter.annotation()
+                && let Some(parameter_type) = signature.parameters.get(index)
+                && parameter_type.annotation_origin == facts::AnnotationOrigin::Explicit
+            {
+                self.nominal_annotation_leaves(
+                    &identity,
+                    facts::AnnotationTarget::Parameter {
+                        index: u32::try_from(index).ok()?,
+                    },
+                    annotation,
+                    &parameter_type.value_type,
+                    &mut nominal_bindings,
+                );
+            }
+        }
+        if let Some(annotation) = node.returns.as_deref()
+            && signature.return_annotation_origin == facts::AnnotationOrigin::Explicit
+        {
+            self.nominal_annotation_leaves(
+                &identity,
+                facts::AnnotationTarget::Return,
+                annotation,
+                &signature.return_type,
+                &mut nominal_bindings,
+            );
+        }
+        self.module.nominal_bindings.extend(nominal_bindings);
         self.module.functions.push(facts::FunctionTypeFact {
             identity: identity.clone(),
             function_kind,
@@ -953,6 +983,152 @@ impl<'db> Exporter<'db> {
             uncertainty: function_uncertainty,
         });
         Some(identity)
+    }
+
+    /// The signature and each leaf's type come from real checker inference;
+    /// syntax only identifies the value-use paths the runtime can consume
+    /// without evaluating annotations. In particular, a spelling like
+    /// Optional is not enough: its actual semantic special-form identity is
+    /// required before traversing its slice.
+    fn nominal_annotation_leaves(
+        &self,
+        function: &facts::SourceIdentity,
+        annotation: facts::AnnotationTarget,
+        expression: &ast::Expr,
+        contract: &facts::StaticType,
+        output: &mut Vec<facts::NominalBindingFact>,
+    ) {
+        if !contract.has_supported_boundary_shape() {
+            return;
+        }
+        match expression {
+            ast::Expr::Name(name) => {
+                if let Some(binding) =
+                    self.nominal_name_binding(function, annotation, name, contract)
+                {
+                    output.push(binding);
+                }
+            }
+            ast::Expr::BinOp(binary) if binary.op == ast::Operator::BitOr => {
+                self.nominal_annotation_leaves(
+                    function,
+                    annotation,
+                    &binary.left,
+                    contract,
+                    output,
+                );
+                self.nominal_annotation_leaves(
+                    function,
+                    annotation,
+                    &binary.right,
+                    contract,
+                    output,
+                );
+            }
+            ast::Expr::Subscript(subscript)
+                if matches!(
+                    subscript.value.inferred_type(&self.model),
+                    Some(Type::SpecialForm(
+                        super::SpecialFormType::Optional | super::SpecialFormType::Union
+                    ))
+                ) =>
+            {
+                if let ast::Expr::Tuple(tuple) = subscript.slice.as_ref() {
+                    for element in &tuple.elts {
+                        self.nominal_annotation_leaves(
+                            function, annotation, element, contract, output,
+                        );
+                    }
+                } else {
+                    self.nominal_annotation_leaves(
+                        function,
+                        annotation,
+                        &subscript.slice,
+                        contract,
+                        output,
+                    );
+                }
+            }
+            // String annotations, attribute access, type aliases, and arbitrary
+            // expressions need a separate explicit lexical operand plan. Do
+            // not parse/evaluate them here or guess an object from its source.
+            _ => {}
+        }
+    }
+
+    fn nominal_name_binding(
+        &self,
+        function: &facts::SourceIdentity,
+        annotation: facts::AnnotationTarget,
+        name: &ast::ExprName,
+        contract: &facts::StaticType,
+    ) -> Option<facts::NominalBindingFact> {
+        fn contains(contract: &facts::StaticType, class: &facts::ClassReference) -> bool {
+            match contract {
+                facts::StaticType::NominalClass(reference)
+                | facts::StaticType::ExactClass(reference) => reference == class,
+                facts::StaticType::Union(elements) => {
+                    elements.iter().any(|element| contains(element, class))
+                }
+                facts::StaticType::Optional(element) => contains(element, class),
+                _ => false,
+            }
+        }
+        let class = match name.inferred_type(&self.model)? {
+            Type::ClassLiteral(class) => self.class_reference(class)?,
+            Type::NominalInstance(instance) => {
+                self.class_reference(instance.class_literal(self.db, &self.env))?
+            }
+            _ => return None,
+        };
+        if !contains(contract, &class) {
+            return None;
+        }
+        // Unlike an IDE's first-definition shortcut, all reachable definitions
+        // must agree on one actual local binding. Preserve import aliases:
+        // the runtime must read that alias, not a similarly named class in a
+        // different module or a different execution of its source.
+        let definitions = definitions_for_name(
+            &self.model,
+            name.id.as_str(),
+            name.into(),
+            ImportAliasResolution::PreserveAliases,
+        );
+        let [resolved] = definitions.as_slice() else {
+            return None;
+        };
+        let definition = resolved.definition()?;
+        if definition.program_file(self.db) != self.model.program_file() {
+            return None;
+        }
+        let binding = self.definition(definition)?;
+        if !matches!(
+            binding.definition_kind,
+            facts::DefinitionKind::Class | facts::DefinitionKind::Assignment
+        ) {
+            return None;
+        }
+        let scope = definition.scope(self.db);
+        let index = semantic_index(self.db, scope.program_file(self.db));
+        let binding_scope = match scope.node(self.db) {
+            NodeWithScopeKind::Module => self.module.module_body_identity(),
+            NodeWithScopeKind::Class(node) => {
+                self.definition(index.expect_single_definition(node))?
+            }
+            NodeWithScopeKind::Function(node) => {
+                self.definition(index.expect_single_definition(node))?
+            }
+            _ => return None,
+        };
+        Some(facts::NominalBindingFact {
+            function: function.clone(),
+            annotation,
+            expression_range: source_range(name.range()),
+            name: name.id.to_string(),
+            class,
+            binding,
+            binding_scope,
+        })
     }
 
     fn descriptor(&self, ty: Type<'db>) -> facts::DescriptorFact {
