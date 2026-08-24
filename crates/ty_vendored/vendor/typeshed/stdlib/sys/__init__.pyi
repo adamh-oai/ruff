@@ -128,7 +128,8 @@ if sys.version_info >= (3, 12):
 maxsize: int
 maxunicode: int
 meta_path: list[MetaPathFinderProtocol]
-modules: dict[str, ModuleType]
+# A None entry blocks import until it is removed or replaced.
+modules: dict[str, ModuleType | None]
 if sys.version_info >= (3, 15):
     lazy_modules: set[str]
 orig_argv: list[str]

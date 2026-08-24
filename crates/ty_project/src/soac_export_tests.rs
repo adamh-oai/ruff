@@ -3397,3 +3397,232 @@ fn soac_export_repeated_source_digests_refresh_after_same_size_dependency_change
     )]);
     assert_eq!(export_from(&db), initial);
 }
+
+
+#[test]
+fn soac_export_sys_modules_sentinel_writes_follow_stdlib_and_alias_types() {
+    use ruff_db::diagnostic::Severity;
+
+    let body = r#"import sys
+from sys import modules as registry
+from types import ModuleType
+
+def install():
+    sys.modules["direct"] = None
+    registry["alias"] = None
+    registry["ready"] = ModuleType("ready")
+"#;
+    for strict in [false, true] {
+        let source = if strict {
+            format!("from __future__ import strict\n{body}")
+        } else {
+            body.to_string()
+        };
+        let dialect = if strict {
+            AnalysisDialect::SoacStrictV1
+        } else {
+            AnalysisDialect::Python
+        };
+        let db = database(&source, dialect, false);
+        let file = system_path_to_file(&db, "/project/main.py").unwrap();
+        let diagnostics = ty_python_semantic::Db::check_file(&db, file);
+        assert!(
+            diagnostics.iter().all(|diagnostic| !matches!(
+                diagnostic.severity(),
+                Severity::Error | Severity::Fatal
+            )),
+            "{diagnostics:?}"
+        );
+        if strict {
+            let facts = export_from(&db);
+            assert!(facts.diagnostics.iter().all(|diagnostic|
+                diagnostic.severity != DiagnosticSeverity::Error
+            ));
+            let registry = facts.global_bindings.iter()
+                .find(|binding| binding.name == "registry").unwrap();
+            assert!(matches!(
+                registry.value_type,
+                StaticType::Unsupported {
+                    kind: UnsupportedTypeKind::MutableGeneric,
+                    ..
+                }
+            ), "mutable registry elements are not a protected module capability");
+        }
+    }
+}
+
+#[test]
+fn soac_export_sys_modules_reads_stay_nullable_in_semantics_and_sites() {
+    use ruff_python_ast::Stmt;
+    use ty_python_semantic::types::Type;
+    use ty_python_semantic::{HasType, SemanticModel};
+
+    let source = r#"from __future__ import strict
+import sys
+from sys import modules as registry
+from types import ModuleType
+
+def fresh():
+    return ModuleType("fresh")
+
+def direct(name):
+    return sys.modules[name]
+
+def alias(name):
+    return registry[name]
+
+def read_name(name):
+    return sys.modules[name].__name__
+
+def invoke(name):
+    return registry[name].callback()
+"#;
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let program_file = ty_python_semantic::Db::program_file(&db, file);
+    let model = SemanticModel::new(&db, program_file);
+    let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db))
+        .load(&db);
+    let mut returns = std::collections::BTreeMap::new();
+    for statement in parsed.suite() {
+        let Stmt::FunctionDef(definition) = statement else {
+            continue;
+        };
+        let [Stmt::Return(return_statement)] = definition.body.as_slice() else {
+            panic!("fixture functions have one explicit return");
+        };
+        let value = return_statement.value.as_deref().unwrap();
+        returns.insert(
+            definition.name.id.as_str(),
+            value.inferred_type(&model).unwrap(),
+        );
+    }
+    let module_type = returns["fresh"];
+    assert!(matches!(module_type, Type::NominalInstance(_)));
+    for name in ["direct", "alias"] {
+        let Type::Union(union) = returns[name] else {
+            panic!("registry lookup must preserve the nullable value union");
+        };
+        let elements = union.elements(&db);
+        assert_eq!(elements.len(), 2);
+        assert!(elements.contains(&module_type));
+        assert_eq!(elements.iter().filter(|element| element.is_none(&db)).count(), 1);
+    }
+
+    let facts = export_from(&db);
+    let reader = &function(&facts, "read_name").identity;
+    let site = facts.attribute_sites.iter().find(|site|
+        &site.identity.enclosing_function == reader && site.name == "__name__"
+    ).unwrap();
+    let StaticType::Union(alternatives) = &site.receiver_type else {
+        panic!("export must retain the actual nullable receiver");
+    };
+    assert!(alternatives.contains(&StaticType::None));
+    assert!(site.uncertainty.contains(&UncertaintyReason::OpenWorld));
+    assert!(facts.diagnostics.iter().any(|diagnostic|
+        diagnostic.code == DiagnosticCode::CheckerError
+            && diagnostic.severity == DiagnosticSeverity::Error
+            && diagnostic.source_range == site.identity.expression_range
+            && !diagnostic.suppressed
+    ), "the nullable module-attribute error must remain blocking");
+
+    let invoker = &function(&facts, "invoke").identity;
+    let calls: Vec<_> = facts.call_sites.iter().filter(|site|
+        &site.identity.enclosing_function == invoker
+    ).collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].binding, CallBindingFact::Dynamic);
+    assert_eq!(calls[0].uncertainty, CallUncertainty::Dynamic);
+    assert_eq!(calls[0].candidate_targets, vec![CallableTargetFact::Dynamic]);
+}
+
+#[test]
+fn soac_export_sys_modules_rejects_invalid_keys_and_values() {
+    let body = r#"import sys
+from sys import modules as registry
+
+def invalid():
+    sys.modules["number"] = 1
+    registry["object"] = object()
+    sys.modules[1] = None
+"#;
+    for strict in [false, true] {
+        let source = if strict {
+            format!("from __future__ import strict\n{body}")
+        } else {
+            body.to_string()
+        };
+        let dialect = if strict {
+            AnalysisDialect::SoacStrictV1
+        } else {
+            AnalysisDialect::Python
+        };
+        let db = database(&source, dialect, false);
+        let file = system_path_to_file(&db, "/project/main.py").unwrap();
+        let diagnostics = ty_python_semantic::Db::check_file(&db, file);
+        assert_eq!(
+            diagnostics.iter().filter(|diagnostic|
+                diagnostic.id().is_lint_named("invalid-assignment")
+            ).count(),
+            3,
+            "{diagnostics:?}"
+        );
+        if strict {
+            let facts = export_from(&db);
+            assert_eq!(
+                facts.diagnostics.iter().filter(|diagnostic|
+                    diagnostic.code == DiagnosticCode::CheckerError
+                        && diagnostic.severity == DiagnosticSeverity::Error
+                        && !diagnostic.suppressed
+                ).count(),
+                3
+            );
+        }
+    }
+}
+
+#[test]
+fn soac_export_sys_modules_user_registry_keeps_nonnullable_contract() {
+    let body = r#"from types import ModuleType
+
+class Namespace:
+    modules: dict[str, ModuleType]
+
+def invalid(sys: Namespace, registry: dict[str, ModuleType]):
+    sys.modules["shadowed"] = None
+    registry["ordinary"] = None
+"#;
+    for strict in [false, true] {
+        let source = if strict {
+            format!("from __future__ import strict\n{body}")
+        } else {
+            body.to_string()
+        };
+        let dialect = if strict {
+            AnalysisDialect::SoacStrictV1
+        } else {
+            AnalysisDialect::Python
+        };
+        let db = database(&source, dialect, false);
+        let file = system_path_to_file(&db, "/project/main.py").unwrap();
+        let diagnostics = ty_python_semantic::Db::check_file(&db, file);
+        assert_eq!(
+            diagnostics.iter().filter(|diagnostic|
+                diagnostic.id().is_lint_named("invalid-assignment")
+            ).count(),
+            2,
+            "{diagnostics:?}"
+        );
+        if strict {
+            let facts = export_from(&db);
+            assert_eq!(
+                facts.diagnostics.iter().filter(|diagnostic|
+                    diagnostic.code == DiagnosticCode::CheckerError
+                        && diagnostic.severity == DiagnosticSeverity::Error
+                        && !diagnostic.suppressed
+                ).count(),
+                2
+            );
+        }
+    }
+}
