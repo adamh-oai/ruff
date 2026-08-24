@@ -366,7 +366,7 @@ class OriginalLocalCell:
     def method(self):
         self.field = 1
 
-assert_type(OriginalLocalCell.captured, tuple[Literal["manual"]])
+assert_type(OriginalLocalCell.captured, tuple[str])
 assert_type(OriginalLocalCell.__static_attributes__, tuple[str, ...])
 
 class MethodComprehension:
@@ -449,7 +449,7 @@ Subject.__static_attributes__  # error: [unresolved-attribute]
 class Explicit:
     __static_attributes__ = ("manual",)
 
-assert_type(Explicit.__static_attributes__, tuple[Literal["manual"]])
+assert_type(Explicit.__static_attributes__, tuple[str])
 ```
 
 ### Builtin, dynamic, and stub classes receive no broad type property
