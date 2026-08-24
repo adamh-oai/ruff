@@ -97,6 +97,122 @@ fn function<'a>(facts: &'a ModuleTypeFacts, name: &str) -> &'a FunctionTypeFact 
 }
 
 #[test]
+fn soac_implicit_class_cell_reaches_nested_lexical_scopes() {
+    let source = r#"from __future__ import strict
+def exercise():
+    class C:
+        def method(self):
+            def nested():
+                return __class__
+            return nested()
+    return C().method(), C
+class ModuleClass:
+    def method(self):
+        callbacks = [lambda: __class__ for _ in range(2)]
+        class Inner:
+            enclosing = __class__
+        return callbacks, Inner
+    nested_lambda = lambda: (lambda: __class__)
+    nested_generator = (lambda: __class__ for _ in range(2))
+"#;
+    let facts = export(source);
+    assert_eq!(
+        facts,
+        export_from(&database(source, AnalysisDialect::SoacStrictV1, true))
+    );
+    assert!(
+        !facts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error),
+        "{:?}",
+        facts.diagnostics
+    );
+    assert_eq!(
+        class(&facts, "exercise.<locals>.C").participation,
+        ParticipationProposal::Candidate
+    );
+    let ordinary = source.replace("from __future__ import strict", "# ordinary source");
+    let db = database(&ordinary, AnalysisDialect::Python, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    assert!(ty_python_semantic::Db::check_file(&db, file).is_empty());
+}
+
+#[test]
+fn soac_implicit_class_cell_preserves_explicit_bindings() {
+    let source = r#"from __future__ import strict
+__class__ = 7
+class C:
+    def parameter(self, __class__: int):
+        def nested() -> int:
+            return __class__
+        return nested
+    def declared(self):
+        __class__: int
+        def nested() -> int:
+            return __class__
+        return nested
+    def local(self):
+        __class__ = 'value'
+        def middle():
+            nonlocal __class__
+            def nested() -> str:
+                return __class__
+            return nested
+        return middle
+    def forwarded_global(self):
+        global __class__
+        def nested() -> int:
+            return __class__
+        return nested
+    def nested_global(self):
+        def nested() -> int:
+            global __class__
+            return __class__
+        return nested
+"#;
+    let facts = export(source);
+    assert!(
+        !facts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error),
+        "{:?}",
+        facts.diagnostics
+    );
+}
+
+#[test]
+fn soac_implicit_class_cell_does_not_grant_nonlexical_or_unbound_names() {
+    for source in [
+        "def outside():\n    def nested(): return __class__\n    return nested\nclass C: method = outside\n",
+        "class C:\n    value = __class__\n",
+        "class C:\n    def method(self, value=__class__): pass\n",
+        "class C:\n    values = [__class__ for _ in range(1)]\n",
+        "class C:\n    values = (value for value in (__class__,))\n",
+        "class C:\n    class Inner:\n        value = __class__\n",
+        "class C:\n    def method(self):\n        global __class__\n        def nested(): return __class__\n        return nested\n",
+        "class C:\n    def method(self):\n        def nested():\n            result = __class__\n            __class__ = 7\n            return result\n        return nested\n",
+    ] {
+        let db = database(
+            &format!("from __future__ import strict\n{source}"),
+            AnalysisDialect::SoacStrictV1,
+            false,
+        );
+        let file = system_path_to_file(&db, "/project/main.py").unwrap();
+        let facts =
+            export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+        assert!(
+            facts
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error),
+            "invalid implicit class-cell use was accepted: {source}"
+        );
+    }
+}
+
+#[test]
 fn soac_lambda_identities_follow_lexical_definition_scopes() {
     let source = r#"from __future__ import strict
 module_list = [lambda: module_index for module_index in range(2)]

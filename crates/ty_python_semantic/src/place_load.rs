@@ -379,7 +379,7 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
 
         if let PlaceExprRef::Symbol(symbol) = place_expr
             && symbol.name() == "__class__"
-            && let Some(definition) = self.context.dunder_class_cell_definition()
+            && let Some(definition) = self.context.dunder_class_cell_definition(file_scope)
         {
             PlaceLoadResolutionNode::DunderClassSource {
                 definition,
@@ -422,6 +422,34 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
                     .parents(place_expr)
                     .any(|root| enclosing_place_table.place(root).is_bound())
             };
+
+            // An enclosing method/lambda/generator can supply its implicit class cell even when
+            // its body never reads the name itself. Resolve that cell at its lexical boundary,
+            // after any nearer enclosing scope was considered, not by searching for a class.
+            // Explicit bindings/declarations (including unbound ones and forwarded writes) and
+            // globals still take precedence. A read-only nonlocal declaration can forward this
+            // same implicit cell to a nested scope.
+            if is_lexical_enclosing_scope
+                && place_expr
+                    .as_symbol()
+                    .is_some_and(|symbol| symbol.name() == "__class__")
+                && !enclosing_place.is_some_and(|place| {
+                    place.as_symbol().is_some_and(|symbol| {
+                        symbol.is_bound() || symbol.is_declared() || symbol.is_global()
+                    })
+                })
+                && let Some(definition) = self
+                    .context
+                    .dunder_class_cell_definition(enclosing_file_scope)
+            {
+                return (
+                    PlaceLoadResolutionNode::Failure(PlaceLoadFailure::UnboundFree),
+                    Some(PlaceLoadConstraints::unnarrowed_source(
+                        PlaceLoadSourceKind::Implicit(ImplicitPlaceLoad::DunderClass(definition)),
+                        PlaceLoadSourceRole::Ordinary,
+                    )),
+                );
+            }
 
             let mut eagerly_undefined = false;
             if self.context.uses_enclosing_snapshots() {
@@ -749,7 +777,7 @@ pub(crate) enum PlaceLoadSourceKind<'db> {
 /// A source that consumers evaluate using a specialized query or rule.
 pub(crate) enum ImplicitPlaceLoad<'db> {
     /// The implicit `__class__` cell for a method, lambda, or generator expression defined directly
-    /// in a class body, e.g.:
+    /// in a class body, also visible to their nested lexical scopes, e.g.:
     ///
     /// ```py
     /// class C:
@@ -1003,20 +1031,18 @@ impl<'db> PlaceLoadResolutionContext<'db, '_> {
         !scope.is_global() && self.index.symbol_is_global_in_scope(symbol, scope)
     }
 
-    fn dunder_class_cell_definition(self) -> Option<Definition<'db>> {
-        let current_scope = self.scope.file_scope_id(self.db);
-        if let Some(definition) = self.index.class_definition_of_method(current_scope) {
+    fn dunder_class_cell_definition(self, scope: FileScopeId) -> Option<Definition<'db>> {
+        if let Some(definition) = self.index.class_definition_of_method(scope) {
             return Some(definition);
         }
 
-        let scope = self.index.scope(current_scope);
         if !matches!(
-            scope.node(),
+            self.index.scope(scope).node(),
             NodeWithScopeKind::Lambda(_) | NodeWithScopeKind::GeneratorExpression(_)
         ) {
             return None;
         }
-        let class = self.index.parent_scope(current_scope)?.node().as_class()?;
+        let class = self.index.parent_scope(scope)?.node().as_class()?;
         Some(self.index.expect_single_definition(class))
     }
 }
