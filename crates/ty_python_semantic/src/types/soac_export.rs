@@ -133,9 +133,8 @@ fn export_soac_module_impl(
     }
     let strict = soac_source::has_strict_future(parsed.suite());
     if strict {
-        soac_source::validate_source_literals(source.as_str(), parsed.tokens()).map_err(|error| {
-            facts::ContractError::InvalidSourceIdentity(error.to_string())
-        })?;
+        soac_source::validate_source_literals(source.as_str(), parsed.tokens())
+            .map_err(|error| facts::ContractError::InvalidSourceIdentity(error.to_string()))?;
     }
     let module = facts::ModuleTypeFacts::new(
         module_name,
@@ -148,9 +147,10 @@ fn export_soac_module_impl(
         policy,
     )?;
     let owner = module.module_body_identity();
-    let source_digests = RefCell::new(rustc_hash::FxHashMap::from_iter([
-        (file, module.source_digest),
-    ]));
+    let source_digests = RefCell::new(rustc_hash::FxHashMap::from_iter([(
+        file,
+        module.source_digest,
+    )]));
     let mut exporter = Exporter {
         db,
         model: SemanticModel::new(db, program_file),
@@ -1605,7 +1605,8 @@ impl<'db> Exporter<'db> {
         let mut field_bindings = Vec::new();
         if let Some(generator) = generator {
             for (name, field) in class.fields(db, None, generator) {
-                if field.first_declaration
+                if field
+                    .first_declaration
                     .and_then(|definition| self.class_literal_for_scope(definition.scope(db)))
                     .is_some_and(|declaring| declaring.known(db) == Some(KnownClass::Object))
                 {
@@ -1810,13 +1811,21 @@ impl<'db> Exporter<'db> {
         let class_places = place_table(db, class.body_scope(db));
         let class_bindings = use_def_map(db, class.body_scope(db));
         for member in all_end_of_scope_members(db, class.body_scope(db)) {
-            if class_places.symbol_id(member.member.name.as_str()).is_some_and(|symbol| {
-                class_bindings.end_of_scope_symbol_bindings(symbol).any(|binding| {
-                    binding.binding.definition().is_some_and(|definition| {
-                        matches!(definition.kind(db), DefinitionKind::ClassStaticAttributes(_))
-                    })
+            if class_places
+                .symbol_id(member.member.name.as_str())
+                .is_some_and(|symbol| {
+                    class_bindings
+                        .end_of_scope_symbol_bindings(symbol)
+                        .any(|binding| {
+                            binding.binding.definition().is_some_and(|definition| {
+                                matches!(
+                                    definition.kind(db),
+                                    DefinitionKind::ClassStaticAttributes(_)
+                                )
+                            })
+                        })
                 })
-            }) {
+            {
                 // A compiler-created metadata value is not a user-authored class default or a
                 // layout/field capability. Do not relabel its overwritten source predecessor.
                 continue;

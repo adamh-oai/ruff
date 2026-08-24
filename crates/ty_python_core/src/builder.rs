@@ -67,8 +67,9 @@ use crate::use_def::{
 };
 use crate::{Db, Statement, StatementNodeKey};
 use crate::{
-    DefinitionsByNode, DescendantsIter, EvaluationMode, ExpressionsScopeMap, LoopHeader, LoopHeaderId,
-    NarrowingAliasPredicate, PossiblyNarrowedPlaces, SemanticIndex, VisibleAncestorsIter,
+    DefinitionsByNode, DescendantsIter, EvaluationMode, ExpressionsScopeMap, LoopHeader,
+    LoopHeaderId, NarrowingAliasPredicate, PossiblyNarrowedPlaces, SemanticIndex,
+    VisibleAncestorsIter,
 };
 use crate::{HasTrackedScope, ImplicitClassCell};
 
@@ -3325,7 +3326,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 return true;
             }
             if symbol.is_used()
-                && self.static_attributes_enclosing_local(class_scope).is_some()
+                && self
+                    .static_attributes_enclosing_local(class_scope)
+                    .is_some()
             {
                 return false;
             }

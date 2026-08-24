@@ -98,9 +98,9 @@ pub(crate) fn script(db: &dyn Db, file: File) -> Option<Script<'_>> {
         &mut diagnostics,
     );
 
-    program_settings.search_paths.inherit_selected_source_modules(
-        &db.project().program_settings(db).search_paths,
-    );
+    program_settings
+        .search_paths
+        .inherit_selected_source_modules(&db.project().program_settings(db).search_paths);
     program_settings.search_paths.try_register_static_roots(db);
 
     let program = Program::from_settings(db, &program_settings);

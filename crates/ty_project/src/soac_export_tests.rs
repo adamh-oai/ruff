@@ -3189,56 +3189,91 @@ def accept(value: Literal['\ud800']) -> Literal['\ud800']: return value"#,
         let error = export_soac_module(&db, file, "main", ResolvedStrictPolicy::default())
             .expect_err("unsupported source must not produce a proposal");
         assert!(matches!(&error, ContractError::InvalidSourceIdentity(_)));
-        assert!(error.to_string().contains("unsupported Unicode surrogate escape U+D800"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Unicode surrogate escape U+D800")
+        );
         let start = source.find(r"\ud800").unwrap();
-        assert!(error.to_string().contains(&format!("bytes {start}..{}", start + 6)));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("bytes {start}..{}", start + 6))
+        );
     }
 }
 
 #[test]
 fn soac_source_genuine_replacement_and_raw_literals_remain_exact() {
-    let facts = export(r#"from __future__ import strict
+    let facts = export(
+        r#"from __future__ import strict
 from typing import Literal
 def accept(value: Literal['�'], raw: Literal[r'\ud800']) -> Literal['\ufffd']:
     return value
-"#);
+"#,
+    );
     let signature = &function(&facts, "accept").signature;
-    assert_eq!(signature.parameters[0].value_type, StaticType::Literal(LiteralValue::Str("�".into())));
-    assert_eq!(signature.parameters[1].value_type, StaticType::Literal(LiteralValue::Str(r"\ud800".into())));
-    assert_eq!(signature.return_type, StaticType::Literal(LiteralValue::Str("�".into())));
+    assert_eq!(
+        signature.parameters[0].value_type,
+        StaticType::Literal(LiteralValue::Str("�".into()))
+    );
+    assert_eq!(
+        signature.parameters[1].value_type,
+        StaticType::Literal(LiteralValue::Str(r"\ud800".into()))
+    );
+    assert_eq!(
+        signature.return_type,
+        StaticType::Literal(LiteralValue::Str("�".into()))
+    );
 }
 
 fn source_literal_dependency_database(dependency: &str, main: &str) -> ProjectDatabase {
     let system = TestSystem::default();
-    system.memory_file_system().write_files_all([
-        ("/project/ty.toml", "[environment]\npython-version = '3.15'\n"),
-        ("/project/dependency.py", dependency),
-        ("/project/main.py", main),
-    ]).unwrap();
-    let metadata = ProjectMetadata::discover(
-        ruff_db::system::SystemPath::new("/project"), &system,
-    ).unwrap();
-    ProjectDatabase::fallible_with_analysis_dialect(
-        metadata, system, AnalysisDialect::SoacStrictV1,
-    ).unwrap()
+    system
+        .memory_file_system()
+        .write_files_all([
+            (
+                "/project/ty.toml",
+                "[environment]\npython-version = '3.15'\n",
+            ),
+            ("/project/dependency.py", dependency),
+            ("/project/main.py", main),
+        ])
+        .unwrap();
+    let metadata =
+        ProjectMetadata::discover(ruff_db::system::SystemPath::new("/project"), &system).unwrap();
+    ProjectDatabase::fallible_with_analysis_dialect(metadata, system, AnalysisDialect::SoacStrictV1)
+        .unwrap()
 }
 
 #[test]
 fn soac_source_imported_surrogate_aliases_never_become_replacement_literal_facts() {
     let main = "from __future__ import strict\nfrom dependency import Alias\ndef accept(value: Alias) -> Alias: return value\n";
     for (dependency, expected) in [
-        (r#"from typing import Literal
+        (
+            r#"from typing import Literal
 Alias = Literal['\ud800']
-"#, StaticType::Unknown),
-        (r#"from typing import Literal
+"#,
+            StaticType::Unknown,
+        ),
+        (
+            r#"from typing import Literal
 type Alias = Literal['\U0000DFFF']
-"#, StaticType::Unknown),
-        (r#"from typing import Literal
+"#,
+            StaticType::Unknown,
+        ),
+        (
+            r#"from typing import Literal
 Alias = Literal['�']
-"#, StaticType::Literal(LiteralValue::Str("�".into()))),
-        (r#"from typing import Literal
+"#,
+            StaticType::Literal(LiteralValue::Str("�".into())),
+        ),
+        (
+            r#"from typing import Literal
 Alias = Literal[r'\ud800']
-"#, StaticType::Literal(LiteralValue::Str(r"\ud800".into()))),
+"#,
+            StaticType::Literal(LiteralValue::Str(r"\ud800".into())),
+        ),
     ] {
         let db = source_literal_dependency_database(dependency, main);
         let facts = export_from(&db);
@@ -3261,17 +3296,21 @@ fn soac_source_dependency_f_and_t_strings_still_infer_interpolation_operands() {
         );
         let file = system_path_to_file(&db, "/project/dependency.py").unwrap();
         let diagnostics = ty_python_semantic::Db::check_file(&db, file);
-        let diagnostic = diagnostics.iter().find(|diagnostic| {
-            diagnostic.id().is_lint_named("unresolved-reference")
-        }).expect("interpolation expression is still analyzed");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.id().is_lint_named("unresolved-reference"))
+            .expect("interpolation expression is still analyzed");
         let range = diagnostic.primary_span().unwrap().range().unwrap();
         assert_eq!(&dependency[range], "missing_operand");
         let facts = export_from(&db);
-        let observed = facts.global_bindings.iter().find(|binding| binding.name == "observed").unwrap();
+        let observed = facts
+            .global_bindings
+            .iter()
+            .find(|binding| binding.name == "observed")
+            .unwrap();
         assert!(!matches!(observed.value_type, StaticType::Literal(_)));
     }
 }
-
 
 fn pydantic_export_database(source: &str) -> ProjectDatabase {
     let system = TestSystem::default();
@@ -3292,9 +3331,8 @@ fn pydantic_export_database(source: &str) -> ProjectDatabase {
         ),
     ]).unwrap();
     let metadata = ProjectMetadata::discover(&project, &system).unwrap();
-    ProjectDatabase::fallible_with_analysis_dialect(
-        metadata, system, AnalysisDialect::SoacStrictV1,
-    ).unwrap()
+    ProjectDatabase::fallible_with_analysis_dialect(metadata, system, AnalysisDialect::SoacStrictV1)
+        .unwrap()
 }
 
 #[test]
@@ -3304,20 +3342,27 @@ fn soac_export_pydantic_fields_do_not_invent_source_owned_builtin_object_members
     );
     let facts = export_from(&db);
     let item = class(&facts, "Item");
-    assert!(matches!(&item.participation, ParticipationProposal::Dynamic(reasons)
-        if reasons.contains(&DynamicClassReason::FrameworkManaged)));
-    assert!(item.inheritance.linearized_bases.contains(
-        &BaseReference::Builtin(BuiltinType::Object),
-    ));
+    assert!(
+        matches!(&item.participation, ParticipationProposal::Dynamic(reasons)
+        if reasons.contains(&DynamicClassReason::FrameworkManaged))
+    );
+    assert!(
+        item.inheritance
+            .linearized_bases
+            .contains(&BaseReference::Builtin(BuiltinType::Object),)
+    );
     assert_eq!(
-        item.instance_fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
+        item.instance_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
         ["id", "name"],
     );
     for field in &item.instance_fields {
         assert_eq!(field.declaring_class.definition, item.identity);
     }
-    assert!(facts.diagnostics.iter().all(|diagnostic|
-        diagnostic.suppressed || diagnostic.severity != DiagnosticSeverity::Error
+    assert!(facts.diagnostics.iter().all(
+        |diagnostic| diagnostic.suppressed || diagnostic.severity != DiagnosticSeverity::Error
     ));
 }
 
@@ -3329,25 +3374,34 @@ fn soac_export_pydantic_fields_keep_user_object_names_and_real_overrides() {
     let facts = export_from(&db);
     let item = class(&facts, "Item");
     let user = class(&facts, "object");
-    assert!(item.inheritance.linearized_bases.iter().any(
-        |base| base.as_class().is_some_and(|base| base.definition == user.identity),
-    ));
+    assert!(item.inheritance.linearized_bases.iter().any(|base| {
+        base.as_class()
+            .is_some_and(|base| base.definition == user.identity)
+    },));
     for name in ["ordinary", "__doc__"] {
-        assert_eq!(field(&facts, "Item", name).declaring_class.definition, user.identity);
+        assert_eq!(
+            field(&facts, "Item", name).declaring_class.definition,
+            user.identity
+        );
     }
-    assert_eq!(field(&facts, "Item", "id").declaring_class.definition, item.identity);
-    assert!(facts.diagnostics.iter().all(|diagnostic|
-        diagnostic.suppressed || diagnostic.severity != DiagnosticSeverity::Error
+    assert_eq!(
+        field(&facts, "Item", "id").declaring_class.definition,
+        item.identity
+    );
+    assert!(facts.diagnostics.iter().all(
+        |diagnostic| diagnostic.suppressed || diagnostic.severity != DiagnosticSeverity::Error
     ));
 }
-
 
 #[test]
 fn soac_export_repeated_source_digests_refresh_after_same_size_dependency_changes() {
     let source = "from __future__ import strict\nclass Base: pass\ndef decorate[T](value: T) -> T: return value\n# first\n";
     let (mut db, system) = inheritance_database(source, false);
     let main = "from __future__ import strict\nfrom base import Base, decorate\nclass Child(Base):\n    left: Base\n    right: Base\n@decorate\nclass Decorated: pass\ndef echo(left: Base, right: Base) -> Base: return left\n";
-    system.memory_file_system().write_file_all("/project/main.py", main).unwrap();
+    system
+        .memory_file_system()
+        .write_file_all("/project/main.py", main)
+        .unwrap();
     db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
         "/project/main.py".into(),
     )]);
@@ -3357,14 +3411,18 @@ fn soac_export_repeated_source_digests_refresh_after_same_size_dependency_change
         let base = class(facts, "Child").bases[0].as_class().unwrap();
         assert_eq!(base.source_digest, expected);
         for name in ["left", "right"] {
-            let StaticType::NominalClass(reference) = &field(facts, "Child", name).value_type else {
+            let StaticType::NominalClass(reference) = &field(facts, "Child", name).value_type
+            else {
                 panic!("field must keep the actual nominal source reference");
             };
             assert_eq!(reference, base);
         }
         let signature = &function(facts, "echo").signature;
         assert_eq!(signature.parameters.len(), 2);
-        for value_type in signature.parameters.iter().map(|parameter| &parameter.value_type)
+        for value_type in signature
+            .parameters
+            .iter()
+            .map(|parameter| &parameter.value_type)
             .chain([&signature.return_type])
         {
             let StaticType::NominalClass(reference) = value_type else {
@@ -3374,10 +3432,16 @@ fn soac_export_repeated_source_digests_refresh_after_same_size_dependency_change
         }
         let decorators = &class(facts, "Decorated").decorators;
         assert_eq!(decorators.len(), 1);
-        assert_eq!(decorators[0].definition.as_ref().unwrap().module, base.definition.module);
+        assert_eq!(
+            decorators[0].definition.as_ref().unwrap().module,
+            base.definition.module
+        );
         assert_eq!(decorators[0].source_digest, Some(expected));
-        let dependencies: Vec<_> = facts.consumed_dependencies.iter()
-            .filter(|dependency| dependency.module.module_name == "base").collect();
+        let dependencies: Vec<_> = facts
+            .consumed_dependencies
+            .iter()
+            .filter(|dependency| dependency.module.module_name == "base")
+            .collect();
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].module, base.definition.module);
         assert_eq!(dependencies[0].source_digest, expected);
@@ -3386,23 +3450,35 @@ fn soac_export_repeated_source_digests_refresh_after_same_size_dependency_change
 
     let initial = export_from(&db);
     assert_digests(&initial, source);
-    assert_eq!(export_from(&db), initial, "repeated exports remain deterministic");
+    assert_eq!(
+        export_from(&db),
+        initial,
+        "repeated exports remain deterministic"
+    );
     let changed = source.replace("# first", "# other");
     assert_eq!(source.len(), changed.len());
-    system.memory_file_system().write_file_all("/project/base.py", &changed).unwrap();
+    system
+        .memory_file_system()
+        .write_file_all("/project/base.py", &changed)
+        .unwrap();
     db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
         "/project/base.py".into(),
     )]);
     let updated = export_from(&db);
     assert_digests(&updated, &changed);
-    assert_ne!(updated, initial, "same file key and size do not preserve old digests");
-    system.memory_file_system().write_file_all("/project/base.py", source).unwrap();
+    assert_ne!(
+        updated, initial,
+        "same file key and size do not preserve old digests"
+    );
+    system
+        .memory_file_system()
+        .write_file_all("/project/base.py", source)
+        .unwrap();
     db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
         "/project/base.py".into(),
     )]);
     assert_eq!(export_from(&db), initial);
 }
-
 
 #[test]
 fn soac_export_sys_modules_sentinel_writes_follow_stdlib_and_alias_types() {
@@ -3440,18 +3516,27 @@ def install():
         );
         if strict {
             let facts = export_from(&db);
-            assert!(facts.diagnostics.iter().all(|diagnostic|
-                diagnostic.severity != DiagnosticSeverity::Error
-            ));
-            let registry = facts.global_bindings.iter()
-                .find(|binding| binding.name == "registry").unwrap();
-            assert!(matches!(
-                registry.value_type,
-                StaticType::Unsupported {
-                    kind: UnsupportedTypeKind::MutableGeneric,
-                    ..
-                }
-            ), "mutable registry elements are not a protected module capability");
+            assert!(
+                facts
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.severity != DiagnosticSeverity::Error)
+            );
+            let registry = facts
+                .global_bindings
+                .iter()
+                .find(|binding| binding.name == "registry")
+                .unwrap();
+            assert!(
+                matches!(
+                    registry.value_type,
+                    StaticType::Unsupported {
+                        kind: UnsupportedTypeKind::MutableGeneric,
+                        ..
+                    }
+                ),
+                "mutable registry elements are not a protected module capability"
+            );
         }
     }
 }
@@ -3486,8 +3571,7 @@ def invoke(name):
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
     let program_file = ty_python_semantic::Db::program_file(&db, file);
     let model = SemanticModel::new(&db, program_file);
-    let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db))
-        .load(&db);
+    let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db)).load(&db);
     let mut returns = std::collections::BTreeMap::new();
     for statement in parsed.suite() {
         let Stmt::FunctionDef(definition) = statement else {
@@ -3511,34 +3595,51 @@ def invoke(name):
         let elements = union.elements(&db);
         assert_eq!(elements.len(), 2);
         assert!(elements.contains(&module_type));
-        assert_eq!(elements.iter().filter(|element| element.is_none(&db)).count(), 1);
+        assert_eq!(
+            elements
+                .iter()
+                .filter(|element| element.is_none(&db))
+                .count(),
+            1
+        );
     }
 
     let facts = export_proposal_from(&db);
     let reader = &function(&facts, "read_name").identity;
-    let site = facts.attribute_sites.iter().find(|site|
-        &site.identity.enclosing_function == reader && site.name == "__name__"
-    ).unwrap();
+    let site = facts
+        .attribute_sites
+        .iter()
+        .find(|site| &site.identity.enclosing_function == reader && site.name == "__name__")
+        .unwrap();
     let StaticType::Union(alternatives) = &site.receiver_type else {
         panic!("export must retain the actual nullable receiver");
     };
     assert!(alternatives.contains(&StaticType::None));
     assert!(site.uncertainty.contains(&UncertaintyReason::OpenWorld));
-    assert!(facts.diagnostics.iter().any(|diagnostic|
-        diagnostic.code == DiagnosticCode::CheckerError
-            && diagnostic.severity == DiagnosticSeverity::Error
-            && diagnostic.source_range == site.identity.expression_range
-            && !diagnostic.suppressed
-    ), "the nullable module-attribute error must remain blocking");
+    assert!(
+        facts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::CheckerError
+                && diagnostic.severity == DiagnosticSeverity::Error
+                && diagnostic.source_range == site.identity.expression_range
+                && !diagnostic.suppressed),
+        "the nullable module-attribute error must remain blocking"
+    );
 
     let invoker = &function(&facts, "invoke").identity;
-    let calls: Vec<_> = facts.call_sites.iter().filter(|site|
-        &site.identity.enclosing_function == invoker
-    ).collect();
+    let calls: Vec<_> = facts
+        .call_sites
+        .iter()
+        .filter(|site| &site.identity.enclosing_function == invoker)
+        .collect();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].binding, CallBindingFact::Dynamic);
     assert_eq!(calls[0].uncertainty, CallUncertainty::Dynamic);
-    assert_eq!(calls[0].candidate_targets, vec![CallableTargetFact::Dynamic]);
+    assert_eq!(
+        calls[0].candidate_targets,
+        vec![CallableTargetFact::Dynamic]
+    );
     let actual_source = ruff_db::source::source_text(&db, file);
     assert!(matches!(
         validate_module_facts(&facts, Some(actual_source.as_bytes())),
@@ -3571,20 +3672,23 @@ def invalid():
         let file = system_path_to_file(&db, "/project/main.py").unwrap();
         let diagnostics = ty_python_semantic::Db::check_file(&db, file);
         assert_eq!(
-            diagnostics.iter().filter(|diagnostic|
-                diagnostic.id().is_lint_named("invalid-assignment")
-            ).count(),
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.id().is_lint_named("invalid-assignment"))
+                .count(),
             3,
             "{diagnostics:?}"
         );
         if strict {
             let facts = export_proposal_from(&db);
             assert_eq!(
-                facts.diagnostics.iter().filter(|diagnostic|
-                    diagnostic.code == DiagnosticCode::CheckerError
+                facts
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == DiagnosticCode::CheckerError
                         && diagnostic.severity == DiagnosticSeverity::Error
-                        && !diagnostic.suppressed
-                ).count(),
+                        && !diagnostic.suppressed)
+                    .count(),
                 3
             );
             let actual_source = ruff_db::source::source_text(&db, file);
@@ -3622,20 +3726,23 @@ def invalid(sys: Namespace, registry: dict[str, ModuleType]):
         let file = system_path_to_file(&db, "/project/main.py").unwrap();
         let diagnostics = ty_python_semantic::Db::check_file(&db, file);
         assert_eq!(
-            diagnostics.iter().filter(|diagnostic|
-                diagnostic.id().is_lint_named("invalid-assignment")
-            ).count(),
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.id().is_lint_named("invalid-assignment"))
+                .count(),
             2,
             "{diagnostics:?}"
         );
         if strict {
             let facts = export_proposal_from(&db);
             assert_eq!(
-                facts.diagnostics.iter().filter(|diagnostic|
-                    diagnostic.code == DiagnosticCode::CheckerError
+                facts
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == DiagnosticCode::CheckerError
                         && diagnostic.severity == DiagnosticSeverity::Error
-                        && !diagnostic.suppressed
-                ).count(),
+                        && !diagnostic.suppressed)
+                    .count(),
                 2
             );
             let actual_source = ruff_db::source::source_text(&db, file);
@@ -3646,7 +3753,6 @@ def invalid(sys: Namespace, registry: dict[str, ModuleType]):
         }
     }
 }
-
 
 #[test]
 fn class_static_attributes_tail_is_an_ordered_internal_binding() {
@@ -3669,46 +3775,78 @@ fn class_static_attributes_tail_is_an_ordered_internal_binding() {
     let [Stmt::ClassDef(class_node)] = parsed.suite().as_slice() else {
         panic!("fixture has one source class");
     };
-    let class_scope = index.scope_ids().find(|scope| scope.node(&db).as_class().is_some())
-        .unwrap().file_scope_id(&db);
+    let class_scope = index
+        .scope_ids()
+        .find(|scope| scope.node(&db).as_class().is_some())
+        .unwrap()
+        .file_scope_id(&db);
     let table = index.place_table(class_scope);
     let use_def = index.use_def_map(class_scope);
     let symbol = table.symbol_id("__static_attributes__").unwrap();
-    let definitions: Vec<_> = use_def.end_of_scope_symbol_bindings(symbol)
-        .filter_map(|binding| binding.binding.definition()).collect();
-    assert_eq!(definitions.len(), 1, "the tail restores a body-deleted namespace entry");
+    let definitions: Vec<_> = use_def
+        .end_of_scope_symbol_bindings(symbol)
+        .filter_map(|binding| binding.binding.definition())
+        .collect();
+    assert_eq!(
+        definitions.len(),
+        1,
+        "the tail restores a body-deleted namespace entry"
+    );
     let tail = definitions[0];
     assert!(!tail.kind(&db).is_user_visible());
     assert!(!tail.is_reexported(&db));
     assert!(tail.kind(&db).category(false, &parsed).is_binding());
     assert!(!tail.kind(&db).category(false, &parsed).is_declaration());
-    assert!(use_def.bindings_at_definition(tail)
-        .any(|binding| matches!(binding.binding, DefinitionState::Deleted)));
+    assert!(
+        use_def
+            .bindings_at_definition(tail)
+            .any(|binding| matches!(binding.binding, DefinitionState::Deleted))
+    );
 
-    let [Stmt::Assign(before), Stmt::Assign(_), Stmt::Assign(captured), Stmt::Delete(_)]
-        = class_node.body.as_slice() else {
-            panic!("fixture retains both source-time reads and the body deletion");
-        };
-    let Expr::Name(before) = &*before.value else { panic!("expected first name read") };
-    assert!(use_def.bindings_at_use(before.scoped_use_id(&db, program_file))
-        .all(|binding| binding.binding.definition().is_none()));
-    let Expr::Name(captured) = &*captured.value else { panic!("expected second name read") };
-    let source_binding = use_def.bindings_at_use(captured.scoped_use_id(&db, program_file))
-        .find_map(|binding| binding.binding.definition()).unwrap();
-    assert!(matches!(source_binding.kind(&db), CoreDefinitionKind::Assignment(_)));
-    assert_ne!(source_binding, tail);
+    let [
+        Stmt::Assign(before),
+        Stmt::Assign(_),
+        Stmt::Assign(captured),
+        Stmt::Delete(_),
+    ] = class_node.body.as_slice()
+    else {
+        panic!("fixture retains both source-time reads and the body deletion");
+    };
+    let Expr::Name(before) = &*before.value else {
+        panic!("expected first name read")
+    };
+    assert!(
+        use_def
+            .bindings_at_use(before.scoped_use_id(&db, program_file))
+            .all(|binding| binding.binding.definition().is_none())
+    );
+    let Expr::Name(captured) = &*captured.value else {
+        panic!("expected second name read")
+    };
+    let source_binding = use_def
+        .bindings_at_use(captured.scoped_use_id(&db, program_file))
+        .find_map(|binding| binding.binding.definition())
+        .unwrap();
     assert!(matches!(
-        index.expect_single_definition(class_node).kind(&db),
-        CoreDefinitionKind::Class(_)
-    ), "the class AST still has exactly its original outer definition");
+        source_binding.kind(&db),
+        CoreDefinitionKind::Assignment(_)
+    ));
+    assert_ne!(source_binding, tail);
+    assert!(
+        matches!(
+            index.expect_single_definition(class_node).kind(&db),
+            CoreDefinitionKind::Class(_)
+        ),
+        "the class AST still has exactly its original outer definition"
+    );
 }
 
 #[test]
 fn class_static_attributes_keep_existing_explicit_member_deletion_flow() {
     use ruff_python_ast::Stmt;
     use ty_python_core::ast_ids::HasScopedUseId;
-    use ty_python_core::scope::FileScopeId;
     use ty_python_core::definition::DefinitionState;
+    use ty_python_core::scope::FileScopeId;
     use ty_python_semantic::{HasType, SemanticModel};
 
     let source = r#"class Subject:
@@ -3728,28 +3866,53 @@ Subject.__static_attributes__
     let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db)).load(&db);
     let index = ty_python_core::semantic_index(&db, program_file);
     let model = SemanticModel::new(&db, program_file);
-    let reads: Vec<_> = parsed.suite().iter().filter_map(|statement| {
-        let Stmt::Expr(expression) = statement else { return None };
-        Some(expression.value.as_ref())
-    }).collect();
+    let reads: Vec<_> = parsed
+        .suite()
+        .iter()
+        .filter_map(|statement| {
+            let Stmt::Expr(expression) = statement else {
+                return None;
+            };
+            Some(expression.value.as_ref())
+        })
+        .collect();
     assert_eq!(reads.len(), 4);
     let use_def = index.use_def_map(FileScopeId::global());
     for expression in &reads[..2] {
         let attribute = expression.as_attribute_expr().unwrap();
-        assert!(use_def.bindings_at_use(attribute.scoped_use_id(&db, program_file))
-            .any(|binding| matches!(binding.binding, DefinitionState::Deleted)));
+        assert!(
+            use_def
+                .bindings_at_use(attribute.scoped_use_id(&db, program_file))
+                .any(|binding| matches!(binding.binding, DefinitionState::Deleted))
+        );
     }
     // Compare to the pre-existing explicit-member behavior; no claim that the common attribute
     // lookup's deleted-versus-undefined loss is repaired by this compiler-binding producer.
-    assert_eq!(reads[0].inferred_type(&model).unwrap(), reads[1].inferred_type(&model).unwrap());
+    assert_eq!(
+        reads[0].inferred_type(&model).unwrap(),
+        reads[1].inferred_type(&model).unwrap()
+    );
     for expression in &reads[2..] {
         let attribute = expression.as_attribute_expr().unwrap();
-        let bindings: Vec<_> = use_def.bindings_at_use(attribute.scoped_use_id(&db, program_file))
-            .map(|binding| binding.binding).collect();
-        assert!(!bindings.iter().any(|binding| matches!(binding, DefinitionState::Deleted)));
-        assert!(bindings.iter().any(|binding| binding.definition().is_some()));
+        let bindings: Vec<_> = use_def
+            .bindings_at_use(attribute.scoped_use_id(&db, program_file))
+            .map(|binding| binding.binding)
+            .collect();
+        assert!(
+            !bindings
+                .iter()
+                .any(|binding| matches!(binding, DefinitionState::Deleted))
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.definition().is_some())
+        );
     }
-    assert_eq!(reads[2].inferred_type(&model).unwrap(), reads[3].inferred_type(&model).unwrap());
+    assert_eq!(
+        reads[2].inferred_type(&model).unwrap(),
+        reads[3].inferred_type(&model).unwrap()
+    );
 }
 
 #[test]
@@ -3814,7 +3977,10 @@ def explicit_local():
 "#;
     let source = format!("from __future__ import strict\n{original}");
     let facts = export(&source);
-    assert_eq!(facts, export_from(&database(&source, AnalysisDialect::SoacStrictV1, true)));
+    assert_eq!(
+        facts,
+        export_from(&database(&source, AnalysisDialect::SoacStrictV1, true))
+    );
     for (name, actual_field) in [
         ("unread_outer.<locals>.Subject", "unread_field"),
         ("ExplicitGlobal", "global_field"),
@@ -3822,19 +3988,49 @@ def explicit_local():
         ("explicit_local.<locals>.Subject", "local_field"),
     ] {
         let record = class(&facts, name);
-        assert_eq!(record.dictionary, ClassDictionarySemantics::DictionaryBearing);
-        assert!(record.class_members.iter().all(|member| member.name != "__static_attributes__"));
-        assert!(record.instance_fields.iter().all(|field| field.name != "__static_attributes__"));
-        assert!(record.instance_fields.iter().any(|field| field.name == actual_field));
-        assert!(record.class_members.iter().filter_map(|member| member.definition.as_ref())
-            .all(|definition| definition.lexical_qualname != format!("{name}.<binding>")));
+        assert_eq!(
+            record.dictionary,
+            ClassDictionarySemantics::DictionaryBearing
+        );
+        assert!(
+            record
+                .class_members
+                .iter()
+                .all(|member| member.name != "__static_attributes__")
+        );
+        assert!(
+            record
+                .instance_fields
+                .iter()
+                .all(|field| field.name != "__static_attributes__")
+        );
+        assert!(
+            record
+                .instance_fields
+                .iter()
+                .any(|field| field.name == actual_field)
+        );
+        assert!(
+            record
+                .class_members
+                .iter()
+                .filter_map(|member| member.definition.as_ref())
+                .all(|definition| definition.lexical_qualname != format!("{name}.<binding>"))
+        );
     }
     let local = class(&facts, "explicit_local.<locals>.Subject");
-    assert!(local.class_members.iter().any(|member| member.name == "captured"),
-        "the earlier explicit tuple remains an ordinary source value under its real name");
+    assert!(
+        local
+            .class_members
+            .iter()
+            .any(|member| member.name == "captured"),
+        "the earlier explicit tuple remains an ordinary source value under its real name"
+    );
 
     let ordinary = database(original, AnalysisDialect::Python, false);
     let file = system_path_to_file(&ordinary, "/project/main.py").unwrap();
-    assert!(ty_python_semantic::Db::check_file(&ordinary, file).is_empty(),
-        "the original case10 runtime-positive source is valid in ordinary Python analysis too");
+    assert!(
+        ty_python_semantic::Db::check_file(&ordinary, file).is_empty(),
+        "the original case10 runtime-positive source is valid in ordinary Python analysis too"
+    );
 }

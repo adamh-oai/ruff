@@ -8,9 +8,9 @@ use crate::types::{
     callable::CallableFunctionProvenance,
     function::KnownFunction,
     infer::{
-        TypeInferenceBuilder, infer_definition_types,
+        TypeInferenceBuilder,
         builder::{DeclaredAndInferredType, DeferredExpressionState},
-        original_class_type,
+        infer_definition_types, original_class_type,
     },
     special_form::TypeQualifier,
 };
