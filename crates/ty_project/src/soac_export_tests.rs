@@ -3646,3 +3646,195 @@ def invalid(sys: Namespace, registry: dict[str, ModuleType]):
         }
     }
 }
+
+
+#[test]
+fn class_static_attributes_tail_is_an_ordered_internal_binding() {
+    use ruff_python_ast::{Expr, Stmt};
+    use ty_python_core::ast_ids::HasScopedUseId;
+    use ty_python_core::definition::DefinitionKind as CoreDefinitionKind;
+    use ty_python_core::definition::DefinitionState;
+
+    let source = r#"class Subject:
+    before = __static_attributes__
+    __static_attributes__ = 42
+    captured = __static_attributes__
+    del __static_attributes__
+"#;
+    let db = database(source, AnalysisDialect::Python, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let program_file = ty_python_semantic::Db::program_file(&db, file);
+    let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db)).load(&db);
+    let index = ty_python_core::semantic_index(&db, program_file);
+    let [Stmt::ClassDef(class_node)] = parsed.suite() else {
+        panic!("fixture has one source class");
+    };
+    let class_scope = index.scope_ids().find(|scope| scope.node(&db).as_class().is_some())
+        .unwrap().file_scope_id(&db);
+    let table = index.place_table(class_scope);
+    let use_def = index.use_def_map(class_scope);
+    let symbol = table.symbol_id("__static_attributes__").unwrap();
+    let definitions: Vec<_> = use_def.end_of_scope_symbol_bindings(symbol)
+        .filter_map(|binding| binding.binding.definition()).collect();
+    assert_eq!(definitions.len(), 1, "the tail restores a body-deleted namespace entry");
+    let tail = definitions[0];
+    assert!(!tail.kind(&db).is_user_visible());
+    assert!(!tail.is_reexported(&db));
+    assert!(tail.kind(&db).category(false, &parsed).is_binding());
+    assert!(!tail.kind(&db).category(false, &parsed).is_declaration());
+    assert!(use_def.bindings_at_definition(tail)
+        .any(|binding| matches!(binding.binding, DefinitionState::Deleted)));
+
+    let [Stmt::Assign(before), Stmt::Assign(_), Stmt::Assign(captured), Stmt::Delete(_)]
+        = class_node.body.as_slice() else {
+            panic!("fixture retains both source-time reads and the body deletion");
+        };
+    let Expr::Name(before) = &*before.value else { panic!("expected first name read") };
+    assert!(use_def.bindings_at_use(before.scoped_use_id(&db, program_file))
+        .all(|binding| binding.binding.definition().is_none()));
+    let Expr::Name(captured) = &*captured.value else { panic!("expected second name read") };
+    let source_binding = use_def.bindings_at_use(captured.scoped_use_id(&db, program_file))
+        .find_map(|binding| binding.binding.definition()).unwrap();
+    assert!(matches!(source_binding.kind(&db), CoreDefinitionKind::Assignment(_)));
+    assert_ne!(source_binding, tail);
+    assert!(matches!(
+        index.expect_single_definition(class_node).kind(&db),
+        CoreDefinitionKind::Class(_)
+    ), "the class AST still has exactly its original outer definition");
+}
+
+#[test]
+fn class_static_attributes_keep_existing_explicit_member_deletion_flow() {
+    use ruff_python_ast::Stmt;
+    use ty_python_core::ast_ids::HasScopedUseId;
+    use ty_python_core::scope::FileScopeId;
+    use ty_python_core::definition::DefinitionState;
+    use ty_python_semantic::{HasType, SemanticModel};
+
+    let source = r#"class Subject:
+    explicit: tuple[str, ...] = ()
+del Subject.explicit
+del Subject.__static_attributes__
+Subject.explicit
+Subject.__static_attributes__
+Subject.explicit = ("restored",)
+Subject.__static_attributes__ = ("restored",)
+Subject.explicit
+Subject.__static_attributes__
+"#;
+    let db = database(source, AnalysisDialect::Python, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let program_file = ty_python_semantic::Db::program_file(&db, file);
+    let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db)).load(&db);
+    let index = ty_python_core::semantic_index(&db, program_file);
+    let model = SemanticModel::new(&db, program_file);
+    let reads: Vec<_> = parsed.suite().iter().filter_map(|statement| {
+        let Stmt::Expr(expression) = statement else { return None };
+        Some(expression.value.as_ref())
+    }).collect();
+    assert_eq!(reads.len(), 4);
+    let use_def = index.use_def_map(FileScopeId::global());
+    for expression in &reads[..2] {
+        let attribute = expression.as_attribute_expr().unwrap();
+        assert!(use_def.bindings_at_use(attribute.scoped_use_id(&db, program_file))
+            .any(|binding| matches!(binding.binding, DefinitionState::Deleted)));
+    }
+    // Compare to the pre-existing explicit-member behavior; no claim that the common attribute
+    // lookup's deleted-versus-undefined loss is repaired by this compiler-binding producer.
+    assert_eq!(reads[0].inferred_type(&model).unwrap(), reads[1].inferred_type(&model).unwrap());
+    for expression in &reads[2..] {
+        let attribute = expression.as_attribute_expr().unwrap();
+        let bindings: Vec<_> = use_def.bindings_at_use(attribute.scoped_use_id(&db, program_file))
+            .map(|binding| binding.binding).collect();
+        assert!(!bindings.iter().any(|binding| matches!(binding, DefinitionState::Deleted)));
+        assert!(bindings.iter().any(|binding| binding.definition().is_some()));
+    }
+    assert_eq!(reads[2].inferred_type(&model).unwrap(), reads[3].inferred_type(&model).unwrap());
+}
+
+#[test]
+fn soac_compiler_static_attributes_do_not_export_user_capabilities() {
+    let original = r#"
+def unread_outer():
+    __static_attributes__ = "outer untouched"
+
+    class Subject:
+        def method(self):
+            self.unread_field = 1
+
+    return Subject.__static_attributes__, __static_attributes__
+
+
+__static_attributes__ = "global before"
+
+
+class ExplicitGlobal:
+    global __static_attributes__
+    captured = __static_attributes__
+
+    def method(self):
+        self.global_field = 2
+
+
+GLOBAL_RESULT = (
+    ExplicitGlobal.captured,
+    hasattr(ExplicitGlobal, "__static_attributes__"),
+    __static_attributes__,
+)
+
+
+def explicit_nonlocal():
+    __static_attributes__ = "nonlocal before"
+
+    class Subject:
+        nonlocal __static_attributes__
+        captured = __static_attributes__
+
+        def method(self):
+            self.nonlocal_field = 3
+
+    return (
+        Subject.captured,
+        hasattr(Subject, "__static_attributes__"),
+        __static_attributes__,
+    )
+
+
+def explicit_local():
+    __static_attributes__ = "outer untouched"
+
+    class Subject:
+        __static_attributes__ = ("manual",)
+        captured = __static_attributes__
+
+        def method(self):
+            self.local_field = 4
+
+    return Subject.captured, Subject.__static_attributes__, __static_attributes__
+"#;
+    let source = format!("from __future__ import strict\n{original}");
+    let facts = export(&source);
+    assert_eq!(facts, export_from(&database(&source, AnalysisDialect::SoacStrictV1, true)));
+    for (name, actual_field) in [
+        ("unread_outer.<locals>.Subject", "unread_field"),
+        ("ExplicitGlobal", "global_field"),
+        ("explicit_nonlocal.<locals>.Subject", "nonlocal_field"),
+        ("explicit_local.<locals>.Subject", "local_field"),
+    ] {
+        let record = class(&facts, name);
+        assert_eq!(record.dictionary, ClassDictionarySemantics::DictionaryBearing);
+        assert!(record.class_members.iter().all(|member| member.name != "__static_attributes__"));
+        assert!(record.instance_fields.iter().all(|field| field.name != "__static_attributes__"));
+        assert!(record.instance_fields.iter().any(|field| field.name == actual_field));
+        assert!(record.class_members.iter().filter_map(|member| member.definition.as_ref())
+            .all(|definition| definition.lexical_qualname != format!("{name}.<binding>")));
+    }
+    let local = class(&facts, "explicit_local.<locals>.Subject");
+    assert!(local.class_members.iter().any(|member| member.name == "captured"),
+        "the earlier explicit tuple remains an ordinary source value under its real name");
+
+    let ordinary = database(original, AnalysisDialect::Python, false);
+    let file = system_path_to_file(&ordinary, "/project/main.py").unwrap();
+    assert!(ty_python_semantic::Db::check_file(&ordinary, file).is_empty(),
+        "the original case10 runtime-positive source is valid in ordinary Python analysis too");
+}
