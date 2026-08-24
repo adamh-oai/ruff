@@ -3666,7 +3666,7 @@ fn class_static_attributes_tail_is_an_ordered_internal_binding() {
     let program_file = ty_python_semantic::Db::program_file(&db, file);
     let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db)).load(&db);
     let index = ty_python_core::semantic_index(&db, program_file);
-    let [Stmt::ClassDef(class_node)] = parsed.suite() else {
+    let [Stmt::ClassDef(class_node)] = parsed.suite().as_slice() else {
         panic!("fixture has one source class");
     };
     let class_scope = index.scope_ids().find(|scope| scope.node(&db).as_class().is_some())
