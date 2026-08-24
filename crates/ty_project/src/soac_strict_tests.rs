@@ -141,6 +141,26 @@ fn soac_strict_checked_field_rule_is_gated_by_shared_policy() {
     policy.checked_fields = CheckedFieldPolicy::SupportedAnnotations;
     let checked = analyze(source, policy);
     assert!(codes(&checked).contains(&DiagnosticCode::StrictIncompatibleFieldWrite));
+
+    let source = "from __future__ import strict\nclass C:\n    def __init__(self, source: int):\n        self.inferred = source\n        self.explicit: int = source\ndef invalid(value: C):\n    value.inferred = 'ordinary inferred field'\n    value.explicit = 'wrong'\n";
+    let mut policy = ResolvedStrictPolicy::default();
+    policy.checked_fields = CheckedFieldPolicy::SupportedAnnotations;
+    let checked = analyze(source, policy);
+    let diagnostics = checked
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::StrictIncompatibleFieldWrite)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "inference cannot select a mandatory field contract"
+    );
+    let start = source.find("value.explicit =").unwrap() as u32;
+    assert_eq!(
+        diagnostics[0].source_range,
+        SourceRange::new(start, start + "value.explicit".len() as u32)
+    );
 }
 
 #[test]

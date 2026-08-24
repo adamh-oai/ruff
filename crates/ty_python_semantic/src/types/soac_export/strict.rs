@@ -522,6 +522,7 @@ impl<'db> StrictChecker<'_, 'db> {
             && self.exporter.module.language_policy.checked_fields
                 == facts::CheckedFieldPolicy::SupportedAnnotations
             && let Some(value) = value
+            && matches!(field.place, Place::Defined(place) if place.origin.is_declared())
             && let Some(field_type) = field.place.ignore_possibly_undefined()
             && self
                 .exporter

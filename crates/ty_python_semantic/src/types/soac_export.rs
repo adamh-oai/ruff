@@ -40,6 +40,7 @@ use super::{
     list_members::all_end_of_scope_members,
     signatures::ParameterKind as TyParameterKind,
 };
+use crate::place::{Place, TypeOrigin};
 use crate::{Db, HasDefinition, HasType, SemanticModel};
 
 /// An owned source path, never a Salsa file key. Virtual editor files are not
@@ -1008,16 +1009,16 @@ impl<'db> Exporter<'db> {
         if !complete {
             reasons.insert(facts::DynamicClassReason::UnknownBase);
         }
-        // Layout or custom hook promises require a future runtime constructor.
-        // Export a dynamic proposal whenever current semantic lookup finds a
-        // non-builtin hook, including one inherited from another source class.
+        // Instance attribute hooks can bypass the proposed storage semantics.
+        // Construction callbacks (__init_subclass__/__set_name__) instead run
+        // after native pre-callback policy installation; their source presence
+        // alone is not a reason to exclude a class. This remains only a proposal:
+        // runtime admission must authenticate bases, callbacks and namespaces.
         for name in [
             "__getattribute__",
             "__getattr__",
             "__setattr__",
             "__delattr__",
-            "__init_subclass__",
-            "__set_name__",
         ] {
             if let Some(ty) = instance
                 .class_member(db, &self.env, name)
@@ -1117,6 +1118,7 @@ impl<'db> Exporter<'db> {
                     declaring_class,
                     uncertainty: uncertainty(&value_type),
                     value_type,
+                    annotation_origin: self.field_annotation_origin(field.first_declaration),
                     field_kind: if init_only {
                         facts::FieldKind::InitOnly
                     } else {
@@ -1169,6 +1171,7 @@ impl<'db> Exporter<'db> {
                 declaring_class: own_reference.clone(),
                 uncertainty: uncertainty(&value_type),
                 value_type,
+                annotation_origin: self.field_annotation_origin(Some(declaration)),
                 field_kind: if classvar {
                     facts::FieldKind::ClassVariable
                 } else if init_only {
@@ -1213,14 +1216,10 @@ impl<'db> Exporter<'db> {
             if !field_names.insert(name.clone()) {
                 continue;
             }
-            let Some(ty) = instance
-                .instance_member(db, &self.env, &name)
-                .place
-                .ignore_possibly_undefined()
-            else {
+            let Place::Defined(place) = instance.instance_member(db, &self.env, &name).place else {
                 continue;
             };
-            let value_type = self.value_type(ty);
+            let value_type = self.value_type(place.ty);
             fields.push(facts::FieldTypeFact {
                 name,
                 declaring_class: own_reference.clone(),
@@ -1231,6 +1230,10 @@ impl<'db> Exporter<'db> {
                 },
                 uncertainty: uncertainty(&value_type),
                 value_type,
+                annotation_origin: match place.origin {
+                    TypeOrigin::Declared => facts::AnnotationOrigin::Explicit,
+                    TypeOrigin::Inferred => facts::AnnotationOrigin::Inferred,
+                },
                 read_policy: facts::FieldReadPolicy::PythonAttribute,
                 write_policy: facts::FieldWritePolicy::DeclaredField,
                 initialization: facts::InitializationPolicy::MayBeAbsent,
@@ -1397,6 +1400,30 @@ impl<'db> Exporter<'db> {
         let class = scope.node(self.db).as_class()?;
         let definition = index.expect_single_definition(class);
         self.class_reference(original_class_type(self.db, definition)?)
+    }
+
+    fn field_annotation_origin(
+        &self,
+        declaration: Option<Definition<'db>>,
+    ) -> facts::AnnotationOrigin {
+        let Some(declaration) = declaration else {
+            return facts::AnnotationOrigin::Unresolved;
+        };
+        let Some(declared) = super::inferred_declaration(self.db, declaration).declared() else {
+            return facts::AnnotationOrigin::Unresolved;
+        };
+        // `Final` without a value annotation still gets its value type from
+        // inference. The semantic declaration uses Unknown + FINAL for that
+        // case; it must not become a mandatory runtime type contract.
+        if declared.qualifiers().contains(TypeQualifiers::FINAL)
+            && declared.inner_type().is_unknown()
+        {
+            return facts::AnnotationOrigin::Inferred;
+        }
+        match declared.origin() {
+            TypeOrigin::Declared => facts::AnnotationOrigin::Explicit,
+            TypeOrigin::Inferred => facts::AnnotationOrigin::Inferred,
+        }
     }
 
     fn field_default(

@@ -209,6 +209,13 @@ fn soac_export_uses_checker_dataclass_fields_options_and_synthesized_signature()
         "from __future__ import strict\nfrom dataclasses import dataclass, field, InitVar\nfrom typing import ClassVar\n@dataclass\nclass Base:\n    first: int = 1\n@dataclass(slots=True, kw_only=True)\nclass Child(Base):\n    value: str = 'x'\n    temporary: InitVar[int] = 2\n    shared: ClassVar[int] = 3\n    items: list[int] = field(default_factory=list)\n",
     );
     let child = class(&facts, "Child");
+    assert!(
+        child
+            .instance_fields
+            .iter()
+            .all(|field| { field.annotation_origin == AnnotationOrigin::Explicit }),
+        "inherited and generated dataclass fields retain their actual declaration origin"
+    );
     let transform = child.transform.as_ref().unwrap();
     assert_eq!(transform.kind, TransformKind::StdlibDataclass);
     let options = transform.dataclass_options.as_ref().unwrap();
@@ -261,6 +268,124 @@ fn soac_export_uses_checker_dataclass_fields_options_and_synthesized_signature()
 }
 
 #[test]
+fn soac_export_field_contract_origin_comes_from_semantic_declarations_not_inferred_types() {
+    let source = r#"from __future__ import strict
+from typing import Any, Final
+class Model:
+    class_body: int
+    defaulted: int = 0
+    inferred_default = 0
+    def __init__(self, source: int):
+        self.explicit_self: int = source
+        self.inferred_from_parameter = source
+        self.inferred_from_literal = 1
+        self.inferred_default = source
+        self.explicit_any: Any = source
+        self.bare_final: Final = source
+        self.final_annotation: Final[int] = source
+        self.uninitialized: str
+"#;
+    let one = export_from(&database(source, AnalysisDialect::SoacStrictV1, false));
+    let two = export_from(&database(source, AnalysisDialect::SoacStrictV1, true));
+    assert_eq!(one, two);
+    let model = class(&one, "Model");
+    let field = |name| {
+        model
+            .instance_fields
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap()
+    };
+    for name in [
+        "class_body",
+        "defaulted",
+        "explicit_self",
+        "explicit_any",
+        "final_annotation",
+        "uninitialized",
+    ] {
+        assert_eq!(
+            field(name).annotation_origin,
+            AnnotationOrigin::Explicit,
+            "{name}"
+        );
+    }
+    for name in [
+        "inferred_from_parameter",
+        "inferred_from_literal",
+        "inferred_default",
+        "bare_final",
+    ] {
+        assert_eq!(
+            field(name).annotation_origin,
+            AnnotationOrigin::Inferred,
+            "{name}"
+        );
+    }
+    assert_eq!(field("explicit_any").value_type, StaticType::Any);
+    assert_eq!(
+        field("explicit_self").value_type,
+        field("inferred_from_parameter").value_type
+    );
+    assert_eq!(
+        function(&one, "Model.__init__").signature.parameters[1].annotation_origin,
+        AnnotationOrigin::Explicit,
+        "an annotated constructor argument does not manufacture a field annotation",
+    );
+}
+
+#[test]
+fn soac_export_construction_callbacks_remain_candidates_without_instance_hook_authority() {
+    let facts = export(
+        r#"from __future__ import strict
+class Base:
+    def __init_subclass__(cls):
+        pass
+class Child(Base):
+    value: int = 7
+class Named:
+    def __set_name__(self, owner, name):
+        pass
+class AttributeHook:
+    def __getattribute__(self, name):
+        return object.__getattribute__(self, name)
+class InheritedAttributeHook(AttributeHook):
+    pass
+"#,
+    );
+    for name in ["Base", "Child", "Named"] {
+        assert_eq!(
+            class(&facts, name).participation,
+            ParticipationProposal::Candidate,
+            "{name}"
+        );
+    }
+    let hook = class(&facts, "Base")
+        .methods
+        .iter()
+        .find(|method| method.name == "__init_subclass__")
+        .unwrap();
+    assert_eq!(hook.binding, MethodBinding::Class);
+    assert!(hook.implementation.is_some());
+    assert!(
+        hook.signature
+            .parameters
+            .iter()
+            .all(|parameter| { parameter.annotation_origin != AnnotationOrigin::Explicit })
+    );
+    for name in ["AttributeHook", "InheritedAttributeHook"] {
+        assert!(
+            matches!(
+                &class(&facts, name).participation,
+                ParticipationProposal::Dynamic(reasons)
+                    if reasons.contains(&DynamicClassReason::CustomAttributeHooks)
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn soac_export_preserves_dynamic_uncertainty_protocols_and_framework_fallback() {
     let facts = export(
         "from __future__ import strict\nfrom typing import Any, Protocol\nclass Shape(Protocol):\n    def method(self) -> int: ...\nclass Meta(type): pass\nclass Managed(metaclass=Meta):\n    value: int\ndef decorate(cls):\n    return cls\n@decorate\nclass Wrapped:\n    value: int\ndef uncertain(explicit: Any, implicit, protocol: Shape):\n    explicit.method()\n    implicit.method()\n    protocol.method()\n",
@@ -306,6 +431,14 @@ fn soac_export_ignored_diagnostics_demote_affected_class_but_not_unrelated_class
         class(&facts, "Fine").participation,
         ParticipationProposal::Candidate
     );
+    assert_eq!(
+        class(&facts, "Fine").instance_fields[0].annotation_origin,
+        AnnotationOrigin::Explicit
+    );
+    assert!(matches!(
+        class(&facts, "Damaged").instance_fields[0].value_type,
+        StaticType::Unknown
+    ));
 }
 
 #[test]
