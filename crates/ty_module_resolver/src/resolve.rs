@@ -255,15 +255,66 @@ fn resolve_module_query<'db>(
     let resolver_environment = module_name.resolver_environment(db);
     let _span = tracing::trace_span!("resolve_module", %name).entered();
 
+    if let Some((_, path)) = resolver_environment.search_paths(db).selected_source_modules
+        .iter().find(|(selected, _)| selected == name)
+    {
+        // A selected source is authoritative in this explicit environment.
+        // If it disappears, do not silently substitute a stub of the same name.
+        return selected_source_module(db, resolver_environment, name, path);
+    }
+
     let Some(resolved) = resolve_name(db, resolver_environment, name, mode) else {
         tracing::debug!("Module `{name}` not found in search paths");
         return None;
     };
 
-    resolved
+    let module = resolved
         .into_iter()
         .next()
-        .map(|candidate| candidate.into_module(db, resolver_environment, name))
+        .map(|candidate| candidate.into_module(db, resolver_environment, name))?;
+    selected_source_owner_matches(db, module, name)
+}
+
+fn selected_source_owner_matches<'db>(
+    db: &'db dyn Db,
+    module: Module<'db>,
+    name: &ModuleName,
+) -> Option<Module<'db>> {
+    if let Some(path) = module.file(db).and_then(|file| file.path(db).as_system_path()) {
+        if module.resolver_environment(db).search_paths(db).selected_source_modules.iter().any(
+            |(selected, source)| selected != name && source.as_str() == path.as_str(),
+        ) {
+            // One source file cannot silently acquire a second semantic owner
+            // inside the explicitly selected source environment.
+            return None;
+        }
+    }
+    Some(module)
+}
+
+fn selected_source_module<'db>(
+    db: &'db dyn Db,
+    environment: ResolverEnvironment<'db>,
+    name: &ModuleName,
+    path: &SystemPath,
+) -> Option<Module<'db>> {
+    let file = system_path_to_file(db, path).ok()?;
+    if file.source_type(db) != PySourceType::Python {
+        return None;
+    }
+    let parent = path.parent()?.to_path_buf();
+    let search_path = SearchPath::first_party(db.system(), parent).ok()?;
+    let kind = if path.file_name() == Some("__init__.py") {
+        ModuleKind::Package
+    } else {
+        ModuleKind::Module
+    };
+    // Selection does not grant KnownModule identity by spelling. The exact
+    // source file and logical owner travel together; builtin provenance stays
+    // with the ordinary standard-library resolver.
+    Some(Module::file_module(
+        db, file, environment, Cow::Borrowed(name), kind, search_path,
+    ))
 }
 
 /// Like `resolve_module_query` but for cases where it failed to resolve the module
@@ -289,6 +340,12 @@ fn desperately_resolve_module<'db>(
     let resolver_environment = module_name.resolver_environment(db);
     let _span = tracing::trace_span!("desperately_resolve_module", %name).entered();
 
+    if let Some((_, path)) = resolver_environment.search_paths(db).selected_source_modules
+        .iter().find(|(selected, _)| selected == name)
+    {
+        return selected_source_module(db, resolver_environment, name, path);
+    }
+
     let Some(resolved) =
         desperately_resolve_name(db, importing_file, resolver_environment, name, mode)
     else {
@@ -307,6 +364,7 @@ fn desperately_resolve_module<'db>(
         .into_iter()
         .next()
         .map(|candidate| candidate.into_module(db, resolver_environment, name))
+        .and_then(|module| selected_source_owner_matches(db, module, name))
 }
 
 /// Resolves the module for the given path.
@@ -346,6 +404,15 @@ pub fn file_to_module<'db>(
     let resolver_environment = resolver_file.environment(db);
     let file = resolver_file.file(db);
     let _span = tracing::trace_span!("file_to_module", ?file).entered();
+
+    if let Some(path) = file.path(db).as_system_path() {
+        if let Some((name, selected)) = resolver_environment.search_paths(db)
+            .selected_source_modules.iter()
+            .find(|(_, selected)| selected.as_str() == path.as_str())
+        {
+            return selected_source_module(db, resolver_environment, name, selected);
+        }
+    }
 
     let path = SystemOrVendoredPathRef::try_from_file(db, file)?;
 
@@ -684,6 +751,10 @@ pub struct SearchPaths {
     site_packages: Vec<SearchPath>,
 
     typeshed_versions: TypeshedVersions,
+
+    /// Explicit offline source selection, empty for ordinary ty. Each logical
+    /// name and canonical source path has exactly one owner in this environment.
+    selected_source_modules: Vec<(ModuleName, SystemPathBuf)>,
 }
 
 impl SearchPaths {
@@ -851,6 +922,7 @@ impl SearchPaths {
             real_stdlib_path,
             site_packages,
             typeshed_versions,
+            selected_source_modules: Vec::new(),
         })
     }
 
@@ -864,7 +936,43 @@ impl SearchPaths {
             real_stdlib_path: None,
             site_packages: vec![],
             typeshed_versions: vendored_typeshed_versions(vendored),
+            selected_source_modules: Vec::new(),
         }
+    }
+
+    /// Bind explicitly selected Python sources to their actual logical owners.
+    ///
+    /// This changes both forward import resolution and reverse file ownership.
+    /// It does not opt a file into any analysis dialect or grant builtin identity.
+    pub fn with_selected_source_modules(
+        mut self,
+        system: &dyn System,
+        sources: impl IntoIterator<Item = (ModuleName, SystemPathBuf)>,
+    ) -> Result<Self, String> {
+        let mut selected = Vec::new();
+        let mut paths = FxHashSet::default();
+        for (name, path) in sources {
+            if !path.is_absolute() || path.extension() != Some("py") {
+                return Err("selected modules require absolute Python source paths".into());
+            }
+            let path = system.canonicalize_path(&path)
+                .map_err(|error| format!("cannot resolve selected source {path}: {error}"))?;
+            if !system.is_file(&path) || !paths.insert(path.clone()) {
+                return Err("selected sources must be distinct existing files".into());
+            }
+            selected.push((name, path));
+        }
+        selected.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if selected.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err("selected module names must be unique".into());
+        }
+        self.selected_source_modules = selected;
+        Ok(self)
+    }
+
+    /// Carry the same explicit source owners into a per-file resolver environment.
+    pub fn inherit_selected_source_modules(&mut self, parent: &Self) {
+        self.selected_source_modules.clone_from(&parent.selected_source_modules);
     }
 
     /// Registers file roots for all non-dynamically discovered search paths.
@@ -881,6 +989,13 @@ impl SearchPaths {
                 // site-packages inside `.venv`, need their own search-path root.
                 if !path.is_first_party() || files.root(db, system_path).is_none() {
                     files.try_add_root(db, system_path, FileRootKind::SearchPath);
+                }
+            }
+        }
+        for (_, source) in &self.selected_source_modules {
+            if let Some(parent) = source.parent() {
+                if files.root(db, parent).is_none() {
+                    files.try_add_root(db, parent, FileRootKind::SearchPath);
                 }
             }
         }
@@ -927,6 +1042,7 @@ pub(crate) fn dynamic_resolution_paths<'db>(
         site_packages,
         typeshed_versions: _,
         real_stdlib_path,
+        selected_source_modules: _,
     } = mode.resolver_environment(db).search_paths(db);
 
     let mut dynamic_paths = Vec::new();
@@ -2455,6 +2571,75 @@ mod tests {
             &SystemPathBuf::from("/alternate/shared.py")
         );
         assert_ne!(primary_module, alternate_module);
+    }
+
+    #[test]
+    fn selected_source_modules_bind_forward_and_reverse_to_the_exact_file() {
+        let TestCase { db, src, .. } = TestCaseBuilder::new()
+            .with_src_files(&[
+                ("driver.py", "class Value: pass"),
+                ("helper.py", "import __main__"),
+            ])
+            .with_vendored_typeshed()
+            .build();
+        let importer = system_path_to_file(&db, src.join("helper.py")).unwrap();
+        let source = system_path_to_file(&db, src.join("driver.py")).unwrap();
+        let ordinary = db.resolver_environment();
+        let main = ModuleName::new_static("__main__").unwrap();
+        let baseline = resolve_module(&db, ImportingFile::File(importer, ordinary), &main)
+            .expect("ordinary ty resolves its actual bundled entry-point stub");
+        assert_ne!(baseline.file(&db), Some(source));
+
+        for name in [main, ModuleName::new_static("entry_alias").unwrap()] {
+            let paths = db.search_paths().clone().with_selected_source_modules(
+                db.system(), [(name.clone(), src.join("driver.py"))],
+            ).unwrap();
+            let selected = ResolverEnvironment::new(
+                &db, ordinary.python_version(&db), &paths,
+            );
+            assert_ne!(selected, ordinary);
+            let module = resolve_module(&db, ImportingFile::File(importer, selected), &name)
+                .expect("explicit source binding");
+            assert_eq!(module.file(&db), Some(source));
+            assert_eq!(module.name(&db), &name);
+            assert_eq!(
+                file_to_module(&db, ResolverFile::new(&db, source, selected)),
+                Some(module),
+            );
+            assert!(module.known(&db).is_none(), "selection does not forge builtin identity");
+            assert!(
+                resolve_module(
+                    &db,
+                    ImportingFile::File(importer, selected),
+                    &ModuleName::new_static("driver").unwrap(),
+                ).is_none(),
+                "the selected file must not acquire an unselected second semantic owner",
+            );
+        }
+        assert_eq!(
+            resolve_module(&db, ImportingFile::File(importer, ordinary),
+                &ModuleName::new_static("__main__").unwrap()),
+            Some(baseline),
+            "ordinary ty's environment and stub resolution are unchanged",
+        );
+    }
+
+    #[test]
+    fn selected_source_modules_reject_ambiguous_file_or_name_ownership() {
+        let TestCase { db, src, .. } = TestCaseBuilder::new()
+            .with_src_files(&[("one.py", ""), ("two.py", "")])
+            .with_vendored_typeshed()
+            .build();
+        let one = ModuleName::new_static("one").unwrap();
+        let two = ModuleName::new_static("two").unwrap();
+        assert!(db.search_paths().clone().with_selected_source_modules(
+            db.system(),
+            [(one.clone(), src.join("one.py")), (two, src.join("one.py"))],
+        ).is_err());
+        assert!(db.search_paths().clone().with_selected_source_modules(
+            db.system(),
+            [(one.clone(), src.join("one.py")), (one, src.join("two.py"))],
+        ).is_err());
     }
 
     #[test]

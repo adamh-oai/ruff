@@ -131,11 +131,7 @@ fn export_soac_module_impl(
             "source is not valid in the selected checker dialect and Python version".into(),
         ));
     }
-    let strict = parsed.suite().iter().any(|statement| {
-        matches!(statement, ast::Stmt::ImportFrom(import)
-            if import.level == 0 && import.module.as_deref() == Some("__future__")
-                && import.names.iter().any(|alias| alias.name.as_str() == "strict"))
-    });
+    let strict = soac_source::has_strict_future(parsed.suite());
     if strict {
         soac_source::validate_source_literals(source.as_str(), parsed.tokens()).map_err(|error| {
             facts::ContractError::InvalidSourceIdentity(error.to_string())
@@ -1589,6 +1585,17 @@ impl<'db> Exporter<'db> {
         let mut field_bindings = Vec::new();
         if let Some(generator) = generator {
             for (name, field) in class.fields(db, None, generator) {
+                if field.first_declaration
+                    .and_then(|definition| self.class_literal_for_scope(definition.scope(db)))
+                    .is_some_and(|declaring| declaring.known(db) == Some(KnownClass::Object))
+                {
+                    // The generic Pydantic field query also enumerates object's
+                    // stub annotations. They describe builtin attributes, not
+                    // source-declared model storage. Object remains the real
+                    // Builtin base; do not invent a source ClassReference or
+                    // relabel the declaration as belonging to the model.
+                    continue;
+                }
                 let value_type = self.value_type(field.declared_ty);
                 let (init_only, default_ty, initialized) = match &field.kind {
                     TyFieldKind::Dataclass {
@@ -1960,11 +1967,15 @@ impl<'db> Exporter<'db> {
         Some(identity)
     }
 
-    fn class_for_scope(&self, scope: ScopeId<'db>) -> Option<facts::ClassReference> {
+    fn class_literal_for_scope(&self, scope: ScopeId<'db>) -> Option<ClassLiteral<'db>> {
         let index = semantic_index(self.db, scope.program_file(self.db));
         let class = scope.node(self.db).as_class()?;
         let definition = index.expect_single_definition(class);
-        self.class_reference(original_class_type(self.db, definition)?)
+        original_class_type(self.db, definition)
+    }
+
+    fn class_for_scope(&self, scope: ScopeId<'db>) -> Option<facts::ClassReference> {
+        self.class_reference(self.class_literal_for_scope(scope)?)
     }
 
     fn enclosing_class_scope(&self, mut scope: ScopeId<'db>) -> Option<ScopeId<'db>> {

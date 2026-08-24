@@ -3266,3 +3266,72 @@ fn soac_source_dependency_f_and_t_strings_still_infer_interpolation_operands() {
         assert!(!matches!(observed.value_type, StaticType::Literal(_)));
     }
 }
+
+
+fn pydantic_export_database(source: &str) -> ProjectDatabase {
+    let system = TestSystem::default();
+    let project = SystemPathBuf::from("/project");
+    system.memory_file_system().write_files_all([
+        (
+            project.join("ty.toml"),
+            "[environment]\npython-version = '3.15'\nextra-paths = ['/dependencies']\n",
+        ),
+        (project.join("main.py"), source),
+        (
+            SystemPathBuf::from("/dependencies/pydantic/__init__.pyi"),
+            "from .main import BaseModel as BaseModel\n",
+        ),
+        (
+            SystemPathBuf::from("/dependencies/pydantic/main.pyi"),
+            "from typing import dataclass_transform\n@dataclass_transform(kw_only_default=True)\nclass BaseModel: ...\n",
+        ),
+    ]).unwrap();
+    let metadata = ProjectMetadata::discover(&project, &system).unwrap();
+    ProjectDatabase::fallible_with_analysis_dialect(
+        metadata, system, AnalysisDialect::SoacStrictV1,
+    ).unwrap()
+}
+
+#[test]
+fn soac_export_pydantic_fields_do_not_invent_source_owned_builtin_object_members() {
+    let db = pydantic_export_database(
+        "from __future__ import strict\nfrom pydantic import BaseModel\n\nclass Item(BaseModel):\n    id: int\n    name: str\n",
+    );
+    let facts = export_from(&db);
+    let item = class(&facts, "Item");
+    assert!(matches!(&item.participation, ParticipationProposal::Dynamic(reasons)
+        if reasons.contains(&DynamicClassReason::FrameworkManaged)));
+    assert!(item.inheritance.linearized_bases.contains(
+        &BaseReference::Builtin(BuiltinType::Object),
+    ));
+    assert_eq!(
+        item.instance_fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
+        ["id", "name"],
+    );
+    for field in &item.instance_fields {
+        assert_eq!(field.declaring_class.definition, item.identity);
+    }
+    assert!(facts.diagnostics.iter().all(|diagnostic|
+        diagnostic.suppressed || diagnostic.severity != DiagnosticSeverity::Error
+    ));
+}
+
+#[test]
+fn soac_export_pydantic_fields_keep_user_object_names_and_real_overrides() {
+    let db = pydantic_export_database(
+        "from __future__ import strict\nfrom pydantic import BaseModel\n\nclass object:\n    ordinary: int\n    __doc__: str | None\n\nclass Item(object, BaseModel):\n    id: int\n",
+    );
+    let facts = export_from(&db);
+    let item = class(&facts, "Item");
+    let user = class(&facts, "object");
+    assert!(item.inheritance.linearized_bases.iter().any(
+        |base| base.as_class().is_some_and(|base| base.definition == user.identity),
+    ));
+    for name in ["ordinary", "__doc__"] {
+        assert_eq!(field(&facts, "Item", name).declaring_class.definition, user.identity);
+    }
+    assert_eq!(field(&facts, "Item", "id").declaring_class.definition, item.identity);
+    assert!(facts.diagnostics.iter().all(|diagnostic|
+        diagnostic.suppressed || diagnostic.severity != DiagnosticSeverity::Error
+    ));
+}
