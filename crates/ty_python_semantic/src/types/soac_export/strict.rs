@@ -233,6 +233,7 @@ pub(super) fn check(exporter: &mut Exporter<'_>, body: &[ast::Stmt]) {
                     .inheritance
                     .linearized_bases
                     .iter()
+                    .filter_map(facts::BaseReference::as_class)
                     .any(|base| dynamic.contains(&base.definition))
             {
                 class.participation = facts::ParticipationProposal::Dynamic(BTreeSet::from([
@@ -463,6 +464,7 @@ impl<'db> StrictChecker<'_, 'db> {
                     .inheritance
                     .linearized_bases
                     .iter()
+                    .filter_map(facts::BaseReference::as_class)
                     .map(|base| &base.definition),
             )
             .find_map(|identity| {

@@ -2617,6 +2617,179 @@ fn inheritance_database(base: &str, unrelated_first: bool) -> (ProjectDatabase, 
 }
 
 #[test]
+fn soac_export_builtin_bases_use_semantic_identity_in_direct_bases_and_mro() {
+    let source = r#"from __future__ import strict
+import builtins
+from builtins import object as ImportedObject
+Root = builtins.object
+class Implicit:
+    pass
+class Explicit(object):
+    pass
+class Qualified(builtins.object):
+    pass
+class Imported(ImportedObject):
+    pass
+class Aliased(Root):
+    pass
+class Derived(Explicit):
+    pass
+def factory():
+    class object:
+        pass
+    LocalRoot = object
+    class Shadowed(LocalRoot):
+        pass
+    return object, Shadowed
+"#;
+    let facts = export(source);
+    assert!(facts.diagnostics.iter().all(|diagnostic| {
+        diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
+    }));
+    let object = BaseReference::Builtin(BuiltinType::Object);
+    for name in ["Implicit", "Explicit", "Qualified", "Imported", "Aliased"] {
+        let class = class(&facts, name);
+        assert_eq!(
+            class.participation,
+            ParticipationProposal::Candidate,
+            "{name}"
+        );
+        assert!(class.inheritance.complete, "{name}");
+        assert_eq!(class.inheritance.linearized_bases, vec![object.clone()]);
+        assert_eq!(
+            class.bases,
+            if name == "Implicit" {
+                vec![]
+            } else {
+                vec![object.clone()]
+            },
+            "{name}"
+        );
+    }
+    let explicit = ClassReference {
+        definition: class(&facts, "Explicit").identity.clone(),
+        source_digest: facts.source_digest,
+    };
+    let derived = class(&facts, "Derived");
+    assert_eq!(derived.bases, vec![BaseReference::Class(explicit.clone())]);
+    assert_eq!(
+        derived.inheritance.linearized_bases,
+        vec![BaseReference::Class(explicit), object.clone()]
+    );
+    let shadow = ClassReference {
+        definition: class(&facts, "factory.<locals>.object").identity.clone(),
+        source_digest: facts.source_digest,
+    };
+    let shadowed = class(&facts, "factory.<locals>.Shadowed");
+    assert_eq!(shadowed.participation, ParticipationProposal::Candidate);
+    assert_eq!(shadowed.bases, vec![BaseReference::Class(shadow.clone())]);
+    assert_eq!(
+        shadowed.inheritance.linearized_bases,
+        vec![BaseReference::Class(shadow), object]
+    );
+}
+
+#[test]
+fn soac_export_builtin_base_identity_does_not_grant_participation() {
+    let facts = export(
+        r#"from __future__ import strict
+class IntChild(int):
+    pass
+class ListChild(list[int]):
+    pass
+class DictChild(dict[str, int]):
+    pass
+class Meta(type):
+    pass
+class Custom(metaclass=Meta):
+    pass
+class Child(Custom):
+    pass
+"#,
+    );
+    for (name, builtin) in [
+        ("IntChild", BuiltinType::Int),
+        ("ListChild", BuiltinType::List),
+        ("DictChild", BuiltinType::Dict),
+        ("Meta", BuiltinType::Type),
+    ] {
+        let class = class(&facts, name);
+        assert_eq!(class.bases, vec![BaseReference::Builtin(builtin)]);
+        // The logical typeshed MRO may include modeled ABCs which are not
+        // physical CPython bases. Preserve those source references in place.
+        assert_eq!(
+            class.inheritance.linearized_bases.first(),
+            Some(&BaseReference::Builtin(builtin))
+        );
+        assert_eq!(
+            class.inheritance.linearized_bases.last(),
+            Some(&BaseReference::Builtin(BuiltinType::Object))
+        );
+        assert!(
+            matches!(&class.participation, ParticipationProposal::Dynamic(reasons)
+            if reasons.contains(&DynamicClassReason::MutableBase)),
+            "{name}"
+        );
+    }
+    assert!(matches!(
+        class(&facts, "Child").participation,
+        ParticipationProposal::Dynamic(_)
+    ));
+}
+
+#[test]
+fn soac_export_builtin_base_alias_changes_invalidate_real_source_references() {
+    let source = "from __future__ import strict\nfrom builtins import object as Root\nclass Base(Root): pass\n";
+    let (mut db, system) = inheritance_database(source, false);
+    let initial = export_from(&db);
+    assert_eq!(
+        class(&initial, "Child").participation,
+        ParticipationProposal::Candidate
+    );
+    assert_eq!(
+        class(&initial, "Child").inheritance.linearized_bases.last(),
+        Some(&BaseReference::Builtin(BuiltinType::Object))
+    );
+    let changed = "from __future__ import strict\nclass object:\n    def __getattr__(self, name: str) -> int: return 1\nRoot = object\nclass Base(Root): pass\n";
+    system
+        .memory_file_system()
+        .write_file_all("/project/base.py", changed)
+        .unwrap();
+    db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+        "/project/base.py".into(),
+    )]);
+    let updated = export_from(&db);
+    let child = class(&updated, "Child");
+    assert!(
+        matches!(&child.participation, ParticipationProposal::Dynamic(reasons)
+        if reasons.contains(&DynamicClassReason::MutableBase))
+    );
+    let shadow = child
+        .inheritance
+        .linearized_bases
+        .iter()
+        .filter_map(BaseReference::as_class)
+        .find(|base| {
+            base.definition.module.module_name == "base"
+                && base.definition.lexical_qualname == "object"
+        })
+        .unwrap();
+    assert_eq!(shadow.source_digest, Fingerprint::digest(changed));
+    assert_eq!(
+        child.inheritance.linearized_bases.last(),
+        Some(&BaseReference::Builtin(BuiltinType::Object))
+    );
+    system
+        .memory_file_system()
+        .write_file_all("/project/base.py", source)
+        .unwrap();
+    db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+        "/project/base.py".into(),
+    )]);
+    assert_eq!(export_from(&db), initial);
+}
+
+#[test]
 fn soac_export_external_strict_bases_are_semantic_proposals_not_mutable_by_location() {
     let source = "from __future__ import strict\nclass Base:\n    def __init__(self):\n        self.inherited: int = 1\n";
     let (first, _) = inheritance_database(source, false);
@@ -2626,11 +2799,20 @@ fn soac_export_external_strict_bases_are_semantic_proposals_not_mutable_by_locat
     let child = class(&facts, "Child");
     assert_eq!(child.participation, ParticipationProposal::Candidate);
     assert!(child.inheritance.complete);
-    assert_eq!(child.bases[0].definition.module.module_name, "bridge");
+    assert_eq!(
+        child.bases[0]
+            .as_class()
+            .unwrap()
+            .definition
+            .module
+            .module_name,
+        "bridge"
+    );
     let ancestor = child
         .inheritance
         .linearized_bases
         .iter()
+        .filter_map(BaseReference::as_class)
         .find(|base| base.definition.module.module_name == "base")
         .unwrap();
     let base_file = system_path_to_file(&first, "/project/base.py").unwrap();

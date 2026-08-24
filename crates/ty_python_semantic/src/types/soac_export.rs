@@ -328,6 +328,29 @@ fn unsupported(kind: facts::UnsupportedTypeKind) -> facts::StaticType {
     }
 }
 
+/// Only the checker's resolved builtin identity selects this projection. A
+/// source class or alias spelled `object` does not establish a builtin base.
+fn builtin_type(known: KnownClass) -> Option<facts::BuiltinType> {
+    use facts::BuiltinType as B;
+    Some(match known {
+        KnownClass::Object => B::Object,
+        KnownClass::Bool => B::Bool,
+        KnownClass::Int => B::Int,
+        KnownClass::Float => B::Float,
+        KnownClass::Complex => B::Complex,
+        KnownClass::Str => B::Str,
+        KnownClass::Bytes => B::Bytes,
+        KnownClass::Bytearray => B::ByteArray,
+        KnownClass::List => B::List,
+        KnownClass::Dict => B::Dict,
+        KnownClass::Set => B::Set,
+        KnownClass::FrozenSet => B::FrozenSet,
+        KnownClass::Tuple => B::Tuple,
+        KnownClass::Type => B::Type,
+        _ => return None,
+    })
+}
+
 fn uncertainty(ty: &facts::StaticType) -> BTreeSet<facts::UncertaintyReason> {
     use facts::{StaticType as S, UncertaintyReason as U};
     match ty {
@@ -543,6 +566,14 @@ impl<'db> Exporter<'db> {
         })
     }
 
+    fn base_reference(&self, class: ClassLiteral<'db>) -> Option<facts::BaseReference> {
+        class
+            .known(self.db)
+            .and_then(builtin_type)
+            .map(facts::BaseReference::Builtin)
+            .or_else(|| self.class_reference(class).map(facts::BaseReference::Class))
+    }
+
     fn value_type(&self, ty: Type<'db>) -> facts::StaticType {
         self.value_type_at_depth(ty, 0)
     }
@@ -639,23 +670,7 @@ impl<'db> Exporter<'db> {
                         },
                     );
                 }
-                let builtin = match known {
-                    Some(KnownClass::Object) => Some(B::Object),
-                    Some(KnownClass::Bool) => Some(B::Bool),
-                    Some(KnownClass::Int) => Some(B::Int),
-                    Some(KnownClass::Float) => Some(B::Float),
-                    Some(KnownClass::Complex) => Some(B::Complex),
-                    Some(KnownClass::Str) => Some(B::Str),
-                    Some(KnownClass::Bytes) => Some(B::Bytes),
-                    Some(KnownClass::Bytearray) => Some(B::ByteArray),
-                    Some(KnownClass::List) => Some(B::List),
-                    Some(KnownClass::Dict) => Some(B::Dict),
-                    Some(KnownClass::Set) => Some(B::Set),
-                    Some(KnownClass::FrozenSet) => Some(B::FrozenSet),
-                    Some(KnownClass::Tuple) => Some(B::Tuple),
-                    Some(KnownClass::Type) => Some(B::Type),
-                    _ => None,
-                };
+                let builtin = known.and_then(builtin_type);
                 match builtin {
                     Some(B::Float) => S::NumericWidening {
                         target: B::Float,
@@ -1435,7 +1450,7 @@ impl<'db> Exporter<'db> {
         let mut linearized_bases = Vec::new();
         for base in class.iter_mro(db, None).skip(1) {
             if let ClassBase::Class(base) = base {
-                if let Some(reference) = self.class_reference(base.class_literal(db)) {
+                if let Some(reference) = self.base_reference(base.class_literal(db)) {
                     if self.resolve_external_bases
                         && base.known(db) != Some(KnownClass::Object)
                         && base.class_literal(db).as_static().is_none_or(|base| {
@@ -1453,14 +1468,17 @@ impl<'db> Exporter<'db> {
                 complete = false;
             }
         }
-        let bases = class
-            .explicit_bases(db)
-            .iter()
-            .filter_map(|base| {
-                base.to_class_type(db)
-                    .and_then(|base| self.class_reference(base.class_literal(db)))
-            })
-            .collect();
+        let mut bases = Vec::new();
+        for base in class.explicit_bases(db) {
+            if let Some(reference) = base
+                .to_class_type(db)
+                .and_then(|base| self.base_reference(base.class_literal(db)))
+            {
+                bases.push(reference);
+            } else {
+                complete = false;
+            }
+        }
         if !complete {
             reasons.insert(facts::DynamicClassReason::UnknownBase);
         }
