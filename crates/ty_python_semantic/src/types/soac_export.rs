@@ -494,8 +494,23 @@ impl<'db> Exporter<'db> {
                 definition.name(db).unwrap_or_else(|| "<binding>".into()),
             ),
         };
+        Some(facts::SourceIdentity {
+            module: self.module_id(program_file)?,
+            lexical_qualname: self.lexical_qualname(definition.scope(db), name),
+            source_range: source_range(definition.kind(db).full_range(&parsed)),
+            definition_kind: kind,
+        })
+    }
+
+    /// Source identities use actual semantic lexical ancestry. Comprehension
+    /// scopes are transparent here; native code-object names are a separate
+    /// compiler projection, not inferred from an expression visitor's owner.
+    fn lexical_qualname(&self, scope: ScopeId<'db>, name: String) -> String {
+        let db = self.db;
+        let program_file = scope.program_file(db);
+        let parsed = parsed_module(db, program_file.python_file(db)).load(db);
         let mut ancestors = Vec::new();
-        let mut scope = Some(definition.scope(db));
+        let mut scope = Some(scope);
         while let Some(current) = scope {
             match current.node(db) {
                 NodeWithScopeKind::Class(node) => {
@@ -514,12 +529,7 @@ impl<'db> Exporter<'db> {
         }
         ancestors.reverse();
         ancestors.push(name);
-        Some(facts::SourceIdentity {
-            module: self.module_id(program_file)?,
-            lexical_qualname: ancestors.join("."),
-            source_range: source_range(definition.kind(db).full_range(&parsed)),
-            definition_kind: kind,
-        })
+        ancestors.join(".")
     }
 
     fn class_reference(&self, class: ClassLiteral<'db>) -> Option<facts::ClassReference> {
@@ -2050,14 +2060,18 @@ impl<'ast> Visitor<'ast> for Exporter<'_> {
                         }
                     }
                 }
-                let name = if self.owner.definition_kind == facts::DefinitionKind::Module {
-                    "<lambda>".into()
-                } else {
-                    format!("{}.<locals>.<lambda>", self.owner.lexical_qualname)
-                };
+                let program_file = self.model.program_file();
+                let index = semantic_index(self.db, program_file);
+                let lambda_scope =
+                    index.node_scope(ty_python_core::scope::NodeWithScopeRef::Lambda(lambda));
+                let enclosing_scope = index
+                    .scope(lambda_scope)
+                    .parent()
+                    .expect("lambda expression has an enclosing semantic scope")
+                    .to_scope_id(self.db, program_file);
                 let identity = facts::SourceIdentity {
                     module: self.module.module.clone(),
-                    lexical_qualname: name,
+                    lexical_qualname: self.lexical_qualname(enclosing_scope, "<lambda>".into()),
                     source_range: source_range(lambda.range()),
                     definition_kind: facts::DefinitionKind::Lambda,
                 };
@@ -2065,9 +2079,6 @@ impl<'ast> Visitor<'ast> for Exporter<'_> {
                     .inferred_type(&self.model)
                     .unwrap_or_else(Type::unknown);
                 let signature = self.callable_signature(ty, 0);
-                let index = semantic_index(self.db, self.model.program_file());
-                let lambda_scope =
-                    index.node_scope(ty_python_core::scope::NodeWithScopeRef::Lambda(lambda));
                 self.module.functions.push(facts::FunctionTypeFact {
                     identity: identity.clone(),
                     function_kind: if lambda_scope.is_generator_function(index) {

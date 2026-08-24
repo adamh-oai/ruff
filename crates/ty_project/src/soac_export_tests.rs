@@ -97,6 +97,116 @@ fn function<'a>(facts: &'a ModuleTypeFacts, name: &str) -> &'a FunctionTypeFact 
 }
 
 #[test]
+fn soac_lambda_identities_follow_lexical_definition_scopes() {
+    let source = r#"from __future__ import strict
+module_list = [lambda: module_index for module_index in range(2)]
+module_set = {lambda: set_index for set_index in range(2)}
+module_dict = {dict_index: lambda: dict_index for dict_index in range(2)}
+module_generator = (lambda: generator_index for generator_index in range(2))
+generator_input = (item for item in (lambda: range(2))())
+nested = lambda: (lambda: "nested")
+class ModuleClass:
+    values = [lambda: module_class_index for module_class_index in range(2)]
+def factory():
+    local_list = [lambda: local_index for local_index in range(2)]
+    class Owner:
+        values = [lambda: class_index for class_index in range(2)]
+        generated = (lambda: class_generator for class_generator in range(2))
+        nested = lambda: (lambda: "class_nested")
+    return Owner
+"#;
+    let facts = export(source);
+    let expected = [
+        ("lambda: module_index", "<lambda>"),
+        ("lambda: set_index", "<lambda>"),
+        ("lambda: dict_index", "<lambda>"),
+        ("lambda: generator_index", "<lambda>"),
+        ("lambda: range(2)", "<lambda>"),
+        ("lambda: (lambda: \"nested\")", "<lambda>"),
+        ("lambda: \"nested\"", "<lambda>.<lambda>"),
+        ("lambda: module_class_index", "ModuleClass.<lambda>"),
+        ("lambda: local_index", "factory.<locals>.<lambda>"),
+        ("lambda: class_index", "factory.<locals>.Owner.<lambda>"),
+        ("lambda: class_generator", "factory.<locals>.Owner.<lambda>"),
+        (
+            "lambda: (lambda: \"class_nested\")",
+            "factory.<locals>.Owner.<lambda>",
+        ),
+        (
+            "lambda: \"class_nested\"",
+            "factory.<locals>.Owner.<lambda>.<lambda>",
+        ),
+    ];
+    assert_eq!(
+        facts
+            .functions
+            .iter()
+            .filter(|function| { function.identity.definition_kind == DefinitionKind::Lambda })
+            .count(),
+        expected.len()
+    );
+    for (expression, qualname) in expected {
+        let start = source.find(expression).unwrap();
+        let range = SourceRange::new(start as u32, (start + expression.len()) as u32);
+        let function = facts
+            .functions
+            .iter()
+            .find(|function| function.identity.source_range == range)
+            .unwrap();
+        assert_eq!(function.identity.definition_kind, DefinitionKind::Lambda);
+        assert_eq!(function.identity.lexical_qualname, qualname, "{expression}");
+        assert_eq!(function.identity.module, facts.module);
+    }
+    assert_eq!(
+        facts,
+        export_from(&database(source, AnalysisDialect::SoacStrictV1, true))
+    );
+}
+
+#[test]
+fn soac_lambda_default_expressions_keep_the_enclosing_scope() {
+    let source = r#"from __future__ import strict
+module_value = lambda fn=(lambda: "module_default"): fn()
+class Owner:
+    value = lambda fn=(lambda: "class_default"): fn()
+def factory():
+    return lambda fn=(lambda: "function_default"): (lambda: fn())
+"#;
+    let facts = export(source);
+    for (expression, qualname) in [
+        ("lambda: \"module_default\"", "<lambda>"),
+        ("lambda: \"class_default\"", "Owner.<lambda>"),
+        ("lambda: \"function_default\"", "factory.<locals>.<lambda>"),
+        ("lambda: fn()", "factory.<locals>.<lambda>.<lambda>"),
+    ] {
+        let start = source.find(expression).unwrap();
+        let range = SourceRange::new(start as u32, (start + expression.len()) as u32);
+        let function = facts
+            .functions
+            .iter()
+            .find(|function| function.identity.source_range == range)
+            .unwrap();
+        assert_eq!(function.identity.lexical_qualname, qualname, "{expression}");
+    }
+    let nested_call = facts
+        .call_sites
+        .iter()
+        .find(|call| {
+            let range = &call.identity.expression_range;
+            &source[range.start as usize..range.end as usize] == "fn()"
+                && call.identity.enclosing_function.lexical_qualname
+                    == "factory.<locals>.<lambda>.<lambda>"
+        })
+        .unwrap();
+    assert!(
+        facts
+            .functions
+            .iter()
+            .any(|function| { function.identity == nested_call.identity.enclosing_function })
+    );
+}
+
+#[test]
 fn soac_nominal_quoted_annotations_reuse_semantic_scopes_and_leaf_identities() {
     let source = r#""""Original δ bytes"""
 from __future__ import strict
