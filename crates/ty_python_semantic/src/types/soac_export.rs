@@ -1170,20 +1170,23 @@ impl<'db> Exporter<'db> {
             return None;
         }
         // Unlike an IDE's first-definition shortcut, all reachable definitions
-        // must agree on one actual local binding. Preserve import aliases:
-        // the runtime must read that alias, not a similarly named class in a
-        // different module or a different execution of its source.
+        // must agree on one actual local binding. Preserve every explicit
+        // import, including plain `from module import Class`: IDE alias
+        // preservation only retains `as` clauses. The runtime must read the
+        // actual local binding, not the imported class's source definition.
         let definitions = definitions_for_name(
             model,
             name.id.as_str(),
             name.into(),
-            ImportAliasResolution::PreserveAliases,
+            ImportAliasResolution::PreserveImports,
         );
         let [resolved] = definitions.as_slice() else {
             return None;
         };
         let definition = resolved.definition()?;
-        if definition.program_file(self.db) != self.model.program_file() {
+        if definition.program_file(self.db) != self.model.program_file()
+            || matches!(definition.kind(self.db), DefinitionKind::StarImport(_))
+        {
             return None;
         }
         let binding = self.definition(definition)?;

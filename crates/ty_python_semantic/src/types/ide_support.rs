@@ -2068,6 +2068,10 @@ mod resolve_definition {
         ResolveAliases,
         /// Keep import aliases as-is, don't resolve to original definitions
         PreserveAliases,
+        /// Keep every explicit local import binding, including imports without
+        /// an `as` clause. Star imports still require symbol resolution; they
+        /// do not define a unique explicit local binding for the name.
+        PreserveImports,
     }
 
     use indexmap::IndexSet;
@@ -2262,8 +2266,9 @@ mod resolve_definition {
                 let module = parsed_module(db, file.python_file(db)).load(db);
                 let alias = import_def.alias(&module);
 
-                if alias.asname.is_some()
-                    && alias_resolution == ImportAliasResolution::PreserveAliases
+                if alias_resolution == ImportAliasResolution::PreserveImports
+                    || (alias.asname.is_some()
+                        && alias_resolution == ImportAliasResolution::PreserveAliases)
                 {
                     return vec![ResolvedDefinition::Definition(definition)];
                 }
@@ -2296,8 +2301,9 @@ mod resolve_definition {
                 let import_node = import_from_def.import(&module);
                 let alias = import_from_def.alias(&module);
 
-                if alias.asname.is_some()
-                    && alias_resolution == ImportAliasResolution::PreserveAliases
+                if alias_resolution == ImportAliasResolution::PreserveImports
+                    || (alias.asname.is_some()
+                        && alias_resolution == ImportAliasResolution::PreserveAliases)
                 {
                     return vec![ResolvedDefinition::Definition(definition)];
                 }

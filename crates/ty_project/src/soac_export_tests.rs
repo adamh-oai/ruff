@@ -256,6 +256,222 @@ fn soac_nominal_bindings_preserve_semantic_aliases_slots_and_union_leaves() {
 }
 
 #[test]
+fn soac_nominal_plain_imports_keep_local_binding_and_foreign_class_identities() {
+    let source = r#"from __future__ import strict
+from typing import Optional, Union
+from external import Foreign
+from external import Foreign as Alias
+def direct(owner: Foreign) -> Foreign:
+    return owner
+def quoted(owner: "Foreign") -> "Foreign":
+    return owner
+def combined(owner: "Foreign | Alias", extra: Optional[Foreign]) -> Union[Foreign, Alias]:
+    return owner
+"#;
+    let facts = export(source);
+    for (name, count) in [("direct", 2), ("quoted", 2), ("combined", 5)] {
+        let function = function(&facts, name);
+        let leaves: Vec<_> = facts
+            .nominal_bindings
+            .iter()
+            .filter(|leaf| leaf.function == function.identity)
+            .collect();
+        assert_eq!(leaves.len(), count, "{name}");
+        for leaf in leaves {
+            assert_eq!(leaf.binding_scope, facts.module_body_identity());
+            assert_eq!(leaf.binding.module, facts.module);
+            assert_eq!(leaf.binding.definition_kind, DefinitionKind::Assignment);
+            assert_eq!(leaf.class.definition.module.module_name, "external");
+            assert_eq!(leaf.class.definition.lexical_qualname, "Foreign");
+            assert_ne!(leaf.binding, leaf.class.definition);
+            let global = facts
+                .global_bindings
+                .iter()
+                .find(|binding| binding.name == leaf.name)
+                .unwrap();
+            assert_eq!(global.definition.as_ref(), Some(&leaf.binding));
+            let import_text = match leaf.name.as_str() {
+                "Foreign" => "Foreign",
+                "Alias" => "Foreign as Alias",
+                name => panic!("unexpected imported leaf {name}"),
+            };
+            let import_start = source
+                .find(&format!("from external import {import_text}\n"))
+                .unwrap()
+                + "from external import ".len();
+            assert_eq!(
+                leaf.binding.source_range,
+                SourceRange::new(
+                    import_start as u32,
+                    (import_start + import_text.len()) as u32
+                )
+            );
+            let dependency = facts
+                .consumed_dependencies
+                .iter()
+                .find(|dependency| dependency.module == leaf.class.definition.module)
+                .unwrap();
+            assert_eq!(leaf.class.source_digest, dependency.source_digest);
+        }
+    }
+    assert_eq!(
+        facts,
+        export_from(&database(source, AnalysisDialect::SoacStrictV1, true))
+    );
+}
+
+#[test]
+fn soac_nominal_plain_imports_retain_exact_class_and_function_scopes() {
+    let source = r#"from __future__ import strict
+class Container:
+    from external import Foreign
+    def method(self, value: Foreign) -> Foreign:
+        return value
+def factory():
+    from external import Foreign
+    def inner(value: "Foreign") -> "Foreign":
+        return value
+    return inner
+"#;
+    let facts = export(source);
+    for (name, scope) in [
+        ("Container.method", &class(&facts, "Container").identity),
+        (
+            "factory.<locals>.inner",
+            &function(&facts, "factory").identity,
+        ),
+    ] {
+        let function = function(&facts, name);
+        let leaves: Vec<_> = facts
+            .nominal_bindings
+            .iter()
+            .filter(|leaf| leaf.function == function.identity)
+            .collect();
+        assert_eq!(leaves.len(), 2, "{name}");
+        for leaf in leaves {
+            assert_eq!(&leaf.binding_scope, scope);
+            assert_eq!(leaf.binding.module, facts.module);
+            assert_eq!(leaf.binding.definition_kind, DefinitionKind::Assignment);
+            assert_eq!(leaf.class.definition.module.module_name, "external");
+            assert_eq!(
+                &source[leaf.binding.source_range.start as usize
+                    ..leaf.binding.source_range.end as usize],
+                "Foreign"
+            );
+        }
+    }
+}
+
+#[test]
+fn soac_nominal_imports_do_not_guess_ambiguous_star_attribute_or_shadowed_bindings() {
+    let source = r#"from __future__ import strict
+from external import Foreign
+import external
+def attribute(value: external.Foreign) -> external.Foreign:
+    return value
+def ambiguous_factory(flag: bool):
+    if flag:
+        from external import Foreign
+    else:
+        from external import Foreign
+    def inner(value: Foreign) -> Foreign:
+        return value
+    return inner
+def shadowed_factory():
+    class Foreign:
+        pass
+    def inner(value: Foreign) -> Foreign:
+        return value
+    return inner
+"#;
+    let facts = export(source);
+    for name in ["attribute", "ambiguous_factory.<locals>.inner"] {
+        let function = function(&facts, name);
+        assert!(matches!(
+            function.signature.parameters[0].value_type,
+            StaticType::NominalClass(_)
+        ));
+        assert!(
+            facts
+                .nominal_bindings
+                .iter()
+                .all(|leaf| leaf.function != function.identity)
+        );
+    }
+    let shadowed = function(&facts, "shadowed_factory.<locals>.inner");
+    let local = class(&facts, "shadowed_factory.<locals>.Foreign");
+    let leaves: Vec<_> = facts
+        .nominal_bindings
+        .iter()
+        .filter(|leaf| leaf.function == shadowed.identity)
+        .collect();
+    assert_eq!(leaves.len(), 2);
+    assert!(leaves.iter().all(|leaf| {
+        leaf.binding == local.identity
+            && leaf.class.definition == local.identity
+            && leaf.binding_scope == function(&facts, "shadowed_factory").identity
+    }));
+
+    let star = export(
+        "from __future__ import strict\nfrom external import *\ndef direct(value: Foreign) -> Foreign:\n    return value\n",
+    );
+    assert!(matches!(
+        function(&star, "direct").signature.parameters[0].value_type,
+        StaticType::NominalClass(_)
+    ));
+    assert!(star.nominal_bindings.is_empty());
+}
+
+#[test]
+fn soac_nominal_import_mode_does_not_change_ordinary_ide_alias_resolution() {
+    use ruff_python_ast::{Expr, Stmt};
+    use ty_python_core::definition::DefinitionKind as SemanticDefinitionKind;
+    use ty_python_semantic::{ImportAliasResolution, SemanticModel, definitions_for_name};
+
+    let source =
+        "from external import Foreign\nfrom external import Foreign as Alias\nForeign\nAlias\n";
+    let db = database(source, AnalysisDialect::Python, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let program_file = ty_python_semantic::Db::program_file(&db, file);
+    let model = SemanticModel::new(&db, program_file);
+    let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db)).load(&db);
+    let mut names = 0;
+    for statement in parsed.suite() {
+        let Stmt::Expr(statement) = statement else {
+            continue;
+        };
+        let Expr::Name(name) = statement.value.as_ref() else {
+            panic!("fixture expression must be a name");
+        };
+        names += 1;
+        for mode in [
+            ImportAliasResolution::ResolveAliases,
+            ImportAliasResolution::PreserveAliases,
+            ImportAliasResolution::PreserveImports,
+        ] {
+            let definitions = definitions_for_name(&model, name.id.as_str(), name.into(), mode);
+            assert_eq!(definitions.len(), 1);
+            let definition = definitions[0].definition().unwrap();
+            let local = mode == ImportAliasResolution::PreserveImports
+                || (name.id == "Alias" && mode == ImportAliasResolution::PreserveAliases);
+            assert_eq!(definition.program_file(&db) == program_file, local);
+            if local {
+                assert!(matches!(
+                    definition.kind(&db),
+                    SemanticDefinitionKind::ImportFrom(_)
+                ));
+            } else {
+                assert!(matches!(
+                    definition.kind(&db),
+                    SemanticDefinitionKind::Class(_)
+                ));
+            }
+        }
+    }
+    assert_eq!(names, 2);
+}
+
+#[test]
 fn soac_nominal_bindings_use_actual_lexical_scopes_and_remove_ignored_contracts() {
     let source = "from __future__ import strict\nfrom typing import Any\nclass Root: pass\nclass Container:\n    Alias = Root\n    def method(self, value: Alias) -> Root:\n        return value\ndef outer():\n    class Nested: pass\n    Alias = Nested\n    def inner(a: Nested, b: Alias) -> Nested:\n        return a\n    return inner\ndef ignored(value: Root) -> Root:\n    return 1  # ty: ignore[invalid-return-type]\ndef unsupported(value: list[Root], dynamic: Any):\n    pass\n";
     let facts = export(source);
