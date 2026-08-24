@@ -28,6 +28,7 @@ use ty_python_core::{
     semantic_index,
 };
 
+mod framework;
 mod strict;
 pub(crate) use strict::register_lints;
 
@@ -152,6 +153,7 @@ fn export_soac_module_impl(
         dependencies: RefCell::new(BTreeMap::new()),
         invalid_dependency: Cell::new(false),
         used_suppressions: Vec::new(),
+        attribute_receivers: BTreeMap::new(),
         resolve_external_bases,
     };
     exporter.globals(program_file);
@@ -187,23 +189,40 @@ fn export_soac_module_impl(
         program_file,
         std::mem::take(&mut exporter.used_suppressions),
     ) {
+        let framework_receiver = exporter.framework_attribute_fallback(&diagnostic);
         let range = diagnostic
             .primary_span()
             .and_then(|span| span.range())
             .map(source_range)
             .unwrap_or(facts::SourceRange::new(0, source.len() as u32));
         exporter.module.diagnostics.push(facts::StrictDiagnostic {
-            code: facts::DiagnosticCode::CheckerError,
-            severity: match diagnostic.severity() {
-                Severity::Error | Severity::Fatal => facts::DiagnosticSeverity::Error,
-                Severity::Warning => facts::DiagnosticSeverity::Warning,
-                _ => facts::DiagnosticSeverity::Information,
+            code: if framework_receiver.is_some() {
+                facts::DiagnosticCode::StrictUncheckedDynamicType
+            } else {
+                facts::DiagnosticCode::CheckerError
+            },
+            severity: if framework_receiver.is_some() {
+                facts::DiagnosticSeverity::Warning
+            } else {
+                match diagnostic.severity() {
+                    Severity::Error | Severity::Fatal => facts::DiagnosticSeverity::Error,
+                    Severity::Warning => facts::DiagnosticSeverity::Warning,
+                    _ => facts::DiagnosticSeverity::Information,
+                }
             },
             source_range: range,
             scope: facts::DiagnosticScope::Site(range),
-            related_definitions: Vec::new(),
+            related_definitions: framework_receiver.iter().cloned().collect(),
             suppressed: false,
-            message: format!("{}: {}", diagnostic.id(), diagnostic.headline_message()),
+            message: if framework_receiver.is_some() {
+                format!(
+                    "{}: {}; SOAC retains dynamic framework attribute access",
+                    diagnostic.id(),
+                    diagnostic.headline_message()
+                )
+            } else {
+                format!("{}: {}", diagnostic.id(), diagnostic.headline_message())
+            },
         });
     }
     exporter.collect_import_dependencies(program_file);
@@ -227,6 +246,9 @@ struct Exporter<'db> {
     dependencies: RefCell<BTreeMap<String, SoacSourceDependency>>,
     invalid_dependency: Cell<bool>,
     used_suppressions: Vec<crate::suppression::FileSuppressionId>,
+    /// Private semantic receivers indexed by their exact expression ranges.
+    /// They do not escape into the owned proposal DTO.
+    attribute_receivers: BTreeMap<facts::SourceRange, Type<'db>>,
     /// The incremental base query first computes local proposals using this
     /// same classifier, then combines the actual semantic MRO recursively.
     /// Disabling this step internally avoids unrelated classes in an imported
@@ -1719,6 +1741,8 @@ impl<'db> Exporter<'db> {
             .value
             .inferred_type(&self.model)
             .unwrap_or_else(Type::unknown);
+        self.attribute_receivers
+            .insert(source_range(node.range()), receiver);
         let receiver_type = self.value_type(receiver);
         let mut reasons = uncertainty(&receiver_type);
         reasons.insert(facts::UncertaintyReason::OpenWorld);
