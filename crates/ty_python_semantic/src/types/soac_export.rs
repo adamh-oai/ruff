@@ -23,7 +23,7 @@ use soac_contracts as facts;
 use ty_module_resolver::file_to_module;
 use ty_python_core::{
     AnalysisDialect, ProgramFile,
-    definition::{Definition, DefinitionKind},
+    definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind},
     scope::{NodeWithScopeKind, ScopeId},
     semantic_index,
 };
@@ -40,7 +40,7 @@ use super::{
     ide_support::{ImportAliasResolution, definitions_for_name},
     infer::{infer_definition_types, original_class_type},
     list_members::all_end_of_scope_members,
-    signatures::ParameterKind as TyParameterKind,
+    signatures::{Parameter as TyParameter, ParameterKind as TyParameterKind},
 };
 use crate::place::{Place, TypeOrigin};
 use crate::{Db, HasDefinition, HasType, SemanticModel};
@@ -190,18 +190,21 @@ fn export_soac_module_impl(
         std::mem::take(&mut exporter.used_suppressions),
     ) {
         let framework_receiver = exporter.framework_attribute_fallback(&diagnostic);
+        let absent_mutable_global =
+            strict::reconcile_absent_global_diagnostic(&mut exporter, &diagnostic);
+        let dynamic_warning = framework_receiver.is_some() || absent_mutable_global;
         let range = diagnostic
             .primary_span()
             .and_then(|span| span.range())
             .map(source_range)
             .unwrap_or(facts::SourceRange::new(0, source.len() as u32));
         exporter.module.diagnostics.push(facts::StrictDiagnostic {
-            code: if framework_receiver.is_some() {
+            code: if dynamic_warning {
                 facts::DiagnosticCode::StrictUncheckedDynamicType
             } else {
                 facts::DiagnosticCode::CheckerError
             },
-            severity: if framework_receiver.is_some() {
+            severity: if dynamic_warning {
                 facts::DiagnosticSeverity::Warning
             } else {
                 match diagnostic.severity() {
@@ -217,6 +220,12 @@ fn export_soac_module_impl(
             message: if framework_receiver.is_some() {
                 format!(
                     "{}: {}; SOAC retains dynamic framework attribute access",
+                    diagnostic.id(),
+                    diagnostic.headline_message()
+                )
+            } else if absent_mutable_global {
+                format!(
+                    "{}: {}; SOAC permits this syntactically declared mutable global; its value and boundness remain unknown",
                     diagnostic.id(),
                     diagnostic.headline_message()
                 )
@@ -734,11 +743,7 @@ impl<'db> Exporter<'db> {
                     TyParameterKind::KeywordVariadic { .. } => facts::ParameterKind::VarKeywords,
                 },
                 value_type: self.value_type_at_depth(parameter.annotated_type(), depth + 1),
-                annotation_origin: if parameter.inferred_annotation {
-                    facts::AnnotationOrigin::Inferred
-                } else {
-                    facts::AnnotationOrigin::Explicit
-                },
+                annotation_origin: self.parameter_annotation_origin(parameter),
                 default: parameter
                     .default_type(self.db)
                     .map_or(facts::DefaultFact::Missing, |ty| self.default_value(ty)),
@@ -782,6 +787,41 @@ impl<'db> Exporter<'db> {
         facts::DefaultFact::Value {
             value_type: Box::new(ty),
             literal,
+        }
+    }
+
+    fn parameter_annotation_origin(&self, parameter: &TyParameter<'db>) -> facts::AnnotationOrigin {
+        // `inferred_annotation` controls signature display, not source provenance.
+        // Synthesized self/other parameters also use with_annotated_type, but
+        // their useful checker types must not manufacture mandatory checks.
+        let Some(definition) = parameter.definition() else {
+            return facts::AnnotationOrigin::Inferred;
+        };
+        match definition.kind(self.db) {
+            DefinitionKind::Parameter(parameter) => {
+                let parsed = parsed_module(self.db, definition.python_file(self.db)).load(self.db);
+                let annotated = match parameter {
+                    ParameterDefinitionNodeKind::Parameter(parameter) => {
+                        parameter.node(&parsed).parameter.annotation.is_some()
+                    }
+                    ParameterDefinitionNodeKind::VariadicPositionalParameter(parameter)
+                    | ParameterDefinitionNodeKind::VariadicKeywordParameter(parameter) => {
+                        parameter.node(&parsed).annotation.is_some()
+                    }
+                };
+                if annotated {
+                    facts::AnnotationOrigin::Explicit
+                } else {
+                    facts::AnnotationOrigin::Inferred
+                }
+            }
+            // Dataclass-generated field parameters carry the actual first
+            // declaration, including inherited and InitVar fields. Preserve
+            // that declaration's origin instead of guessing from a name.
+            DefinitionKind::AnnotatedAssignment(_) => {
+                self.field_annotation_origin(Some(definition))
+            }
+            _ => facts::AnnotationOrigin::Inferred,
         }
     }
 
@@ -975,6 +1015,7 @@ impl<'db> Exporter<'db> {
                 && parameter_type.annotation_origin == facts::AnnotationOrigin::Explicit
             {
                 self.nominal_annotation_leaves(
+                    &self.model,
                     &identity,
                     facts::AnnotationTarget::Parameter {
                         index: u32::try_from(index).ok()?,
@@ -989,6 +1030,7 @@ impl<'db> Exporter<'db> {
             && signature.return_annotation_origin == facts::AnnotationOrigin::Explicit
         {
             self.nominal_annotation_leaves(
+                &self.model,
                 &identity,
                 facts::AnnotationTarget::Return,
                 annotation,
@@ -1014,6 +1056,7 @@ impl<'db> Exporter<'db> {
     /// required before traversing its slice.
     fn nominal_annotation_leaves(
         &self,
+        model: &SemanticModel<'db>,
         function: &facts::SourceIdentity,
         annotation: facts::AnnotationTarget,
         expression: &ast::Expr,
@@ -1026,13 +1069,14 @@ impl<'db> Exporter<'db> {
         match expression {
             ast::Expr::Name(name) => {
                 if let Some(binding) =
-                    self.nominal_name_binding(function, annotation, name, contract)
+                    self.nominal_name_binding(model, function, annotation, name, contract)
                 {
                     output.push(binding);
                 }
             }
             ast::Expr::BinOp(binary) if binary.op == ast::Operator::BitOr => {
                 self.nominal_annotation_leaves(
+                    model,
                     function,
                     annotation,
                     &binary.left,
@@ -1040,6 +1084,7 @@ impl<'db> Exporter<'db> {
                     output,
                 );
                 self.nominal_annotation_leaves(
+                    model,
                     function,
                     annotation,
                     &binary.right,
@@ -1049,7 +1094,7 @@ impl<'db> Exporter<'db> {
             }
             ast::Expr::Subscript(subscript)
                 if matches!(
-                    subscript.value.inferred_type(&self.model),
+                    subscript.value.inferred_type(model),
                     Some(Type::SpecialForm(
                         super::SpecialFormType::Optional | super::SpecialFormType::Union
                     ))
@@ -1058,11 +1103,12 @@ impl<'db> Exporter<'db> {
                 if let ast::Expr::Tuple(tuple) = subscript.slice.as_ref() {
                     for element in &tuple.elts {
                         self.nominal_annotation_leaves(
-                            function, annotation, element, contract, output,
+                            model, function, annotation, element, contract, output,
                         );
                     }
                 } else {
                     self.nominal_annotation_leaves(
+                        model,
                         function,
                         annotation,
                         &subscript.slice,
@@ -1071,15 +1117,32 @@ impl<'db> Exporter<'db> {
                     );
                 }
             }
-            // String annotations, attribute access, type aliases, and arbitrary
-            // expressions need a separate explicit lexical operand plan. Do
-            // not parse/evaluate them here or guess an object from its source.
+            ast::Expr::StringLiteral(string) => {
+                // This is the checker's existing forward-annotation parse and
+                // scope witness, not another annotation parser. Its submodel
+                // is required for both type and definition queries on these
+                // nodes, which are not in the module's ordinary AST.
+                if let Some((parsed, annotation_model)) = model.enter_string_annotation(string) {
+                    self.nominal_annotation_leaves(
+                        &annotation_model,
+                        function,
+                        annotation,
+                        parsed.expr(),
+                        contract,
+                        output,
+                    );
+                }
+            }
+            // Attribute access, type aliases, and arbitrary expressions need
+            // a separate explicit operand plan. Never evaluate them or guess
+            // an actual runtime object from a source identity.
             _ => {}
         }
     }
 
     fn nominal_name_binding(
         &self,
+        model: &SemanticModel<'db>,
         function: &facts::SourceIdentity,
         annotation: facts::AnnotationTarget,
         name: &ast::ExprName,
@@ -1096,7 +1159,7 @@ impl<'db> Exporter<'db> {
                 _ => false,
             }
         }
-        let class = match name.inferred_type(&self.model)? {
+        let class = match name.inferred_type(model)? {
             Type::ClassLiteral(class) => self.class_reference(class)?,
             Type::NominalInstance(instance) => {
                 self.class_reference(instance.class_literal(self.db, &self.env))?
@@ -1111,7 +1174,7 @@ impl<'db> Exporter<'db> {
         // the runtime must read that alias, not a similarly named class in a
         // different module or a different execution of its source.
         let definitions = definitions_for_name(
-            &self.model,
+            model,
             name.id.as_str(),
             name.into(),
             ImportAliasResolution::PreserveAliases,

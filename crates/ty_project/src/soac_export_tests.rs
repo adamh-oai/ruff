@@ -97,6 +97,108 @@ fn function<'a>(facts: &'a ModuleTypeFacts, name: &str) -> &'a FunctionTypeFact 
 }
 
 #[test]
+fn soac_nominal_quoted_annotations_reuse_semantic_scopes_and_leaf_identities() {
+    let source = r#""""Original δ bytes"""
+from __future__ import strict
+from typing import Optional, Union
+class Recording:
+    def __enter__(self) -> "Recording":
+        return self
+Alias = Recording
+def use_context(manager: "Recording") -> "Recording":
+    return manager
+def combine(first: "Recording | Alias", second: Optional["Recording"]) -> "Union[Recording, Alias]":
+    return first
+def factory():
+    class Local:
+        def direct(self, value: "Local") -> "Local":
+            return value
+    CapturedAlias = Local
+    def deferred(value: "CapturedAlias") -> "CapturedAlias":
+        return value
+    return Local, deferred
+"#;
+    let facts = export(source);
+    assert_eq!(
+        facts,
+        export_from(&database(source, AnalysisDialect::SoacStrictV1, true))
+    );
+    for (name, count) in [
+        ("Recording.__enter__", 1),
+        ("use_context", 2),
+        ("combine", 5),
+    ] {
+        let function = function(&facts, name);
+        let leaves: Vec<_> = facts
+            .nominal_bindings
+            .iter()
+            .filter(|leaf| leaf.function == function.identity)
+            .collect();
+        assert_eq!(leaves.len(), count, "{name}");
+        assert!(
+            leaves
+                .iter()
+                .all(|leaf| leaf.binding_scope == facts.module_body_identity())
+        );
+    }
+    let direct = function(&facts, "factory.<locals>.Local.direct");
+    let deferred = function(&facts, "factory.<locals>.deferred");
+    let local = class(&facts, "factory.<locals>.Local");
+    let factory = function(&facts, "factory");
+    for (function, direct_binding) in [(direct, true), (deferred, false)] {
+        let leaves: Vec<_> = facts
+            .nominal_bindings
+            .iter()
+            .filter(|leaf| leaf.function == function.identity)
+            .collect();
+        assert_eq!(leaves.len(), 2);
+        for leaf in leaves {
+            assert_eq!(leaf.binding_scope, factory.identity);
+            assert_eq!(leaf.class.definition, local.identity);
+            assert_eq!(leaf.binding == local.identity, direct_binding);
+        }
+    }
+    for leaf in &facts.nominal_bindings {
+        assert_eq!(
+            &source[leaf.expression_range.start as usize..leaf.expression_range.end as usize],
+            leaf.name
+        );
+    }
+    assert!(
+        !facts
+            .diagnostics
+            .iter()
+            .any(
+                |diagnostic| diagnostic.severity == DiagnosticSeverity::Error
+                    && !diagnostic.suppressed
+            )
+    );
+}
+
+#[test]
+fn soac_nominal_quoted_annotations_do_not_guess_unsupported_expressions() {
+    let source = r#"from __future__ import strict
+class Recording: pass
+def factory(): return Recording
+def unsupported(value: "list[Recording]"): pass
+def dynamic(value: "factory()"): pass
+def escaped(value: "Recor\x64ing"): pass
+def raw(value: r"Recording"): pass
+def concatenated(value: "Record" "ing"): pass
+"#;
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let facts =
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    assert!(facts.nominal_bindings.is_empty());
+    assert!(
+        facts.diagnostics.iter().any(
+            |diagnostic| diagnostic.severity == DiagnosticSeverity::Error && !diagnostic.suppressed
+        )
+    );
+}
+
+#[test]
 fn soac_nominal_bindings_preserve_semantic_aliases_slots_and_union_leaves() {
     let source = "from __future__ import strict\nfrom typing import Optional, Union\nfrom external import Foreign as Alias\nclass Local: pass\nLocalAlias = Local\ndef combine(a: Local, b: Alias, c: Optional[LocalAlias], d: Union[Local, Alias]) -> Local | Alias:\n    return a\ndef duplicate(value: Local | LocalAlias) -> Local:\n    return value\n";
     let facts = export(source);
@@ -367,6 +469,88 @@ fn soac_export_uses_semantic_binding_for_methods_callable_fields_and_open_famili
     assert_eq!(
         site("callback").uncertainty,
         CallUncertainty::CallableInstanceField
+    );
+}
+
+#[test]
+fn soac_export_generated_parameters_preserve_field_origins_not_display_annotations() {
+    let facts = export(
+        r#"from __future__ import strict
+from dataclasses import dataclass, InitVar
+@dataclass(frozen=True)
+class Base:
+    first: int = 1
+@dataclass(frozen=True, order=True)
+class Record(Base):
+    other: int = 2
+    seed: InitVar[int] = 3
+    def annotated(self: "Record", other: "Record") -> bool:
+        return self is other
+"#,
+    );
+    let record = class(&facts, "Record");
+    for name in ["__init__", "__replace__"] {
+        let method = record
+            .methods
+            .iter()
+            .find(|method| method.name == name)
+            .unwrap();
+        assert!(method.generated.is_some());
+        assert_eq!(
+            method.signature.parameters[0].annotation_origin,
+            AnnotationOrigin::Inferred,
+            "{name}'s synthetic receiver has a display type, not a source annotation"
+        );
+        for parameter in method.signature.parameters.iter().skip(1) {
+            assert_eq!(
+                parameter.annotation_origin,
+                AnnotationOrigin::Explicit,
+                "{name}.{} must retain its actual dataclass field declaration",
+                parameter.name
+            );
+        }
+        assert_eq!(
+            method.signature.return_annotation_origin,
+            AnnotationOrigin::Inferred
+        );
+    }
+    for name in [
+        "__lt__",
+        "__le__",
+        "__gt__",
+        "__ge__",
+        "__setattr__",
+        "__delattr__",
+    ] {
+        let method = record
+            .methods
+            .iter()
+            .find(|method| method.name == name)
+            .unwrap();
+        assert!(method.generated.is_some());
+        assert!(
+            method
+                .signature
+                .parameters
+                .iter()
+                .all(|parameter| parameter.annotation_origin == AnnotationOrigin::Inferred),
+            "{name}'s synthesized display annotations are not source contracts"
+        );
+    }
+    let annotated = function(&facts, "Record.annotated");
+    assert!(
+        annotated
+            .signature
+            .parameters
+            .iter()
+            .all(|parameter| parameter.annotation_origin == AnnotationOrigin::Explicit),
+        "actual source-written receiver and comparison annotations remain explicit"
+    );
+    assert!(
+        record
+            .instance_fields
+            .iter()
+            .all(|field| field.annotation_origin == AnnotationOrigin::Explicit)
     );
 }
 

@@ -22,6 +22,145 @@ fn codes(facts: &ModuleTypeFacts) -> Vec<DiagnosticCode> {
 }
 
 #[test]
+fn soac_strict_absent_global_declarations_export_unknown_mutable_bindings() {
+    let source = "from __future__ import strict\ndef bind():\n    global value\n    value = 1\n    return value\ndef capture():\n    global caught\n    try:\n        raise ValueError('boom')\n    except ValueError as caught:\n        inside = caught.args[0]\n    return inside\ndef groups():\n    global group\n    try:\n        raise ExceptionGroup('group', [ValueError('boom')])\n    except* ValueError as group:\n        matched = isinstance(group, ExceptionGroup)\n    return matched\n";
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let diagnostics = ty_python_semantic::Db::check_file(&db, file);
+    let unresolved: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.id().is_lint_named("unresolved-global"))
+        .collect();
+    assert_eq!(unresolved.len(), 3);
+    let facts =
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    for name in ["value", "caught", "group"] {
+        let binding = facts
+            .global_bindings
+            .iter()
+            .find(|binding| binding.name == name)
+            .unwrap();
+        assert_eq!(binding.mutability, GlobalMutability::ExplicitlyMutable);
+        assert_eq!(binding.value_type, StaticType::Unknown);
+        assert!(binding.definition.is_none());
+        assert!(binding.uncertainty.contains(&UncertaintyReason::Unknown));
+    }
+    for diagnostic in unresolved {
+        let range = diagnostic.primary_span().unwrap().range().unwrap();
+        let range = SourceRange::new(range.start().to_u32(), range.end().to_u32());
+        assert!(
+            facts.diagnostics.iter().any(|diagnostic| {
+                diagnostic.source_range == range
+                    && diagnostic.code == DiagnosticCode::StrictUncheckedDynamicType
+                    && diagnostic.severity == DiagnosticSeverity::Warning
+                    && !diagnostic.suppressed
+            }),
+            "missing visible declared-global warning at {range:?}"
+        );
+    }
+    assert!(!facts.diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Error && !diagnostic.suppressed
+    }));
+    assert_eq!(
+        ty_python_semantic::Db::check_file(&db, file)
+            .iter()
+            .filter(|diagnostic| diagnostic.id().is_lint_named("unresolved-global"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn soac_strict_absent_global_rule_requires_actual_source_opt_in() {
+    let source = "def bind():\n    global absent\n    absent = 1\n";
+    let ordinary = database(source, AnalysisDialect::Python, false);
+    let file = system_path_to_file(&ordinary, "/project/main.py").unwrap();
+    assert!(
+        ty_python_semantic::Db::check_file(&ordinary, file)
+            .iter()
+            .any(|diagnostic| diagnostic.id().is_lint_named("unresolved-global"))
+    );
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let diagnostics = ty_python_semantic::Db::check_file(&db, file);
+    let unresolved = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.id().is_lint_named("unresolved-global"))
+        .unwrap();
+    let expected_severity = match unresolved.severity() {
+        ruff_db::diagnostic::Severity::Error | ruff_db::diagnostic::Severity::Fatal => {
+            DiagnosticSeverity::Error
+        }
+        ruff_db::diagnostic::Severity::Warning => DiagnosticSeverity::Warning,
+        _ => DiagnosticSeverity::Information,
+    };
+    let facts =
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    assert_eq!(facts.source_dialect, SourceDialect::OrdinaryPython);
+    assert!(facts.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == DiagnosticCode::CheckerError
+            && diagnostic.severity == expected_severity
+            && !diagnostic.suppressed
+    }));
+    assert!(!facts.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == DiagnosticCode::StrictUncheckedDynamicType && !diagnostic.suppressed
+    }));
+}
+
+#[test]
+fn soac_strict_absent_global_rule_keeps_unresolved_reads_and_assignment_errors() {
+    let source = "from __future__ import strict\nCOUNT: int = 0\ndef invalid():\n    global COUNT, absent\n    COUNT = 'bad'\n    absent = missing_value\n    return never_declared\n";
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let diagnostics = ty_python_semantic::Db::check_file(&db, file);
+    for code in [
+        "invalid-assignment",
+        "unresolved-reference",
+        "unresolved-global",
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id().is_lint_named(code)),
+            "missing {code}"
+        );
+    }
+    let facts =
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    for diagnostic in diagnostics.iter().filter(|diagnostic| {
+        diagnostic.id().is_lint_named("invalid-assignment")
+            || diagnostic.id().is_lint_named("unresolved-reference")
+    }) {
+        let range = diagnostic.primary_span().unwrap().range().unwrap();
+        let range = SourceRange::new(range.start().to_u32(), range.end().to_u32());
+        assert!(
+            facts.diagnostics.iter().any(|diagnostic| {
+                diagnostic.source_range == range
+                    && diagnostic.code == DiagnosticCode::CheckerError
+                    && diagnostic.severity == DiagnosticSeverity::Error
+                    && !diagnostic.suppressed
+            }),
+            "unrelated error was weakened at {range:?}"
+        );
+    }
+    assert!(!facts.global_bindings.iter().any(|binding| {
+        ["missing_value", "never_declared"].contains(&binding.name.as_str())
+            && binding.mutability == GlobalMutability::ExplicitlyMutable
+    }));
+}
+
+#[test]
+fn soac_strict_absent_global_rule_does_not_accept_invalid_nonlocal_scope() {
+    let source = "from __future__ import strict\ndef invalid():\n    global absent\n    nonlocal nonexistent\n    absent = 1\n";
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    assert!(matches!(
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()),
+        Err(ContractError::InvalidSourceIdentity(_))
+    ));
+}
+
+#[test]
 fn soac_strict_framework_attribute_fallback_preserves_original_metaclass_source() {
     let source = "from __future__ import strict\ndef decorate(cls):\n    cls.decorated = cls.flag + 1\n    return cls\nclass Meta(type):\n    def __new__(mcls, name, bases, ns, **kw):\n        cls = type.__new__(mcls, name, bases, ns)\n        cls.flag = kw['flag']\n        return cls\n@decorate\nclass C(metaclass=Meta, flag=41):\n    pass\nRESULT = C.decorated\n";
     let db = database(source, AnalysisDialect::SoacStrictV1, false);

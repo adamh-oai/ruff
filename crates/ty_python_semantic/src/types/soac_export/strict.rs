@@ -7,7 +7,10 @@
 use super::*;
 use crate::lint::{Level, LintId, LintMetadata, LintRegistryBuilder, LintStatus};
 use crate::reachability::DeclarationsIteratorExtension;
+use crate::types::diagnostic::UNRESOLVED_GLOBAL;
 use crate::types::ide_support::{ImportAliasResolution, definitions_for_name};
+use ruff_db::diagnostic::{Diagnostic, UnifiedFile};
+use ty_python_core::scope::FileScopeId;
 
 macro_rules! strict_lint {
     ($name:ident, $summary:literal) => {
@@ -76,11 +79,14 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     }
 }
 
-fn mutable_globals(db: &dyn Db, file: ProgramFile<'_>) -> BTreeSet<String> {
+fn mutable_global_declarations(
+    db: &dyn Db,
+    file: ProgramFile<'_>,
+) -> BTreeMap<facts::SourceRange, String> {
     struct GlobalDeclarations<'db> {
         db: &'db dyn Db,
         file: ProgramFile<'db>,
-        names: BTreeSet<String>,
+        declarations: BTreeMap<facts::SourceRange, String>,
     }
     impl<'ast> Visitor<'ast> for GlobalDeclarations<'_> {
         fn visit_stmt(&mut self, statement: &'ast ast::Stmt) {
@@ -95,7 +101,8 @@ fn mutable_globals(db: &dyn Db, file: ProgramFile<'_>) -> BTreeSet<String> {
                     if let Some(symbol) = index.place_table(scope).symbol_id(name.as_str())
                         && index.symbol_resolves_to_global_scope(symbol, scope)
                     {
-                        self.names.insert(name.to_string());
+                        self.declarations
+                            .insert(source_range(name.range()), name.to_string());
                     }
                 }
             }
@@ -106,10 +113,63 @@ fn mutable_globals(db: &dyn Db, file: ProgramFile<'_>) -> BTreeSet<String> {
     let mut declarations = GlobalDeclarations {
         db,
         file,
-        names: BTreeSet::new(),
+        declarations: BTreeMap::new(),
     };
     declarations.visit_body(parsed.suite());
-    declarations.names
+    declarations.declarations
+}
+
+fn mutable_globals(db: &dyn Db, file: ProgramFile<'_>) -> BTreeSet<String> {
+    mutable_global_declarations(db, file)
+        .into_values()
+        .collect()
+}
+
+pub(super) fn reconcile_absent_global_diagnostic(
+    exporter: &mut Exporter<'_>,
+    diagnostic: &Diagnostic,
+) -> bool {
+    if exporter.module.source_dialect != facts::SourceDialect::SoacStrict
+        || diagnostic.id().as_lint() != Some(UNRESOLVED_GLOBAL.name())
+    {
+        return false;
+    }
+    let Some(span) = diagnostic.primary_span() else {
+        return false;
+    };
+    let file = exporter.model.program_file();
+    if span.file() != &UnifiedFile::Ty(file.file(exporter.db)) {
+        return false;
+    }
+    let Some(range) = span.range().map(source_range) else {
+        return false;
+    };
+    let declarations = mutable_global_declarations(exporter.db, file);
+    let Some(name) = declarations.get(&range) else {
+        return false;
+    };
+    let index = semantic_index(exporter.db, file);
+    let global_places = index.place_table(FileScopeId::global());
+    if let Some(symbol) = global_places.symbol_id(name)
+        && (global_places.symbol(symbol).is_bound() || global_places.symbol(symbol).is_declared())
+    {
+        return false;
+    }
+    let Some(binding) = exporter.module.global_bindings.iter_mut().find(|binding| {
+        &binding.name == name && binding.mutability == facts::GlobalMutability::ExplicitlyMutable
+    }) else {
+        return false;
+    };
+    // A deferred function store can have an inferred value/definition even
+    // though the module binding does not exist yet. The syntactic declaration
+    // grants mutability, not boundness or a stable value. Preserve the real ty
+    // diagnostic as a warning and withhold those stronger proposals.
+    binding.value_type = facts::StaticType::Unknown;
+    binding.definition = None;
+    binding
+        .uncertainty
+        .insert(facts::UncertaintyReason::Unknown);
+    true
 }
 
 fn is_strict(db: &dyn Db, file: ProgramFile<'_>) -> bool {
