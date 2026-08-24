@@ -750,6 +750,11 @@ impl<'db> Exporter<'db> {
     }
 
     fn signature(&self, signature: &Signature<'db>, depth: usize) -> facts::CallableSignature {
+        let named_parameters: BTreeSet<_> = signature
+            .parameters()
+            .iter()
+            .filter_map(|parameter| parameter.name().map(|name| name.as_str()))
+            .collect();
         let parameters = signature
             .parameters()
             .iter()
@@ -758,7 +763,16 @@ impl<'db> Exporter<'db> {
                 name: parameter
                     .name()
                     .map(ToString::to_string)
-                    .unwrap_or_else(|| format!("arg{index}")),
+                    .unwrap_or_else(|| {
+                        // Unnamed semantic slots need a stable DTO label, not a
+                        // guessed native parameter name. Never collide with an
+                        // actual parameter (for example a dataclass field `arg0`).
+                        let mut name = format!("arg{index}");
+                        while named_parameters.contains(name.as_str()) {
+                            name.push('_');
+                        }
+                        name
+                    }),
                 kind: match parameter.kind() {
                     TyParameterKind::PositionalOnly { .. } => facts::ParameterKind::PositionalOnly,
                     TyParameterKind::PositionalOrKeyword { .. } => {

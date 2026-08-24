@@ -1782,6 +1782,252 @@ class Record(Base):
 }
 
 #[test]
+fn soac_dataclass_init_receiver_follows_all_semantic_field_names() {
+    for (body, parameters) in [
+        ("self: int", vec!["__dataclass_self__", "self", "payload"]),
+        (
+            "self: InitVar[Target]",
+            vec!["__dataclass_self__", "self", "payload"],
+        ),
+        (
+            "self: int = field(init=False)",
+            vec!["__dataclass_self__", "payload"],
+        ),
+        (
+            "self: ClassVar[int] = 0",
+            vec!["__dataclass_self__", "payload"],
+        ),
+        ("self = 0", vec!["self", "payload"]),
+        ("def self(instance): pass", vec!["self", "payload"]),
+        ("self: KW_ONLY", vec!["self", "payload"]),
+        (
+            "__dataclass_self__: int",
+            vec!["self", "__dataclass_self__", "payload"],
+        ),
+    ] {
+        let source = format!(
+            "from __future__ import strict\nfrom dataclasses import dataclass, field, InitVar, KW_ONLY\nfrom typing import ClassVar\nclass Target: pass\n@dataclass\nclass Record:\n    {body}\n    payload: int\n"
+        );
+        let db = database(&source, AnalysisDialect::SoacStrictV1, false);
+        let file = system_path_to_file(&db, "/project/main.py").unwrap();
+        let facts =
+            export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+        assert!(
+            facts.diagnostics.iter().all(|diagnostic| {
+                diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
+            }),
+            "{body}: {:?}",
+            facts.diagnostics
+        );
+        let record = class(&facts, "Record");
+        let init = record
+            .methods
+            .iter()
+            .find(|method| method.name == "__init__")
+            .unwrap();
+        assert_eq!(
+            init.signature
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            parameters,
+            "{body}"
+        );
+        assert_eq!(
+            init.signature.parameters[0].annotation_origin,
+            AnnotationOrigin::Inferred
+        );
+        assert!(
+            init.signature
+                .parameters
+                .iter()
+                .skip(1)
+                .all(|parameter| parameter.annotation_origin == AnnotationOrigin::Explicit)
+        );
+        assert_eq!(
+            init.signature.return_annotation_origin,
+            AnnotationOrigin::Inferred
+        );
+        assert!(matches!(init.signature.return_type, StaticType::None));
+        if body == "self: InitVar[Target]" {
+            let field = field(&facts, "Record", "self");
+            assert_eq!(field.field_kind, FieldKind::InitOnly);
+            assert_eq!(init.signature.parameters[1].value_type, field.value_type);
+            assert_eq!(field_bindings(&facts, field).len(), 1);
+        }
+        // Other generated methods keep their own stdlib receiver names.
+        for name in ["__repr__", "__eq__"] {
+            if let Some(method) = record.methods.iter().find(|method| method.name == name) {
+                assert_eq!(method.signature.parameters[0].name, "self", "{name}");
+            }
+        }
+        let replace = record
+            .methods
+            .iter()
+            .find(|method| method.name == "__replace__")
+            .unwrap();
+        assert_eq!(
+            replace.signature.parameters[0].kind,
+            ParameterKind::PositionalOnly
+        );
+        assert_eq!(
+            replace.signature.parameters[0].annotation_origin,
+            AnnotationOrigin::Inferred
+        );
+        export_from(&db);
+    }
+}
+
+#[test]
+fn soac_dataclass_init_receiver_includes_inherited_fields_not_ordinary_attributes() {
+    for (base, expected_receiver, expected_field) in [
+        (
+            "@dataclass\nclass Base:\n    self: int",
+            "__dataclass_self__",
+            true,
+        ),
+        (
+            "@dataclass\nclass Base:\n    self: int = field(init=False)",
+            "__dataclass_self__",
+            false,
+        ),
+        (
+            "@dataclass\nclass Base:\n    self: ClassVar[int] = 0",
+            "__dataclass_self__",
+            false,
+        ),
+        ("@dataclass\nclass Base:\n    self: KW_ONLY", "self", false),
+        ("class Base:\n    self: int", "self", false),
+    ] {
+        let source = format!(
+            "from __future__ import strict\nfrom dataclasses import dataclass, field, KW_ONLY\nfrom typing import ClassVar\n{base}\nclass Middle(Base): pass\n@dataclass\nclass Record(Middle):\n    payload: int\n"
+        );
+        let facts = export(&source);
+        let record = class(&facts, "Record");
+        let init = record
+            .methods
+            .iter()
+            .find(|method| method.name == "__init__")
+            .unwrap();
+        assert_eq!(
+            init.signature.parameters[0].name, expected_receiver,
+            "{base}"
+        );
+        assert_eq!(
+            init.signature
+                .parameters
+                .iter()
+                .skip(1)
+                .any(|parameter| parameter.name == "self"),
+            expected_field,
+            "{base}"
+        );
+    }
+}
+
+#[test]
+fn soac_dataclass_init_receiver_uses_stdlib_provenance_not_shared_field_specifiers() {
+    let facts = export(
+        r#"from __future__ import strict
+from dataclasses import dataclass as native_dataclass, field
+from typing import ClassVar, dataclass_transform
+@dataclass_transform(field_specifiers=(field,))
+def dataclass[T](cls: type[T]) -> type[T]:
+    return cls
+@dataclass
+class Custom:
+    self: ClassVar[int] = 0
+configured = native_dataclass(kw_only=True)
+@configured
+class Native:
+    self: int
+"#,
+    );
+    for (name, init_receiver, replace_kind) in [
+        ("Custom", "self", ParameterKind::PositionalOrKeyword),
+        (
+            "Native",
+            "__dataclass_self__",
+            ParameterKind::PositionalOnly,
+        ),
+    ] {
+        let record = class(&facts, name);
+        let init = record
+            .methods
+            .iter()
+            .find(|method| method.name == "__init__")
+            .unwrap();
+        assert_eq!(init.signature.parameters[0].name, init_receiver);
+        let replace = record
+            .methods
+            .iter()
+            .find(|method| method.name == "__replace__")
+            .unwrap();
+        assert_eq!(replace.signature.parameters[0].kind, replace_kind);
+    }
+}
+
+#[test]
+fn soac_dataclass_init_receiver_preserves_real_name_conflicts_and_unnamed_labels() {
+    let facts = export(
+        "from __future__ import strict\nfrom dataclasses import dataclass\n@dataclass\nclass Record:\n    self: int\n    arg0: int\n    arg0_: int\n",
+    );
+    let record = class(&facts, "Record");
+    let replace = record
+        .methods
+        .iter()
+        .find(|method| method.name == "__replace__")
+        .unwrap();
+    assert_eq!(
+        replace
+            .signature
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>(),
+        ["arg0__", "self", "arg0", "arg0_"]
+    );
+    assert_eq!(
+        replace.signature.parameters[0].kind,
+        ParameterKind::PositionalOnly
+    );
+    assert!(
+        replace
+            .signature
+            .parameters
+            .iter()
+            .skip(1)
+            .all(|parameter| parameter.kind == ParameterKind::KeywordOnly
+                && parameter.annotation_origin == AnnotationOrigin::Explicit)
+    );
+
+    // CPython rejects these two actual field names because its chosen receiver
+    // also occurs in the constructor fields. Do not invent another native name.
+    let db = database(
+        "from __future__ import strict\nfrom dataclasses import dataclass\n@dataclass\nclass Conflict:\n    self: int\n    __dataclass_self__: int\n",
+        AnalysisDialect::SoacStrictV1,
+        false,
+    );
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let facts =
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let init = class(&facts, "Conflict")
+        .methods
+        .iter()
+        .find(|method| method.name == "__init__")
+        .unwrap();
+    assert_eq!(
+        init.signature
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>(),
+        ["__dataclass_self__", "self", "__dataclass_self__"]
+    );
+}
+
+#[test]
 fn soac_dataclass_comparison_catalog_uses_generated_signatures_and_own_options() {
     let facts = export(
         r#"from __future__ import strict

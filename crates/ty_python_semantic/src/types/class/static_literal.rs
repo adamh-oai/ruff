@@ -1044,8 +1044,12 @@ impl<'db> StaticClassLiteral<'db> {
                     }
                 }
 
-                *transformer_params =
-                    DataclassParams::new(db, flags, transformer_params.field_specifiers(db));
+                *transformer_params = DataclassParams::new(
+                    db,
+                    transformer_params.is_stdlib(db),
+                    flags,
+                    transformer_params.field_specifiers(db),
+                );
             }
         }
 
@@ -1660,6 +1664,9 @@ impl<'db> StaticClassLiteral<'db> {
         }
 
         let field_policy = CodeGeneratorKind::from_class(db, self.into())?;
+        let stdlib_dataclass = self
+            .dataclass_params(db)
+            .is_some_and(|params| params.is_stdlib(db));
         let pydantic_constructor_fields_are_keyword_only =
             field_policy.is_pydantic() && pydantic::constructor_fields_are_keyword_only(db, self);
         let pydantic_constructor_fields_are_optional = name == "__init__"
@@ -1898,7 +1905,37 @@ impl<'db> StaticClassLiteral<'db> {
                     return None;
                 }
 
-                let self_parameter = Parameter::positional_or_keyword(Name::new_static("self"))
+                // CPython chooses the receiver from the full dataclass field table, not
+                // just the constructor parameters. ClassVars and init=False fields count,
+                // including inherited ones; KW_ONLY markers and ordinary attributes do not.
+                let has_self_field = stdlib_dataclass
+                    && self
+                        .iter_mro(db, specialization)
+                        .filter_map(ClassBase::into_class)
+                        .filter_map(|class| class.static_class_literal(db))
+                        .filter(|(class, _)| {
+                            class
+                                .dataclass_params(db)
+                                .is_some_and(|params| params.is_stdlib(db))
+                        })
+                        .any(|(class, specialization)| {
+                            let fields = class.own_fields_with_class_variables(
+                                db,
+                                specialization,
+                                field_policy,
+                            );
+                            fields.class_variables.iter().any(|name| name == "self")
+                                || fields
+                                    .fields
+                                    .get("self")
+                                    .is_some_and(|field| !field.is_kw_only_sentinel(db))
+                        });
+                let receiver = if has_self_field {
+                    "__dataclass_self__"
+                } else {
+                    "self"
+                };
+                let self_parameter = Parameter::positional_or_keyword(Name::new_static(receiver))
                     // TODO: could be `Self`.
                     .with_annotated_type(instance_ty);
                 signature_from_fields(vec![self_parameter], Type::none(db, env))
@@ -2102,8 +2139,16 @@ impl<'db> StaticClassLiteral<'db> {
                 CodeGeneratorKind::DataclassLike(_) | CodeGeneratorKind::Pydantic(_),
                 "__replace__",
             ) if env.python_version(db) >= PythonVersion::PY313 => {
-                let self_parameter = Parameter::positional_or_keyword(Name::new_static("self"))
-                    .with_annotated_type(instance_ty);
+                // The stdlib method is `_replace(self, /, **changes)`. Its expanded
+                // field signature must not bind a keyword field named `self` to the
+                // receiver. Leave that positional-only slot unnamed so it cannot
+                // collide with any of the modeled keyword fields.
+                let self_parameter = if stdlib_dataclass {
+                    Parameter::positional_only(None)
+                } else {
+                    Parameter::positional_or_keyword(Name::new_static("self"))
+                }
+                .with_annotated_type(instance_ty);
 
                 signature_from_fields(vec![self_parameter], instance_ty)
             }

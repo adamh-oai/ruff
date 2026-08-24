@@ -2747,6 +2747,7 @@ impl<'db> Bindings<'db> {
 
                                 let dataclass_params = DataclassParams::new(
                                     db,
+                                    dataclass_params.is_stdlib(db),
                                     flags,
                                     dataclass_params.field_specifiers(db),
                                 );

@@ -54,6 +54,79 @@ Person("Eve", "string instead of int")
 Person(20, "Eve")
 ```
 
+## A field named `self`
+
+```toml
+[environment]
+python-version = "3.15"
+```
+
+The stdlib chooses `__dataclass_self__` as the generated constructor's receiver when its field table
+contains `self`. This includes class variables, initialization-only fields, and fields omitted from
+the constructor. Unannotated attributes and `KW_ONLY` markers do not belong to that table.
+
+```py
+from dataclasses import dataclass, field, InitVar, KW_ONLY
+from typing import ClassVar, assert_type
+
+@dataclass
+class Stored:
+    self: int
+
+stored = Stored(self=1)
+Stored.__init__(__dataclass_self__=stored, self=2)
+assert_type(stored.self, int)
+Stored(self="wrong")  # error: [invalid-argument-type]
+assert_type(Stored.__replace__(stored, self=3), Stored)
+Stored.__replace__(self=3)  # error: [missing-argument]
+
+@dataclass
+class Temporary:
+    self: InitVar[int]
+
+temporary = Temporary(self=1)
+Temporary.__init__(__dataclass_self__=temporary, self=2)
+
+@dataclass
+class NoInitField:
+    self: int = field(init=False)
+
+no_init = NoInitField()
+NoInitField.__init__(__dataclass_self__=no_init)
+
+@dataclass
+class Shared:
+    self: ClassVar[int] = 0
+
+shared = Shared()
+Shared.__init__(__dataclass_self__=shared)
+
+@dataclass
+class Child(Shared):
+    payload: int
+
+child = Child(payload=1)
+Child.__init__(__dataclass_self__=child, payload=2)
+
+@dataclass
+class OrdinaryAttribute:
+    self = 0
+
+ordinary = OrdinaryAttribute()
+OrdinaryAttribute.__init__(self=ordinary)
+# error: [unknown-argument]
+# error: [missing-argument]
+OrdinaryAttribute.__init__(__dataclass_self__=ordinary)
+
+@dataclass
+class Marker:
+    self: KW_ONLY
+    payload: int
+
+marker = Marker(payload=1)
+Marker.__init__(self=marker, payload=2)
+```
+
 ## Signature of `__init__`
 
 Declarations in the class body are used to generate the signature of the `__init__` method. If the

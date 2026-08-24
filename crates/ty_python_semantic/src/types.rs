@@ -1525,6 +1525,11 @@ impl From<DataclassTransformerFlags> for DataclassFlags {
 /// dataclass-transformer decorator calls.
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 pub struct DataclassParams<'db> {
+    /// Set only by the semantic `dataclasses.dataclass` producer, not by a
+    /// dataclass-transform decorator that shares flags or field specifiers.
+    #[returns(copy)]
+    is_stdlib: bool,
+
     #[returns(copy)]
     flags: DataclassFlags,
 
@@ -1545,12 +1550,13 @@ impl<'db> DataclassParams<'db> {
             .ignore_possibly_undefined()
             .unwrap_or_else(Type::unknown);
 
-        Self::new(db, flags, [dataclasses_field].as_slice())
+        Self::new(db, true, flags, [dataclasses_field].as_slice())
     }
 
     fn from_transformer_params(db: &'db dyn Db, params: DataclassTransformerParams<'db>) -> Self {
         Self::new(
             db,
+            false,
             DataclassFlags::from(params.flags(db)),
             params.field_specifiers(db),
         )
@@ -1572,7 +1578,12 @@ impl<'db> DataclassParams<'db> {
             })
             .collect::<Option<Box<_>>>()?;
 
-        Some(Self::new(db, self.flags(db), field_specifiers))
+        Some(Self::new(
+            db,
+            self.is_stdlib(db),
+            self.flags(db),
+            field_specifiers,
+        ))
     }
 }
 
