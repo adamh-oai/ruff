@@ -60,6 +60,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+soac_contracts = "0.1.0"
 ruff_db = { workspace = true, features = ["os", "testing"] }
 ruff_python_parser = { workspace = true }
 

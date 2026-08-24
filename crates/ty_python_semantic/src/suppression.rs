@@ -341,6 +341,12 @@ pub(crate) struct Suppressions {
 }
 
 impl Suppressions {
+    /// Code regions covered by parsed checker ignores. Exporters conservatively
+    /// withhold facts here even when a disabled diagnostic was never constructed.
+    pub(crate) fn soac_covered_ranges(&self) -> impl Iterator<Item = TextRange> + '_ {
+        self.iter().map(|suppression| suppression.suppressed_range)
+    }
+
     /// Returns the suppression that takes precedence for the diagnostic `range` and lint `id`.
     ///
     /// Nested suppression ranges prefer the innermost candidate. If a diagnostic spans multiple

@@ -48,6 +48,10 @@ pub use types::ide_support::{
     map_stub_definition, type_hierarchy_prepare, type_hierarchy_subtypes,
     type_hierarchy_supertypes,
 };
+pub use types::soac_export::{
+    SoacDependencyPath, SoacModuleExport, SoacSourceDependency, export_soac_module,
+    export_soac_module_facts,
+};
 pub use types::{
     DisplaySettings, FixtureBinding, ProgramEnvironment, TypeQualifiers,
     fixture_bindings_for_parameter,

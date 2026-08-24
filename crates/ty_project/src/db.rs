@@ -15,8 +15,8 @@ use ruff_db::files::{File, Files};
 use ruff_db::system::System;
 use ruff_db::vendored::VendoredFileSystem;
 use salsa::{Database, Event, Setter};
-use ty_python_core::{AnalysisDialect, ProgramFile};
 use ty_python_core::program::{FallibleStrategy, MisconfigurationStrategy, UseDefaultStrategy};
+use ty_python_core::{AnalysisDialect, ProgramFile};
 use ty_python_semantic::lint::{LintRegistry, RuleSelection};
 use ty_python_semantic::{AnalysisSettings, Db as SemanticDb, PythonVersionWithSource};
 
@@ -89,7 +89,12 @@ impl ProjectDatabase {
     where
         S: System + 'static + Send + Sync + RefUnwindSafe,
     {
-        Self::new(project_metadata, system, analysis_dialect, &FallibleStrategy)
+        Self::new(
+            project_metadata,
+            system,
+            analysis_dialect,
+            &FallibleStrategy,
+        )
     }
 
     /// Creates a new database, substituting default values for any misconfigured settings.

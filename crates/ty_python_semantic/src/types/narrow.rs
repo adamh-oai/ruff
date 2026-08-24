@@ -3227,9 +3227,10 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
 
     fn comparison_soundness_policy(&self) -> ComparisonSoundnessPolicy {
         let db = self.db;
-        ComparisonSoundnessPolicy::from_analysis_settings(
-            crate::effective_analysis_settings(db, self.scope().file(db)),
-        )
+        ComparisonSoundnessPolicy::from_analysis_settings(crate::effective_analysis_settings(
+            db,
+            self.scope().file(db),
+        ))
     }
 
     #[track_caller]

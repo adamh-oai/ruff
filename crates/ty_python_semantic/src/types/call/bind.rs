@@ -1965,9 +1965,9 @@ impl<'db> Bindings<'db> {
                         };
 
                         let default = get_argument_type("default", false);
-                        let has_default_value = get_argument_type("default_factory", false)
-                            .is_some()
-                            || get_argument_type("factory", false).is_some()
+                        let default_factory = get_argument_type("default_factory", false)
+                            .or_else(|| get_argument_type("factory", false));
+                        let has_default_value = default_factory.is_some()
                             || default.is_some_and(|default| {
                                 pydantic::field_provides_default(db, function_type, default)
                             });
@@ -2128,7 +2128,14 @@ impl<'db> Bindings<'db> {
                         // to `T`. Otherwise, we would error on `name: str = field(default="")`.
                         overload.set_return_type(Type::KnownInstance(KnownInstanceType::Field(
                             FieldInstance::new(
-                                db, default_ty, init, kw_only, alias, converter, strict,
+                                db,
+                                default_ty,
+                                default_factory,
+                                init,
+                                kw_only,
+                                alias,
+                                converter,
+                                strict,
                             ),
                         )));
                     }

@@ -160,6 +160,7 @@ pub(crate) mod relation;
 mod relation_error;
 mod set_theoretic;
 mod signatures;
+pub(crate) mod soac_export;
 mod special_form;
 mod string_annotation;
 mod subclass_of;

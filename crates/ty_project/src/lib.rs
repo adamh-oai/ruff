@@ -39,6 +39,8 @@ pub mod glob;
 pub mod metadata;
 pub mod parallel;
 mod script;
+#[cfg(test)]
+mod soac_export_tests;
 mod uv;
 mod walk;
 pub mod watch;
