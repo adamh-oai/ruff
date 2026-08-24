@@ -38,6 +38,9 @@ pub use use_def::{
 };
 use use_def::{EnclosingSnapshotKey, ScopedEnclosingSnapshotId};
 
+mod analysis_dialect;
+pub use analysis_dialect::{AnalysisDialect, AnalysisPolicy};
+
 pub mod ast_ids;
 pub mod ast_node_ref;
 mod builder;

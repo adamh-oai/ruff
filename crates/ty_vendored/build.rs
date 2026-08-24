@@ -36,7 +36,7 @@ const TYPESHED_ZIP_LOCATION: &str = "/zipped_typeshed.zip";
 ///
 /// This routine is adapted from a recipe at
 /// <https://github.com/zip-rs/zip-old/blob/5d0f198124946b7be4e5969719a7f29f363118cd/examples/write_dir.rs>
-fn write_zipped_typeshed_to(writer: File) -> ZipResult<File> {
+fn write_zipped_typeshed_to(writer: File, soac: bool) -> ZipResult<File> {
     let mut zip = ZipWriter::new(writer);
 
     // Use deflated compression for WASM builds because compiling `zstd-sys` requires clang
@@ -70,6 +70,12 @@ fn write_zipped_typeshed_to(writer: File) -> ZipResult<File> {
             zip.start_file(&*normalized_relative_path, options)?;
             let mut f = File::open(absolute_path)?;
             std::io::copy(&mut f, &mut zip).unwrap();
+
+            if soac && normalized_relative_path == "stdlib/__future__.pyi" {
+                writeln!(&mut zip, "\n# SOAC strict-analysis dialect v1 only.")?;
+                writeln!(&mut zip, "strict: _Feature")?;
+                writeln!(&mut zip, "__all__ += [\"strict\"]")?;
+            }
 
             // Patch the VERSIONS file to make `ty_extensions` available
             if normalized_relative_path == "stdlib/VERSIONS" {
@@ -111,5 +117,8 @@ fn main() {
     let zipped_typeshed_location = format!("{out_dir}{TYPESHED_ZIP_LOCATION}");
 
     let zipped_typeshed_file = File::create(zipped_typeshed_location).unwrap();
-    write_zipped_typeshed_to(zipped_typeshed_file).unwrap();
+    write_zipped_typeshed_to(zipped_typeshed_file, false).unwrap();
+
+    let soac_typeshed_file = File::create(format!("{out_dir}/zipped_soac_typeshed.zip")).unwrap();
+    write_zipped_typeshed_to(soac_typeshed_file, true).unwrap();
 }

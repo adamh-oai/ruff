@@ -1382,7 +1382,7 @@ fn analyze_single_pattern_predicate_kind<'db>(
                 subject_ty,
                 value_ty,
                 ComparisonSoundnessPolicy::from_analysis_settings(
-                    db.analysis_settings(value.file(db)),
+                    crate::effective_analysis_settings(db, value.file(db)),
                 ),
             )
         }

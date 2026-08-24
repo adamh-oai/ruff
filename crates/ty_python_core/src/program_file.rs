@@ -71,6 +71,14 @@ impl<'db> ProgramFile<'db> {
         Self::new_internal(db, python_file, program)
     }
 
+    /// Returns the dialect and version for this particular file interpretation.
+    pub fn analysis_policy(self, db: &'db dyn Db) -> crate::AnalysisPolicy {
+        crate::AnalysisPolicy {
+            dialect: db.analysis_dialect(self.file(db)),
+            python_version: self.python_version(db),
+        }
+    }
+
     /// Returns the physical file represented by this program file.
     pub fn file(self, db: &'db dyn Db) -> File {
         self.python_file(db).file(db)

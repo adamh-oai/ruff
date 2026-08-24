@@ -141,7 +141,9 @@ impl SemanticSyntaxChecker {
                     // syntax error with the highest precedence.
                 } else if matches!(module.as_deref(), Some("__future__")) {
                     for name in names {
-                        if !is_known_future_feature(&name.name) {
+                        if !is_known_future_feature(&name.name)
+                            && !(name.name.as_str() == "strict" && ctx.allows_soac_strict_future())
+                        {
                             // test_ok valid_future_feature
                             // from __future__ import annotations
 
@@ -2538,6 +2540,14 @@ where
 ///         x  # here, classes break function scopes
 /// ```
 pub trait SemanticSyntaxContext {
+    /// Whether the embedding application explicitly selected SOAC analysis.
+    ///
+    /// This does not relax the normal future-import placement checks. A future
+    /// import cannot opt its own source into this analysis dialect.
+    fn allows_soac_strict_future(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if `__future__`-style type annotations are enabled.
     fn future_annotations_or_stub(&self) -> bool;
 

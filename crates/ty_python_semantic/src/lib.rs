@@ -129,6 +129,24 @@ impl Default for AnalysisSettings {
     }
 }
 
+/// Resolves analysis settings after all user overrides and dialect requirements.
+///
+/// SOAC analysis must not narrow broad builtin values to literals based on
+/// equality, or treat an unknown generic specialization as proof of its type
+/// arguments. User settings, including script-local settings, cannot disable
+/// these restrictions. Unknown, `Any`, suppressed errors, annotations, and
+/// unsupported semantics still require independent validation by an exporter;
+/// conservative inference alone is not a runtime contract.
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+pub fn effective_analysis_settings(db: &dyn Db, file: File) -> AnalysisSettings {
+    let mut settings = db.analysis_settings(file).clone();
+    if db.analysis_dialect(file) == ty_python_core::AnalysisDialect::SoacStrictV1 {
+        settings.strict_equality_semantics = true;
+        settings.strict_generic_narrowing = true;
+    }
+    settings
+}
+
 /// Returns all attribute assignments (and their method scope IDs) with a symbol name matching
 /// the one given for a specific class body scope.
 ///

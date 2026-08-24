@@ -359,8 +359,9 @@ fn infer_binary_type_comparison_inner<'db>(
         }
     };
 
-    let soundness_policy =
-        ComparisonSoundnessPolicy::from_analysis_settings(db.analysis_settings(context.file()));
+    let soundness_policy = ComparisonSoundnessPolicy::from_analysis_settings(
+        crate::effective_analysis_settings(db, context.file()),
+    );
 
     if let NonIdentityOperator::Rich(rich_op) = op
         && let Some(left_tuple) = left.tuple_instance_spec(db, env)
@@ -1140,7 +1141,7 @@ fn infer_tuple_rich_comparison<'db>(
 
             let mut builder = UnionBuilder::new(db, env);
             let soundness_policy = ComparisonSoundnessPolicy::from_analysis_settings(
-                db.analysis_settings(context.file()),
+                crate::effective_analysis_settings(db, context.file()),
             );
             let mut equality = TupleEqualityEvaluator::new(db, env, soundness_policy);
 

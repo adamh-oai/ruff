@@ -21,6 +21,22 @@ pub fn file_system() -> &'static VendoredFileSystem {
     &VENDORED_TYPESHED_STUBS
 }
 
+/// The matched stub set for explicit SOAC strict-analysis dialect v1.
+///
+/// The upstream stub set returned by [`file_system`] is unchanged. Embedders
+/// must choose the dialect before creating files or running cached queries and
+/// keep the selected stub set stable for the database lifetime.
+pub fn soac_file_system() -> &'static VendoredFileSystem {
+    static SOAC_TYPESHED_STUBS: LazyLock<VendoredFileSystem> = LazyLock::new(|| {
+        VendoredFileSystem::new_static(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/zipped_soac_typeshed.zip"
+        )))
+        .unwrap()
+    });
+    &SOAC_TYPESHED_STUBS
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{self, Read};

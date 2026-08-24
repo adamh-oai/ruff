@@ -7,6 +7,12 @@ use crate::program::{Program, ProgramSettings};
 /// Database giving access to semantic information about a Python program.
 #[salsa::db]
 pub trait Db: ModuleResolverDb {
+    /// Explicit analysis dialect for this file. This input must be immutable for
+    /// the lifetime of a database, or depend on tracked Salsa inputs.
+    fn analysis_dialect(&self, _file: File) -> crate::AnalysisDialect {
+        crate::AnalysisDialect::Python
+    }
+
     /// Returns `true` if the file should be checked.
     fn should_check_file(&self, file: File) -> bool;
 }

@@ -81,9 +81,8 @@ pub(crate) fn suppressions(db: &dyn Db, file: PythonFile<'_>) -> Suppressions {
     let parsed = parsed_module(db, file).load(db);
     let source = source_text(db, source_file);
 
-    let respect_type_ignore = db
-        .analysis_settings(source_file)
-        .respect_type_ignore_comments;
+    let respect_type_ignore =
+        crate::effective_analysis_settings(db, source_file).respect_type_ignore_comments;
 
     let mut builder = SuppressionsBuilder::new(&source, db.lint_registry());
     let mut line_start = TextSize::default();

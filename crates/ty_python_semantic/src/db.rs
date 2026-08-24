@@ -20,6 +20,10 @@ pub trait Db: PythonCoreDb {
 
     fn lint_registry(&self) -> &LintRegistry;
 
+    /// User-configured settings after file and script overrides.
+    ///
+    /// Semantic consumers must use [`crate::effective_analysis_settings`] so an
+    /// override cannot weaken the requirements of an explicit analysis dialect.
     fn analysis_settings(&self, file: File) -> &AnalysisSettings;
 
     /// Whether ty is running with logging verbosity INFO or higher (`-v` or more).

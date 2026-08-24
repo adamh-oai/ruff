@@ -5586,6 +5586,10 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
 }
 
 impl SemanticSyntaxContext for SemanticIndexBuilder<'_, '_> {
+    fn allows_soac_strict_future(&self) -> bool {
+        self.db.analysis_dialect(self.file.file(self.db)) == crate::AnalysisDialect::SoacStrictV1
+    }
+
     fn future_annotations_or_stub(&self) -> bool {
         self.has_future_annotations
     }

@@ -671,7 +671,7 @@ pub(crate) fn definite_match_pattern_type_for_subject<'db>(
                 resolved_subject_ty,
                 value_ty,
                 ComparisonSoundnessPolicy::from_analysis_settings(
-                    db.analysis_settings(value.file(db)),
+                    crate::effective_analysis_settings(db, value.file(db)),
                 ),
             ) == Truthiness::AlwaysTrue
             {
@@ -781,7 +781,7 @@ fn pattern_fallthrough_type<'db>(
                 value_ty,
                 value_ty,
                 ComparisonSoundnessPolicy::from_analysis_settings(
-                    db.analysis_settings(value.file(db)),
+                    crate::effective_analysis_settings(db, value.file(db)),
                 ),
             ) == Truthiness::AlwaysTrue
         {
@@ -796,7 +796,10 @@ fn pattern_fallthrough_type<'db>(
             subject_ty,
             value_ty,
             false,
-            ComparisonSoundnessPolicy::from_analysis_settings(db.analysis_settings(value.file(db))),
+            ComparisonSoundnessPolicy::from_analysis_settings(crate::effective_analysis_settings(
+                db,
+                value.file(db),
+            )),
         ) {
             return IntersectionBuilder::new(db, env)
                 .add_positive(subject_ty)
@@ -1144,7 +1147,7 @@ pub(crate) fn definite_match_pattern_type<'db>(
             // Only return the type if it's guaranteed to match itself.
             // Otherwise, we can't definitively exclude it from subsequent patterns.
             let policy = ComparisonSoundnessPolicy::from_analysis_settings(
-                db.analysis_settings(value.file(db)),
+                crate::effective_analysis_settings(db, value.file(db)),
             );
             if equality_truthiness(db, env, ty, ty, policy) == Truthiness::AlwaysTrue {
                 ty

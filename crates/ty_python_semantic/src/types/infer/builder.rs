@@ -816,7 +816,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn settings(&self) -> &AnalysisSettings {
-        self.db().analysis_settings(self.file())
+        crate::effective_analysis_settings(self.db(), self.file())
     }
 
     fn is_in_type_checking_block(&self, scope: ScopeId<'db>, node: impl Ranged) -> bool {

@@ -15,7 +15,7 @@ use ruff_db::files::{File, Files};
 use ruff_db::system::System;
 use ruff_db::vendored::VendoredFileSystem;
 use salsa::{Database, Event, Setter};
-use ty_python_core::ProgramFile;
+use ty_python_core::{AnalysisDialect, ProgramFile};
 use ty_python_core::program::{FallibleStrategy, MisconfigurationStrategy, UseDefaultStrategy};
 use ty_python_semantic::lint::{LintRegistry, RuleSelection};
 use ty_python_semantic::{AnalysisSettings, Db as SemanticDb, PythonVersionWithSource};
@@ -51,6 +51,10 @@ pub struct ProjectDatabase {
     project: Option<Project>,
     files: Files,
 
+    // Immutable for the lifetime of this database and all its snapshots. Choosing
+    // another dialect requires a new database, including its vendored file set.
+    analysis_dialect: AnalysisDialect,
+
     // IMPORTANT: Never return clones of `system` outside `ProjectDatabase` (only return references)
     // or the "trick" to get a mutable `Arc` in `Self::system_mut` is no longer guaranteed to work.
     system: Arc<dyn System + Send + Sync + RefUnwindSafe>,
@@ -68,7 +72,24 @@ impl ProjectDatabase {
     where
         S: System + 'static + Send + Sync + RefUnwindSafe,
     {
-        Self::new(project_metadata, system, &FallibleStrategy)
+        Self::fallible_with_analysis_dialect(project_metadata, system, AnalysisDialect::Python)
+    }
+
+    /// Creates a database with an explicitly selected, immutable analysis dialect.
+    ///
+    /// SOAC mode selects its matched future stub and forces conservative analysis
+    /// after per-file overrides. It does not alter source bytes, authenticate
+    /// contracts, or change the configured target Python version. Exporters must
+    /// validate each `ProgramFile::analysis_policy` against their target runtime.
+    pub fn fallible_with_analysis_dialect<S>(
+        project_metadata: ProjectMetadata,
+        system: S,
+        analysis_dialect: AnalysisDialect,
+    ) -> anyhow::Result<Self>
+    where
+        S: System + 'static + Send + Sync + RefUnwindSafe,
+    {
+        Self::new(project_metadata, system, analysis_dialect, &FallibleStrategy)
     }
 
     /// Creates a new database, substituting default values for any misconfigured settings.
@@ -76,7 +97,12 @@ impl ProjectDatabase {
     where
         S: System + 'static + Send + Sync + RefUnwindSafe,
     {
-        let Ok(db) = Self::new(project_metadata, system, &UseDefaultStrategy);
+        let Ok(db) = Self::new(
+            project_metadata,
+            system,
+            AnalysisDialect::Python,
+            &UseDefaultStrategy,
+        );
         db
     }
 
@@ -100,6 +126,7 @@ impl ProjectDatabase {
     fn new<S, Strategy: MisconfigurationStrategy>(
         project_metadata: ProjectMetadata,
         system: S,
+        analysis_dialect: AnalysisDialect,
         strategy: &Strategy,
     ) -> Result<Self, Strategy::Error<anyhow::Error>>
     where
@@ -107,6 +134,7 @@ impl ProjectDatabase {
     {
         let mut db = Self {
             project: None,
+            analysis_dialect,
             storage: salsa::Storage::new(if tracing::enabled!(tracing::Level::TRACE) {
                 Some(Box::new({
                     move |event: Event| {
@@ -572,6 +600,10 @@ impl SemanticDb for ProjectDatabase {
 
 #[salsa::db]
 impl ty_python_core::Db for ProjectDatabase {
+    fn analysis_dialect(&self, _file: File) -> AnalysisDialect {
+        self.analysis_dialect
+    }
+
     fn should_check_file(&self, file: File) -> bool {
         // Avoid creating a dependency on the `should_check_file` query for vendored files.
         if file.path(self).is_vendored_path() {
@@ -586,7 +618,10 @@ impl ty_python_core::Db for ProjectDatabase {
 #[salsa::db]
 impl SourceDb for ProjectDatabase {
     fn vendored(&self) -> &VendoredFileSystem {
-        ty_vendored::file_system()
+        match self.analysis_dialect {
+            AnalysisDialect::Python => ty_vendored::file_system(),
+            AnalysisDialect::SoacStrictV1 => ty_vendored::soac_file_system(),
+        }
     }
 
     fn system(&self) -> &dyn System {
@@ -847,9 +882,16 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use ruff_db::Db as _;
-    use ruff_db::files::FileRootKind;
+    use ruff_db::files::{FileRootKind, system_path_to_file};
+    use ruff_db::parsed::parsed_module;
+    use ruff_db::source::source_text;
     use ruff_db::system::{SystemPathBuf, TestSystem};
+    use ruff_python_ast::PythonVersion;
+    use ruff_python_parser::semantic_errors::SemanticSyntaxErrorKind;
     use ty_module_resolver::list_modules;
+    use ty_python_core::{AnalysisDialect, AnalysisPolicy, ProgramFile, semantic_index};
+    use ty_python_semantic::types::{KnownClass, Type};
+    use ty_python_semantic::{Db as _, HasType, SemanticModel, effective_analysis_settings};
 
     use crate::{Db as _, ProjectDatabase, ProjectMetadata};
 
@@ -929,6 +971,242 @@ mod tests {
             FileRootKind::SearchPath
         );
 
+        Ok(())
+    }
+
+    fn dialect_db(
+        dialect: AnalysisDialect,
+        python_version: &str,
+        options: &str,
+        source: &str,
+    ) -> anyhow::Result<ProjectDatabase> {
+        let system = TestSystem::default();
+        let project = SystemPathBuf::from("/project");
+        let config = format!("[environment]\npython-version = \"{python_version}\"\n{options}");
+        system.memory_file_system().write_files_all([
+            (project.join("ty.toml"), config.as_str()),
+            (project.join("main.py"), source),
+        ])?;
+        let metadata = ProjectMetadata::discover(&project, &system)?;
+        match dialect {
+            AnalysisDialect::Python => ProjectDatabase::fallible(metadata, system),
+            AnalysisDialect::SoacStrictV1 => {
+                ProjectDatabase::fallible_with_analysis_dialect(metadata, system, dialect)
+            }
+        }
+    }
+
+    fn main_file(db: &ProjectDatabase) -> ProgramFile<'_> {
+        db.program_file(system_path_to_file(db, "/project/main.py").unwrap())
+    }
+
+    fn guarded_expression_type<'db>(db: &'db ProjectDatabase, function_name: &str) -> Type<'db> {
+        let file = main_file(db);
+        let parsed = parsed_module(db, file.python_file(db)).load(db);
+        let function = parsed
+            .syntax()
+            .body
+            .iter()
+            .filter_map(|stmt| stmt.as_function_def_stmt())
+            .find(|function| function.name.as_str() == function_name)
+            .unwrap();
+        let guard = function.body[0].as_if_stmt().unwrap();
+        let expression = &guard.body[0].as_expr_stmt().unwrap().value;
+        expression
+            .inferred_type(&SemanticModel::new(db, file))
+            .unwrap()
+    }
+
+    #[test]
+    fn soac_future_requires_explicit_dialect_and_preserves_source() -> anyhow::Result<()> {
+        let source = "\"\"\"Unicode δ docstring.\"\"\"\nfrom __future__ import strict, annotations\nflag: int = strict.compiler_flag\n";
+        let ordinary = dialect_db(AnalysisDialect::Python, "3.15", "", source)?;
+        let ordinary_file = main_file(&ordinary);
+        let errors = semantic_index(&ordinary, ordinary_file).semantic_syntax_errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].kind,
+            SemanticSyntaxErrorKind::FutureFeatureNotDefined("strict".to_owned())
+        );
+
+        let soac = dialect_db(AnalysisDialect::SoacStrictV1, "3.15", "", source)?;
+        let file = main_file(&soac);
+        assert!(
+            semantic_index(&soac, file)
+                .semantic_syntax_errors()
+                .is_empty()
+        );
+        assert!(soac.check_file(file.file(&soac)).is_empty());
+        assert_eq!(source_text(&soac, file.file(&soac)).as_str(), source);
+        let parsed = parsed_module(&soac, file.python_file(&soac)).load(&soac);
+        let import = parsed.syntax().body[1].as_import_from_stmt().unwrap();
+        assert_eq!(import.module.as_deref(), Some("__future__"));
+        assert_eq!(import.names[0].name.as_str(), "strict");
+        assert_eq!(import.names[1].name.as_str(), "annotations");
+        assert_eq!(import.names[0].range, errors[0].range);
+        let range = import.names[0].range;
+        assert_eq!(
+            &source[usize::from(range.start())..usize::from(range.end())],
+            "strict"
+        );
+        assert_eq!(
+            file.analysis_policy(&soac),
+            AnalysisPolicy {
+                dialect: AnalysisDialect::SoacStrictV1,
+                python_version: PythonVersion::PY315,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn soac_future_keeps_placement_and_unknown_feature_errors() -> anyhow::Result<()> {
+        for (source, expected) in [
+            (
+                "value = 1\nfrom __future__ import strict\n",
+                SemanticSyntaxErrorKind::LateFutureImport,
+            ),
+            (
+                "def f():\n    from __future__ import strict\n",
+                SemanticSyntaxErrorKind::LateFutureImport,
+            ),
+            (
+                "lazy from __future__ import strict\n",
+                SemanticSyntaxErrorKind::LazyFutureImport,
+            ),
+            (
+                "from __future__ import strict, unrecognized\n",
+                SemanticSyntaxErrorKind::FutureFeatureNotDefined("unrecognized".to_owned()),
+            ),
+        ] {
+            let db = dialect_db(AnalysisDialect::SoacStrictV1, "3.15", "", source)?;
+            let errors = semantic_index(&db, main_file(&db)).semantic_syntax_errors();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].kind, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn soac_future_stub_does_not_leak_into_ordinary_analysis() -> anyhow::Result<()> {
+        let source = "import __future__\nsoac_feature = __future__.strict\npython_feature = __future__.annotations\n";
+        for dialect in [AnalysisDialect::Python, AnalysisDialect::SoacStrictV1] {
+            let db = dialect_db(dialect, "3.15", "", source)?;
+            let file = main_file(&db);
+            let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+            let model = SemanticModel::new(&db, file);
+            let types: Vec<_> = parsed.syntax().body[1..]
+                .iter()
+                .map(|stmt| {
+                    stmt.as_assign_stmt()
+                        .unwrap()
+                        .value
+                        .inferred_type(&model)
+                        .unwrap()
+                })
+                .collect();
+            assert_ne!(types[1], Type::unknown());
+            match dialect {
+                AnalysisDialect::Python => {
+                    assert_eq!(types[0], Type::unknown());
+                    assert!(!db.check_file(file.file(&db)).is_empty());
+                }
+                AnalysisDialect::SoacStrictV1 => {
+                    assert_eq!(types[0], types[1]);
+                    assert!(db.check_file(file.file(&db)).is_empty());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn soac_configured_python_315_drives_parser_and_typeshed() -> anyhow::Result<()> {
+        let source = "lazy import math\nimport sys\nbits: int = sys.abi_info.pointer_bits\n";
+        for dialect in [AnalysisDialect::Python, AnalysisDialect::SoacStrictV1] {
+            let py315 = dialect_db(dialect, "3.15", "", source)?;
+            let file = main_file(&py315);
+            assert_eq!(file.python_version(&py315), PythonVersion::PY315);
+            assert_eq!(
+                file.analysis_policy(&py315).python_version,
+                PythonVersion::PY315
+            );
+            let parsed = parsed_module(&py315, file.python_file(&py315)).load(&py315);
+            assert!(parsed.unsupported_syntax_errors().is_empty());
+            assert!(
+                semantic_index(&py315, file)
+                    .semantic_syntax_errors()
+                    .is_empty()
+            );
+            assert!(py315.check_file(file.file(&py315)).is_empty());
+
+            let py314 = dialect_db(dialect, "3.14", "", source)?;
+            let file = main_file(&py314);
+            assert_eq!(file.python_version(&py314), PythonVersion::PY314);
+            let parsed = parsed_module(&py314, file.python_file(&py314)).load(&py314);
+            assert!(!parsed.unsupported_syntax_errors().is_empty());
+            assert!(!py314.check_file(file.file(&py314)).is_empty());
+        }
+        // latest_ty is a fallback, not the maximum accepted configured version.
+        assert_eq!(PythonVersion::latest_ty(), PythonVersion::PY314);
+        Ok(())
+    }
+
+    #[test]
+    fn soac_effective_settings_override_unsafe_project_and_file_options() -> anyhow::Result<()> {
+        let source = "class Covariant[T]:\n    def get(self) -> T:\n        raise NotImplementedError\n\ndef equality(value: int):\n    if value == 1:\n        value\n\ndef generic(value: object):\n    if isinstance(value, Covariant):\n        value.get()\n";
+        for options in [
+            "[analysis]\nstrict-equality-semantics = false\nstrict-generic-narrowing = false\n",
+            "[analysis]\nstrict-equality-semantics = true\nstrict-generic-narrowing = true\n[[overrides]]\ninclude = [\"main.py\"]\n[overrides.analysis]\nstrict-equality-semantics = false\nstrict-generic-narrowing = false\n",
+        ] {
+            for dialect in [AnalysisDialect::Python, AnalysisDialect::SoacStrictV1] {
+                let db = dialect_db(dialect, "3.15", options, source)?;
+                let file = main_file(&db);
+                let raw = db.analysis_settings(file.file(&db));
+                assert!(!raw.strict_equality_semantics);
+                assert!(!raw.strict_generic_narrowing);
+                let effective = effective_analysis_settings(&db, file.file(&db));
+                let equality = guarded_expression_type(&db, "equality");
+                let generic = guarded_expression_type(&db, "generic");
+                match dialect {
+                    AnalysisDialect::Python => {
+                        assert_eq!(effective, raw);
+                        assert!(matches!(equality, Type::LiteralValue(_)));
+                        assert_eq!(generic, Type::unknown());
+                    }
+                    AnalysisDialect::SoacStrictV1 => {
+                        assert!(effective.strict_equality_semantics);
+                        assert!(effective.strict_generic_narrowing);
+                        let env = SemanticModel::new(&db, file).program_environment();
+                        assert_eq!(equality, KnownClass::Int.to_instance(&db, &env));
+                        assert_eq!(generic, KnownClass::Object.to_instance(&db, &env));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn soac_script_policy_reports_real_version_and_cannot_weaken_analysis() -> anyhow::Result<()> {
+        let source = "# /// script\n# requires-python = \">=3.14\"\n# [tool.ty.analysis]\n# strict-equality-semantics = false\n# strict-generic-narrowing = false\n# ///\nfrom __future__ import strict\ndef equality(value: int):\n    if value == 1:\n        value\n";
+        let db = dialect_db(AnalysisDialect::SoacStrictV1, "3.15", "", source)?;
+        let file = main_file(&db);
+        assert_eq!(
+            file.analysis_policy(&db),
+            AnalysisPolicy {
+                dialect: AnalysisDialect::SoacStrictV1,
+                python_version: PythonVersion::PY314,
+            }
+        );
+        let effective = effective_analysis_settings(&db, file.file(&db));
+        assert!(effective.strict_equality_semantics);
+        assert!(effective.strict_generic_narrowing);
+        let env = SemanticModel::new(&db, file).program_environment();
+        assert_eq!(
+            guarded_expression_type(&db, "equality"),
+            KnownClass::Int.to_instance(&db, &env)
+        );
         Ok(())
     }
 }

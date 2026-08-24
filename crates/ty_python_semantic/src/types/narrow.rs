@@ -1839,13 +1839,15 @@ impl<'db> PatternSuccessAnalyzer<'db> {
 
     fn comparison_soundness_policy(&self) -> ComparisonSoundnessPolicy {
         let db = self.db;
-        ComparisonSoundnessPolicy::from_analysis_settings(db.analysis_settings(self.scope.file(db)))
+        ComparisonSoundnessPolicy::from_analysis_settings(crate::effective_analysis_settings(
+            db,
+            self.scope.file(db),
+        ))
     }
 
     fn use_generic_filtering(&self) -> bool {
         let db = self.db;
-        !db.analysis_settings(self.scope.file(db))
-            .strict_generic_narrowing
+        !crate::effective_analysis_settings(db, self.scope.file(db)).strict_generic_narrowing
     }
 
     fn merge_binding(
@@ -3226,7 +3228,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
     fn comparison_soundness_policy(&self) -> ComparisonSoundnessPolicy {
         let db = self.db;
         ComparisonSoundnessPolicy::from_analysis_settings(
-            db.analysis_settings(self.scope().file(db)),
+            crate::effective_analysis_settings(db, self.scope().file(db)),
         )
     }
 
@@ -4320,9 +4322,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
                 let class_info_ty = inference.expression_type(second_arg);
 
                 let use_generic_filtering = is_positive
-                    && !self
-                        .db
-                        .analysis_settings(self.scope().file(self.db))
+                    && !crate::effective_analysis_settings(self.db, self.scope().file(self.db))
                         .strict_generic_narrowing;
                 function
                     .generate_constraint(
