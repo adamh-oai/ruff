@@ -994,7 +994,7 @@ fn check_class_declaration<'db>(
 /// class Sub(Mixin):
 ///     def method(self: HasValue) -> None: ...
 /// ```
-fn is_assignable_method_override<'db>(
+pub(super) fn is_assignable_method_override<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     subclass_type: Type<'db>,

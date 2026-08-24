@@ -58,6 +58,7 @@ const RUNTIME_CHECKABLE_DOCS_URL: &str =
 
 /// Registers all known type check lints.
 pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
+    super::soac_export::register_lints(registry);
     registry.register_lint(&AMBIGUOUS_PROTOCOL_MEMBER);
     registry.register_lint(&CALL_NON_CALLABLE);
     registry.register_lint(&CALL_TOP_CALLABLE);

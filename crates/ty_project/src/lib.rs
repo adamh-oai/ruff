@@ -41,6 +41,8 @@ pub mod parallel;
 mod script;
 #[cfg(test)]
 mod soac_export_tests;
+#[cfg(test)]
+mod soac_strict_tests;
 mod uv;
 mod walk;
 pub mod watch;

@@ -8,22 +8,38 @@ use ty_python_semantic::{export_soac_module, export_soac_module_facts};
 
 use crate::{ProjectDatabase, ProjectMetadata};
 
-fn database(source: &str, dialect: AnalysisDialect, unrelated: bool) -> ProjectDatabase {
+pub(super) fn database(source: &str, dialect: AnalysisDialect, unrelated: bool) -> ProjectDatabase {
+    database_with_options(source, dialect, unrelated, "")
+}
+
+pub(super) fn database_with_options(
+    source: &str,
+    dialect: AnalysisDialect,
+    unrelated: bool,
+    options: &str,
+) -> ProjectDatabase {
     let system = TestSystem::default();
     let project = SystemPathBuf::from("/project");
+    let config = format!("[environment]\npython-version = '3.15'\n{options}");
     system
         .memory_file_system()
         .write_files_all([
-            (
-                project.join("ty.toml"),
-                "[environment]\npython-version = '3.15'\n",
-            ),
+            (project.join("ty.toml"), config.as_str()),
             (project.join("main.py"), source),
             (project.join("unrelated.py"), "class Unrelated: pass\n"),
             (
                 project.join("external.py"),
                 "class Foreign:\n    def method(self) -> int:\n        return 1\n",
             ),
+            (
+                project.join("external_strict.py"),
+                "from __future__ import strict\nLIMIT = 1\nglobal mutable\nmutable = 0\n",
+            ),
+            (
+                project.join("configuration_values.py"),
+                "from nested_values import NUMBER\n",
+            ),
+            (project.join("nested_values.py"), "NUMBER = 42\n"),
         ])
         .unwrap();
     let metadata = ProjectMetadata::discover(&project, &system).unwrap();
@@ -371,5 +387,67 @@ fn soac_export_typevars_and_lambda_calls_have_source_binders() {
     assert_eq!(
         call.identity.enclosing_function.lexical_qualname,
         "<lambda>"
+    );
+}
+
+#[test]
+fn soac_export_tracks_imports_even_when_values_normalize_to_builtin_types() {
+    let db = database(
+        "from __future__ import strict\nfrom configuration_values import NUMBER\nCOPY = NUMBER\n",
+        AnalysisDialect::SoacStrictV1,
+        false,
+    );
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let exported = export_soac_module(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    for name in ["configuration_values", "nested_values"] {
+        assert!(
+            exported
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.module.module_name == name),
+            "missing {name}"
+        );
+    }
+}
+
+#[test]
+fn soac_export_unknown_dataclass_options_remain_dynamic() {
+    let facts = export(
+        "from __future__ import strict\nfrom dataclasses import dataclass\ndef choose() -> bool: return bool(input())\n@dataclass(slots=choose())\nclass Uncertain:\n    value: int\n",
+    );
+    let class = class(&facts, "Uncertain");
+    assert!(matches!(
+        class.participation,
+        ParticipationProposal::Dynamic(_)
+    ));
+    assert_eq!(class.dictionary, ClassDictionarySemantics::Unknown);
+    assert!(class.transform.is_none());
+    assert!(class.decorators[0].arguments.is_empty());
+    assert!(
+        class.decorators[0]
+            .uncertainty
+            .contains(&UncertaintyReason::DynamicDecorator)
+    );
+}
+
+#[test]
+fn soac_export_dataclass_field_presence_requires_actual_generated_init() {
+    let facts = export(
+        "from __future__ import strict\nfrom dataclasses import dataclass\n@dataclass(init=False)\nclass NoInit:\n    value: int\n@dataclass\nclass CustomInit:\n    value: int\n    def __init__(self): pass\n",
+    );
+    for name in ["NoInit", "CustomInit"] {
+        assert_eq!(
+            class(&facts, name).instance_fields[0].initialization,
+            InitializationPolicy::MayBeAbsent
+        );
+    }
+}
+
+#[test]
+fn soac_export_generator_lambdas_are_not_synchronous_functions() {
+    let facts = export("from __future__ import strict\ncallback = lambda: (yield 1)\n");
+    assert_eq!(
+        function(&facts, "<lambda>").function_kind,
+        FunctionKind::Generator
     );
 }

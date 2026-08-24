@@ -5484,7 +5484,10 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
             }
             ast::Expr::Yield(_) | ast::Expr::YieldFrom(_) => {
                 let scope = self.current_scope();
-                if self.scopes[scope].kind() == ScopeKind::Function {
+                if matches!(
+                    self.scopes[scope].kind(),
+                    ScopeKind::Function | ScopeKind::Lambda
+                ) {
                     self.generator_functions.insert(scope);
                 }
                 walk_expr(self, expr);

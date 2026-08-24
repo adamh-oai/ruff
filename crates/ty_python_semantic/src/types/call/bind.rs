@@ -8071,7 +8071,7 @@ impl<'db> Binding<'db> {
     /// that parameter.
     ///
     /// Returns an error if the parameter name is not found.
-    fn parameter_type_by_name(
+    pub(crate) fn parameter_type_by_name(
         &self,
         db: &'db dyn Db,
         parameter_name: &str,

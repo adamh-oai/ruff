@@ -28,6 +28,9 @@ use ty_python_core::{
     semantic_index,
 };
 
+mod strict;
+pub(crate) use strict::register_lints;
+
 use super::{
     CallArguments, ClassBase, ClassLiteral, DataclassFlags, DynamicType, KnownClass,
     LiteralValueTypeKind, ProgramEnvironment, Signature, Type, TypeQualifiers,
@@ -136,10 +139,41 @@ pub fn export_soac_module(
         owner,
         dependencies: RefCell::new(BTreeMap::new()),
         invalid_dependency: Cell::new(false),
+        used_suppressions: Vec::new(),
     };
     exporter.globals(program_file);
     exporter.visit_body(parsed.suite());
-    for diagnostic in crate::check_file_unwrap(db, program_file) {
+    // ty deliberately does not construct diagnostics that an ignore suppresses.
+    // Retain the parser's covered *code* ranges, rather than guessing at an
+    // omitted error from diagnostic text or scanning comments with a regexp.
+    for range in
+        crate::suppression::suppressions(db, program_file.python_file(db)).soac_covered_ranges()
+    {
+        let range = source_range(range);
+        exporter.module.diagnostics.push(facts::StrictDiagnostic {
+            code: facts::DiagnosticCode::StrictUncheckedDynamicType,
+            severity: facts::DiagnosticSeverity::Warning,
+            source_range: range,
+            scope: facts::DiagnosticScope::Site(range),
+            related_definitions: Vec::new(),
+            suppressed: true,
+            message: "Checker ignore covers this source region; dependent facts remain uncertain"
+                .into(),
+        });
+    }
+    // Suppressed source regions and dynamic base classes must be classified
+    // before optional strict class diagnostics consult the proposal catalog.
+    exporter.module = exporter.module.canonicalized()?;
+    strict::check(&mut exporter, parsed.suite());
+    // Complete the real checker diagnostic/suppression pipeline with the
+    // explicit SOAC consumer's usage. This prevents a used strict ignore from
+    // spuriously becoming an unused-ignore error, without suppressing unrelated
+    // unused codes or changing ordinary Python checking.
+    for diagnostic in super::check_types_with_suppression_usage(
+        db,
+        program_file,
+        std::mem::take(&mut exporter.used_suppressions),
+    ) {
         let range = diagnostic
             .primary_span()
             .and_then(|span| span.range())
@@ -159,24 +193,7 @@ pub fn export_soac_module(
             message: format!("{}: {}", diagnostic.id(), diagnostic.headline_message()),
         });
     }
-    // ty deliberately does not construct diagnostics that an ignore suppresses.
-    // Retain the parser's covered *code* ranges, rather than guessing at an
-    // omitted error from diagnostic text or scanning comments with a regexp.
-    for range in
-        crate::suppression::suppressions(db, program_file.python_file(db)).soac_covered_ranges()
-    {
-        let range = source_range(range);
-        exporter.module.diagnostics.push(facts::StrictDiagnostic {
-            code: facts::DiagnosticCode::StrictUncheckedDynamicType,
-            severity: facts::DiagnosticSeverity::Warning,
-            source_range: range,
-            scope: facts::DiagnosticScope::Site(range),
-            related_definitions: Vec::new(),
-            suppressed: true,
-            message: "Checker ignore covers this source region; dependent facts remain uncertain"
-                .into(),
-        });
-    }
+    exporter.collect_import_dependencies(program_file);
     if exporter.invalid_dependency.get() {
         return Err(facts::ContractError::InvalidSourceIdentity(
             "a semantic dependency has a virtual path or conflicting source identities".into(),
@@ -196,6 +213,7 @@ struct Exporter<'db> {
     owner: facts::SourceIdentity,
     dependencies: RefCell<BTreeMap<String, SoacSourceDependency>>,
     invalid_dependency: Cell<bool>,
+    used_suppressions: Vec<crate::suppression::FileSuppressionId>,
 }
 
 fn source_range(range: TextRange) -> facts::SourceRange {
@@ -233,6 +251,74 @@ fn unknown_signature() -> facts::CallableSignature {
 }
 
 impl<'db> Exporter<'db> {
+    /// Conservative resolved import closure. A dependency can determine a
+    /// builtin-valued fact without leaving a nominal source reference in the
+    /// exported type (for example `from configuration import NUMBER`). Resolve
+    /// those imports inside the actual checker program as well.
+    fn collect_import_dependencies(&self, file: ProgramFile<'db>) {
+        struct Imports<'a, 'db> {
+            exporter: &'a Exporter<'db>,
+            model: SemanticModel<'db>,
+            files: Vec<ProgramFile<'db>>,
+        }
+        impl<'db> Imports<'_, 'db> {
+            fn module(&mut self, module: Option<ty_module_resolver::Module<'db>>) {
+                if let Some(file) = module.and_then(|module| module.file(self.exporter.db)) {
+                    self.files
+                        .push(self.model.program().program_file(self.exporter.db, file));
+                }
+            }
+            fn alias(&mut self, alias: &ast::Alias) {
+                if let Some(Type::ModuleLiteral(module)) = alias.inferred_type(&self.model) {
+                    self.module(Some(module.module(self.exporter.db)));
+                }
+            }
+        }
+        impl<'ast> Visitor<'ast> for Imports<'_, '_> {
+            fn visit_stmt(&mut self, statement: &'ast ast::Stmt) {
+                match statement {
+                    ast::Stmt::Import(import) => {
+                        for alias in &import.names {
+                            self.module(self.model.resolve_module(Some(alias.name.as_str()), 0));
+                            self.alias(alias);
+                        }
+                    }
+                    ast::Stmt::ImportFrom(import) => {
+                        self.module(
+                            self.model
+                                .resolve_module(import.module.as_deref(), import.level),
+                        );
+                        for alias in &import.names {
+                            self.alias(alias);
+                        }
+                    }
+                    _ => {}
+                }
+                visitor::walk_stmt(self, statement);
+            }
+        }
+        let mut pending = vec![file];
+        let mut visited = rustc_hash::FxHashSet::default();
+        while let Some(file) = pending.pop() {
+            if !visited.insert(file) {
+                continue;
+            }
+            let _ = self.module_id(file);
+            let parsed = parsed_module(self.db, file.python_file(self.db)).load(self.db);
+            if !parsed.errors().is_empty() {
+                continue;
+            }
+            let mut imports = Imports {
+                exporter: self,
+                model: SemanticModel::new(self.db, file),
+                files: Vec::new(),
+            };
+            imports.module(imports.model.resolve_module(Some("builtins"), 0));
+            imports.visit_body(parsed.suite());
+            pending.extend(imports.files);
+        }
+    }
+
     fn module_id(&self, file: ProgramFile<'db>) -> Option<facts::ModuleContentId> {
         if file.file(self.db) == self.model.file() {
             return Some(self.module.module.clone());
@@ -673,12 +759,52 @@ impl<'db> Exporter<'db> {
                         );
                     }
                 }
-                let uncertain = matches!(
+                let mut uncertain = matches!(
                     kind,
                     facts::DecoratorKind::Other
                         | facts::DecoratorKind::Unknown
                         | facts::DecoratorKind::DataclassTransform
                 );
+                if kind == facts::DecoratorKind::StdlibDataclass
+                    && let ast::Expr::Call(call) = &decorator.expression
+                {
+                    let bound_arguments =
+                        CallArguments::from_arguments_typed(&call.arguments, |expression| {
+                            expression
+                                .inferred_type(&self.model)
+                                .unwrap_or_else(Type::unknown)
+                        });
+                    let resolved_options = callee_ty
+                        .try_call(self.db, &self.env, &bound_arguments)
+                        .ok()
+                        .is_some_and(|bindings| {
+                            let mut overloads = bindings
+                                .iter_flat()
+                                .flat_map(|binding| {
+                                    binding.matching_overloads().map(|(_, overload)| overload)
+                                })
+                                .peekable();
+                            overloads.peek().is_some()
+                                && overloads.all(|overload| {
+                                    super::DATACLASS_FLAGS.iter().all(|(name, _)| {
+                                        overload
+                                            .parameter_type_by_name(self.db, name, true)
+                                            .ok()
+                                            .flatten()
+                                            .is_some_and(|ty| {
+                                                matches!(
+                                                    ty.as_literal_value_kind(),
+                                                    Some(LiteralValueTypeKind::Bool(_))
+                                                )
+                                            })
+                                    })
+                                })
+                        });
+                    if !resolved_options {
+                        uncertain = true;
+                        arguments.clear();
+                    }
+                }
                 facts::DecoratorFact {
                     kind,
                     expression_range: source_range(decorator.expression.range()),
@@ -826,10 +952,11 @@ impl<'db> Exporter<'db> {
         let mut reasons = BTreeSet::new();
         let mut class_uncertainty = BTreeSet::new();
         if decorators.iter().any(|decorator| {
-            !matches!(
-                decorator.kind,
-                facts::DecoratorKind::StdlibDataclass | facts::DecoratorKind::TypingFinal
-            )
+            !decorator.uncertainty.is_empty()
+                || !matches!(
+                    decorator.kind,
+                    facts::DecoratorKind::StdlibDataclass | facts::DecoratorKind::TypingFinal
+                )
         }) {
             reasons.insert(facts::DynamicClassReason::UnknownDecorator);
             class_uncertainty.insert(facts::UncertaintyReason::DynamicDecorator);
@@ -913,45 +1040,56 @@ impl<'db> Exporter<'db> {
         let stdlib_dataclass = decorators
             .iter()
             .any(|decorator| decorator.kind == facts::DecoratorKind::StdlibDataclass);
-        let mut transform = generator.map(|generator| {
-            let kind = if stdlib_dataclass {
-                facts::TransformKind::StdlibDataclass
-            } else if matches!(generator, CodeGeneratorKind::DataclassLike(_)) {
-                facts::TransformKind::DataclassTransform
-            } else {
-                facts::TransformKind::UnsupportedFramework
-            };
-            if kind != facts::TransformKind::StdlibDataclass
-                || self.module.language_policy.adapters.dataclasses
-                    == facts::StdlibDataclassPolicy::Dynamic
-            {
-                reasons.insert(facts::DynamicClassReason::FrameworkManaged);
-            }
-            let options = class.dataclass_params(db).map(|params| {
-                let flags = params.flags(db);
-                facts::DataclassOptions {
-                    init: flags.contains(DataclassFlags::INIT),
-                    repr: flags.contains(DataclassFlags::REPR),
-                    eq: flags.contains(DataclassFlags::EQ),
-                    order: flags.contains(DataclassFlags::ORDER),
-                    unsafe_hash: flags.contains(DataclassFlags::UNSAFE_HASH),
-                    frozen: flags.contains(DataclassFlags::FROZEN),
-                    match_args: flags.contains(DataclassFlags::MATCH_ARGS),
-                    kw_only: flags.contains(DataclassFlags::KW_ONLY),
-                    slots: flags.contains(DataclassFlags::SLOTS),
-                    weakref_slot: flags.contains(DataclassFlags::WEAKREF_SLOT),
+        let uncertain_dataclass_options = decorators.iter().any(|decorator| {
+            decorator.kind == facts::DecoratorKind::StdlibDataclass
+                && !decorator.uncertainty.is_empty()
+        });
+        let mut transform = generator
+            .filter(|_| !uncertain_dataclass_options)
+            .map(|generator| {
+                let kind = if stdlib_dataclass {
+                    facts::TransformKind::StdlibDataclass
+                } else if matches!(generator, CodeGeneratorKind::DataclassLike(_)) {
+                    facts::TransformKind::DataclassTransform
+                } else {
+                    facts::TransformKind::UnsupportedFramework
+                };
+                if kind != facts::TransformKind::StdlibDataclass
+                    || self.module.language_policy.adapters.dataclasses
+                        == facts::StdlibDataclassPolicy::Dynamic
+                {
+                    reasons.insert(facts::DynamicClassReason::FrameworkManaged);
+                }
+                let options = class.dataclass_params(db).map(|params| {
+                    let flags = params.flags(db);
+                    facts::DataclassOptions {
+                        init: flags.contains(DataclassFlags::INIT),
+                        repr: flags.contains(DataclassFlags::REPR),
+                        eq: flags.contains(DataclassFlags::EQ),
+                        order: flags.contains(DataclassFlags::ORDER),
+                        unsafe_hash: flags.contains(DataclassFlags::UNSAFE_HASH),
+                        frozen: flags.contains(DataclassFlags::FROZEN),
+                        match_args: flags.contains(DataclassFlags::MATCH_ARGS),
+                        kw_only: flags.contains(DataclassFlags::KW_ONLY),
+                        slots: flags.contains(DataclassFlags::SLOTS),
+                        weakref_slot: flags.contains(DataclassFlags::WEAKREF_SLOT),
+                    }
+                });
+                facts::ClassTransformFact {
+                    kind,
+                    provenance: decorators
+                        .iter()
+                        .find(|decorator| decorator.kind == facts::DecoratorKind::StdlibDataclass)
+                        .and_then(|decorator| decorator.definition.clone()),
+                    dataclass_options: options,
+                    generated_methods: BTreeSet::new(),
                 }
             });
-            facts::ClassTransformFact {
-                kind,
-                provenance: decorators
-                    .iter()
-                    .find(|decorator| decorator.kind == facts::DecoratorKind::StdlibDataclass)
-                    .and_then(|decorator| decorator.definition.clone()),
-                dataclass_options: options,
-                generated_methods: BTreeSet::new(),
-            }
-        });
+        let generated_init = transform.is_some()
+            && super::member::class_member(db, class.body_scope(db), "__init__").is_undefined()
+            && class
+                .own_synthesized_member(db, &self.env, None, None, "__init__")
+                .is_some();
         let mut fields = Vec::new();
         if let Some(generator) = generator {
             for (name, field) in class.fields(db, None, generator) {
@@ -990,7 +1128,7 @@ impl<'db> Exporter<'db> {
                     } else {
                         facts::FieldWritePolicy::DeclaredField
                     },
-                    initialization: if initialized {
+                    initialization: if initialized && generated_init && !init_only {
                         facts::InitializationPolicy::InitializedByConstructor
                     } else {
                         facts::InitializationPolicy::MayBeAbsent
@@ -1230,7 +1368,12 @@ impl<'db> Exporter<'db> {
             } else {
                 facts::ParticipationProposal::Dynamic(reasons)
             },
-            dictionary: if slots {
+            dictionary: if uncertain_dataclass_options
+                || class_uncertainty.contains(&facts::UncertaintyReason::DynamicDecorator)
+                || class_uncertainty.contains(&facts::UncertaintyReason::DynamicMetaclass)
+            {
+                facts::ClassDictionarySemantics::Unknown
+            } else if slots {
                 facts::ClassDictionarySemantics::ExplicitSlots
             } else {
                 facts::ClassDictionarySemantics::DictionaryBearing
@@ -1558,9 +1701,16 @@ impl<'ast> Visitor<'ast> for Exporter<'_> {
                     .inferred_type(&self.model)
                     .unwrap_or_else(Type::unknown);
                 let signature = self.callable_signature(ty, 0);
+                let index = semantic_index(self.db, self.model.program_file());
+                let lambda_scope =
+                    index.node_scope(ty_python_core::scope::NodeWithScopeRef::Lambda(lambda));
                 self.module.functions.push(facts::FunctionTypeFact {
                     identity: identity.clone(),
-                    function_kind: facts::FunctionKind::Synchronous,
+                    function_kind: if lambda_scope.is_generator_function(index) {
+                        facts::FunctionKind::Generator
+                    } else {
+                        facts::FunctionKind::Synchronous
+                    },
                     uncertainty: signature.uncertainty.clone(),
                     signature,
                     decorators: Vec::new(),
