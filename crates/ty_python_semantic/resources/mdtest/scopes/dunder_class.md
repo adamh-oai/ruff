@@ -180,7 +180,8 @@ class C:
 ## No implicit owner
 
 Class namespace membership is not lexical closure provenance. A function assigned to a class does
-not gain a class cell, and an enclosing class body does not supply one to a nested class body.
+not gain a class cell, and a nested class body without an explicit nonlocal declaration does not
+automatically capture the enclosing class's cell.
 
 ```py
 def outside() -> None:
@@ -299,22 +300,39 @@ class C:
     method = unrelated
 ```
 
-## Known limitations
-
-The following uses need additional eager-cell or annotation-scope producer support.
-
-### Eager nested class-body forwarding
+## Eager nested class-body forwarding
 
 The declaration below is valid Python. The outer cell exists but is initially empty while the
-nested class body executes, and the outer construction fills it afterward. This needs eager cell
-dataflow distinct from the callable-cell initial-value model; do not create a class namespace
-binding or assume the outer class value is already available.
+nested class body executes, and the outer construction fills it afterward. A preceding direct write
+can fill that cell, but the nested class's methods still receive their own separate implicit cell.
 
 ```py
 class C:
     class D:
-        nonlocal __class__  # error: [invalid-syntax]
+        nonlocal __class__
+        __class__ = str
+        reveal_type(__class__)  # revealed: <class 'str'>
+
+        def method(self) -> None:
+            reveal_type(__class__)  # revealed: <class 'D'>
 ```
+
+## The eager cell starts empty
+
+Its eventual class value is not yet available. An empty cell does not fall back to a global name.
+
+```py
+__class__ = int
+
+class C:
+    class D:
+        nonlocal __class__
+        __class__  # error: [unresolved-reference]
+```
+
+## Known limitations
+
+The following uses need additional annotation-scope producer support.
 
 ### Type alias annotation scopes
 

@@ -1589,7 +1589,17 @@ impl<'db> Exporter<'db> {
         }
         let mut methods = BTreeMap::new();
         let mut class_members = BTreeMap::new();
+        let class_places = place_table(db, class.body_scope(db));
         for member in all_end_of_scope_members(db, class.body_scope(db)) {
+            // A class body can write a global or nonlocal cell, but that does not
+            // install a binding in its prepared namespace. The scope iterator
+            // includes those writes for flow analysis; they are not members.
+            if class_places
+                .symbol_by_name(member.member.name.as_str())
+                .is_some_and(|symbol| symbol.is_global() || symbol.is_nonlocal())
+            {
+                continue;
+            }
             let name = member.member.name.to_string();
             let ty = member.member.ty;
             let function = ty.as_function_literal().or_else(|| {

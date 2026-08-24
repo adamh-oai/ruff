@@ -327,6 +327,185 @@ def outer() -> int:
 }
 
 #[test]
+fn soac_eager_nested_class_cell_has_distinct_forwarded_and_method_owners() {
+    let source = r#"from __future__ import strict
+__class__ = 100
+def factory():
+    class Outer:
+        class Inner:
+            nonlocal __class__
+            __class__ = "construction"
+            saved: str = __class__
+            def own_class(self):
+                return __class__
+            def replace(self, value):
+                nonlocal __class__
+                __class__ = value
+        def own_class(self):
+            return __class__
+        def replace(self, value):
+            nonlocal __class__
+            __class__ = value
+    return Outer
+"#;
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let program_file = ty_python_semantic::Db::program_file(&db, file);
+    let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db)).load(&db);
+    let index = ty_python_core::semantic_index(&db, program_file);
+    let class_scope = |name| {
+        index
+            .scope_ids()
+            .find(|scope| {
+                scope.node(&db).scope_kind().is_class() && scope.name(&db, &parsed) == name
+            })
+            .unwrap()
+            .file_scope_id(&db)
+    };
+    let outer = class_scope("Outer");
+    let inner = class_scope("Inner");
+    let method_scope = |owner, name| {
+        index
+            .scope_ids()
+            .find(|scope| {
+                index.scope(scope.file_scope_id(&db)).parent() == Some(owner)
+                    && scope.name(&db, &parsed) == name
+            })
+            .unwrap()
+            .file_scope_id(&db)
+    };
+    let outer_cell = index
+        .implicit_class_cell(method_scope(outer, "own_class"))
+        .unwrap();
+    let inner_cell = index
+        .implicit_class_cell(method_scope(inner, "own_class"))
+        .unwrap();
+    assert_ne!(outer_cell, inner_cell);
+    assert_eq!(index.implicit_class_cell(inner), Some(outer_cell));
+    assert!(
+        index
+            .implicit_class_cell_write_scopes(outer_cell)
+            .contains(&inner)
+    );
+    assert!(
+        !index
+            .implicit_class_cell_write_scopes(inner_cell)
+            .contains(&inner)
+    );
+    assert!(
+        index
+            .implicit_class_cell_write_scopes(inner_cell)
+            .contains(&method_scope(inner, "replace"))
+    );
+    assert!(
+        !index
+            .implicit_class_cell_write_scopes(outer_cell)
+            .contains(&method_scope(inner, "replace"))
+    );
+
+    let facts = export_from(&db);
+    for class_name in ["factory.<locals>.Outer", "factory.<locals>.Outer.Inner"] {
+        assert!(
+            class(&facts, class_name)
+                .class_members
+                .iter()
+                .all(|member| member.name != "__class__"),
+            "{class_name}"
+        );
+    }
+    let global = facts
+        .global_bindings
+        .iter()
+        .find(|binding| binding.name == "__class__")
+        .unwrap();
+    assert_eq!(
+        global.value_type,
+        StaticType::Literal(LiteralValue::Int("100".into()))
+    );
+    assert_eq!(global.mutability, GlobalMutability::FinalAfterSeal);
+    let ordinary = source.replace("from __future__ import strict", "# ordinary source");
+    let ordinary = database(&ordinary, AnalysisDialect::Python, false);
+    let file = system_path_to_file(&ordinary, "/project/main.py").unwrap();
+    assert!(ty_python_semantic::Db::check_file(&ordinary, file).is_empty());
+}
+
+#[test]
+fn soac_eager_nested_class_cell_does_not_grant_a_completed_value() {
+    let source = r#"from __future__ import strict
+__class__ = 100
+class Outer:
+    class Inner:
+        nonlocal __class__
+        before = __class__
+"#;
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let facts =
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    assert!(
+        facts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    );
+}
+
+#[test]
+fn soac_eager_nested_class_cell_keeps_explicit_owner_and_namespace_boundaries() {
+    let source = r#"from __future__ import strict
+global_name = 1
+def factory():
+    outer_name = 2
+    class Outer:
+        __class__ = "namespace"
+        class Inner:
+            nonlocal __class__, outer_name
+            global global_name
+            __class__ = "construction"
+            outer_name = 3
+            global_name = 4
+            saved = __class__
+        def own_class(self):
+            return __class__
+    return Outer
+"#;
+    let facts = export(source);
+    let outer = class(&facts, "factory.<locals>.Outer");
+    assert!(
+        outer
+            .class_members
+            .iter()
+            .any(|member| member.name == "__class__")
+    );
+    let inner = class(&facts, "factory.<locals>.Outer.Inner");
+    for name in ["__class__", "outer_name", "global_name"] {
+        assert!(
+            inner.class_members.iter().all(|member| member.name != name),
+            "{name}"
+        );
+    }
+    assert!(
+        inner
+            .class_members
+            .iter()
+            .any(|member| member.name == "saved")
+    );
+
+    for invalid in [
+        "class Alone:\n    nonlocal __class__\n",
+        "__class__ = 100\nclass Alone:\n    nonlocal __class__\n",
+        "class Outer:\n    def method(self):\n        global __class__\n        class Inner:\n            nonlocal __class__\n",
+    ] {
+        let db = database(invalid, AnalysisDialect::Python, false);
+        let file = system_path_to_file(&db, "/project/main.py").unwrap();
+        assert!(
+            !ty_python_semantic::Db::check_file(&db, file).is_empty(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
 fn soac_implicit_class_cell_preserves_a_generic_methods_type_parameter_owner() {
     let source = "class Model:\n    def method[__class__](self):\n        return __class__\n";
     let db = database(source, AnalysisDialect::Python, false);

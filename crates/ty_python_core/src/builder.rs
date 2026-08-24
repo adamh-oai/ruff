@@ -1116,7 +1116,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     }
 
     fn implicit_class_cell(&self, scope: FileScopeId) -> Option<ImplicitClassCell> {
-        ImplicitClassCell::resolve(&self.scopes, scope, |scope| {
+        let forwards_eager_class_cell = self.place_tables[scope]
+            .symbol_id("__class__")
+            .is_some_and(|id| self.place_tables[scope].symbol(id).is_nonlocal());
+        ImplicitClassCell::resolve(&self.scopes, scope, forwards_eager_class_cell, |scope| {
             let table = &self.place_tables[scope];
             table.symbol_id("__class__").is_some_and(|id| {
                 let symbol = table.symbol(id);

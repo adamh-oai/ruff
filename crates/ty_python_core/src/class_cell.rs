@@ -46,9 +46,12 @@ impl ImplicitClassCell {
     /// Resolve a free or nonlocal `__class__` reference using completed lexical scope information.
     /// The callback reports explicit local/global owners; nonlocal declarations only forward.
     /// Class namespace bindings are visible in the starting class scope, never through a closure.
+    /// An explicit nonlocal in an eager nested class body can forward its enclosing class's cell;
+    /// that cell is distinct from the one the nested class supplies to its own methods.
     pub(crate) fn resolve(
         scopes: &IndexSlice<FileScopeId, Scope>,
         start: FileScopeId,
+        forwards_eager_class_cell: bool,
         mut has_explicit_owner: impl FnMut(FileScopeId) -> bool,
     ) -> Option<Self> {
         let mut next = Some(start);
@@ -62,7 +65,22 @@ impl ImplicitClassCell {
             {
                 return None;
             }
-            if let Some(cell) = Self::for_callable_scope(scopes, scope_id) {
+            let cell = Self::for_callable_scope(scopes, scope_id).or_else(|| {
+                if scope_id != start || !forwards_eager_class_cell || !scope.kind().is_class() {
+                    return None;
+                }
+                let parent = scope.parent()?;
+                let class_scope = if scopes[parent].kind() == ScopeKind::TypeParams {
+                    scopes[parent].parent()?
+                } else {
+                    parent
+                };
+                scopes[class_scope]
+                    .kind()
+                    .is_class()
+                    .then_some(Self { class_scope })
+            });
+            if let Some(cell) = cell {
                 // A generic method's type parameter scope may explicitly own the same name.
                 // Check that intervening lexical scope before reaching the class cell.
                 let mut parent = scope.parent();

@@ -10030,9 +10030,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let Some(initial) = original_class_type(db, definition) else {
             return Place::Undefined.into();
         };
+        let during_construction = self.scope().node(db).scope_kind().is_class()
+            && self
+                .index
+                .ancestor_scopes(self.scope().file_scope_id(db))
+                .take_while(|(scope, _)| *scope != cell.class_scope())
+                .all(|(_, scope)| scope.is_eager());
         let mut union = UnionBuilder::new(db, env).recursively_defined(RecursivelyDefined::Yes);
-        union.add_in_place(Type::ClassLiteral(initial));
-        let mut definedness = Definedness::AlwaysDefined;
+        let mut definedness = if during_construction {
+            // An eager nested class can forward the cell before type construction
+            // fills it. Neither the eventual class value nor a global namesake is
+            // available yet. Ordinary local flow handles a preceding direct write;
+            // other reachable writes are only possible values, not boundness proof.
+            Definedness::PossiblyUndefined
+        } else {
+            union.add_in_place(Type::ClassLiteral(initial));
+            Definedness::AlwaysDefined
+        };
         for scope in self.index.implicit_class_cell_write_scopes(cell) {
             let symbol = self
                 .index
@@ -10068,11 +10082,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         ));
                     }
                     DefinitionState::Deleted => definedness = Definedness::PossiblyUndefined,
-                    // Each writing scope starts without a local assignment. That is not a
-                    // deletion of the shared cell, whose original class value is included above.
+                    // An absent local assignment is not a deletion of the shared cell.
                     DefinitionState::Undefined => {}
                 }
             }
+        }
+        if union.is_empty() {
+            return Place::Undefined.into();
         }
         let Place::Defined(place) = Place::bound(union.build()) else {
             unreachable!("bound constructs a defined place")

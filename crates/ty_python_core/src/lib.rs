@@ -521,7 +521,11 @@ impl<'db> SemanticIndex<'db> {
     /// Resolve this scope's free/nonlocal `__class__` to its actual implicit cell, if any.
     /// Explicit local and global owners take precedence; namespace membership is not ownership.
     pub fn implicit_class_cell(&self, scope: FileScopeId) -> Option<ImplicitClassCell> {
-        ImplicitClassCell::resolve(&self.scopes, scope, |scope| {
+        let forwards_eager_class_cell = self
+            .place_table(scope)
+            .symbol_by_name("__class__")
+            .is_some_and(|symbol| symbol.is_nonlocal());
+        ImplicitClassCell::resolve(&self.scopes, scope, forwards_eager_class_cell, |scope| {
             self.place_table(scope)
                 .symbol_by_name("__class__")
                 .is_some_and(|symbol| symbol.is_local() || symbol.is_global())
