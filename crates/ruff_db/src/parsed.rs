@@ -69,6 +69,12 @@ pub fn parsed_string_annotation(
     string: &StringLiteral,
 ) -> Result<Parsed<ModExpression>, ParseError> {
     let expr = parse_string_annotation(source, string)?;
+    // This is an actual second parse, with original absolute source ranges.
+    // A lossless outer raw string does not establish lossless inner literals.
+    soac_source::validate_source_literals(source, expr.tokens()).map_err(|error| ParseError {
+        location: error.range(),
+        error: ParseErrorType::OtherError(error.to_string()),
+    })?;
 
     // We need the sub-ast of the string annotation to be indexed
     indexed::ensure_indexed(&expr, string.node_index().load()).map_err(|err| {
@@ -944,6 +950,39 @@ mod tests {
     use crate::vendored::{VendoredFileSystemBuilder, VendoredPath};
     use ruff_python_ast::PythonVersion;
     use zip::CompressionMethod;
+
+    #[test]
+    fn soac_source_actual_second_annotation_parse_rejects_only_active_surrogates()
+        -> crate::system::Result<()>
+    {
+        for (source, rejected) in [
+            (r#"r"Literal['\ud800']""#, true),
+            (r#"r"Literal['\U0000DFFF']""#, true),
+            (r#"r"Literal['\\ud800']""#, false),
+            (r#"r"Literal[r'\ud800']""#, false),
+            (r#""Literal['�']""#, false),
+            (r#"r"Literal['\ufffd']""#, false),
+        ] {
+            let mut db = TestDb::new();
+            db.write_file("test.py", source)?;
+            let file = system_path_to_file(&db, "test.py").unwrap();
+            let file = PythonFile::new(&db, file, PythonVersion::latest_ty());
+            let parsed = parsed_module(&db, file).load(&db);
+            let ruff_python_ast::Stmt::Expr(statement) = &parsed.suite()[0] else {
+                panic!("expected expression");
+            };
+            let ruff_python_ast::Expr::StringLiteral(string) = statement.value.as_ref() else {
+                panic!("expected string");
+            };
+            let result = super::parsed_string_annotation(source, string.as_single_part_string().unwrap());
+            assert_eq!(result.is_err(), rejected, "{source}");
+            if let Err(error) = result {
+                assert!(matches!(error.error, ruff_python_parser::ParseErrorType::OtherError(_)));
+                assert!(matches!(&source[error.location], r"\ud800" | r"\U0000DFFF"));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn python_file() -> crate::system::Result<()> {

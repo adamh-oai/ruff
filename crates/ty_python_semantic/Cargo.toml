@@ -11,6 +11,7 @@ repository = { workspace = true }
 license = { workspace = true }
 
 [dependencies]
+soac_source = "0.1.0"
 soac_contracts = "0.1.0"
 ruff_db = { workspace = true }
 ruff_diagnostics = { workspace = true }

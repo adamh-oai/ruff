@@ -6836,6 +6836,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 aliased_type,
             )));
         }
+        // An ordinary dependency can contribute literal aliases to a strict
+        // module. Do not intern a substituted U+FFFD as an exact Python value.
+        if !crate::types::soac_export::source_literals_supported(self.db(), self.program_file()) {
+            return Type::unknown();
+        }
         if literal.value.len() <= Self::MAX_STRING_LITERAL_SIZE {
             Type::string_literal(self.db(), literal.value.to_str())
         } else {
@@ -6859,6 +6864,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } = fstring;
 
         let mut collector = StringPartsCollector::new();
+        if !crate::types::soac_export::source_literals_supported(db, self.program_file()) {
+            // Preserve traversal and diagnostics for all interpolation operands,
+            // while declining an exact string value from a lossy source file.
+            collector.add_non_literal_string_expression();
+        }
         for part in value {
             // Make sure we iter through every parts to infer all sub-expressions. The `collector`
             // struct ensures we don't allocate unnecessary strings.

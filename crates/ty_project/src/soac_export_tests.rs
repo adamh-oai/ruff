@@ -3166,3 +3166,103 @@ fn soac_export_external_base_source_changes_invalidate_transitive_queries() {
     )]);
     assert_eq!(export_from(&db), initial);
 }
+
+#[test]
+fn soac_source_surrogate_literals_fail_before_export() {
+    for body in [
+        r#"def value(): return '\ud800'"#,
+        r#"def value(arg): return f'\ud800{arg}'"#,
+        r#"def value(arg): return f'{arg:\ud800}'"#,
+        r#"def value(arg): return t'\ud800{arg}'"#,
+        r#"def value(arg): return t'{arg:\ud800}'"#,
+        r#"from typing import Literal
+def accept(value: Literal['\ud800']) -> Literal['\ud800']: return value"#,
+    ] {
+        let source = format!("from __future__ import strict\n{body}\n");
+        let db = database(&source, AnalysisDialect::SoacStrictV1, false);
+        let file = system_path_to_file(&db, "/project/main.py").unwrap();
+        let error = export_soac_module(&db, file, "main", ResolvedStrictPolicy::default())
+            .expect_err("unsupported source must not produce a proposal");
+        assert!(matches!(&error, ContractError::InvalidSourceIdentity(_)));
+        assert!(error.to_string().contains("unsupported Unicode surrogate escape U+D800"));
+        let start = source.find(r"\ud800").unwrap();
+        assert!(error.to_string().contains(&format!("bytes {start}..{}", start + 6)));
+    }
+}
+
+#[test]
+fn soac_source_genuine_replacement_and_raw_literals_remain_exact() {
+    let facts = export(r#"from __future__ import strict
+from typing import Literal
+def accept(value: Literal['�'], raw: Literal[r'\ud800']) -> Literal['\ufffd']:
+    return value
+"#);
+    let signature = &function(&facts, "accept").signature;
+    assert_eq!(signature.parameters[0].value_type, StaticType::Literal(LiteralValue::Str("�".into())));
+    assert_eq!(signature.parameters[1].value_type, StaticType::Literal(LiteralValue::Str(r"\ud800".into())));
+    assert_eq!(signature.return_type, StaticType::Literal(LiteralValue::Str("�".into())));
+}
+
+fn source_literal_dependency_database(dependency: &str, main: &str) -> ProjectDatabase {
+    let system = TestSystem::default();
+    system.memory_file_system().write_files_all([
+        ("/project/ty.toml", "[environment]\npython-version = '3.15'\n"),
+        ("/project/dependency.py", dependency),
+        ("/project/main.py", main),
+    ]).unwrap();
+    let metadata = ProjectMetadata::discover(
+        ruff_db::system::SystemPath::new("/project"), &system,
+    ).unwrap();
+    ProjectDatabase::fallible_with_analysis_dialect(
+        metadata, system, AnalysisDialect::SoacStrictV1,
+    ).unwrap()
+}
+
+#[test]
+fn soac_source_imported_surrogate_aliases_never_become_replacement_literal_facts() {
+    let main = "from __future__ import strict\nfrom dependency import Alias\ndef accept(value: Alias) -> Alias: return value\n";
+    for (dependency, expected) in [
+        (r#"from typing import Literal
+Alias = Literal['\ud800']
+"#, StaticType::Unknown),
+        (r#"from typing import Literal
+type Alias = Literal['\U0000DFFF']
+"#, StaticType::Unknown),
+        (r#"from typing import Literal
+Alias = Literal['�']
+"#, StaticType::Literal(LiteralValue::Str("�".into()))),
+        (r#"from typing import Literal
+Alias = Literal[r'\ud800']
+"#, StaticType::Literal(LiteralValue::Str(r"\ud800".into()))),
+    ] {
+        let db = source_literal_dependency_database(dependency, main);
+        let facts = export_from(&db);
+        let signature = &function(&facts, "accept").signature;
+        assert_eq!(signature.parameters[0].value_type, expected, "{dependency}");
+        assert_eq!(signature.return_type, expected, "{dependency}");
+        if expected == StaticType::Unknown {
+            assert!(signature.uncertainty.contains(&UncertaintyReason::Unknown));
+        }
+    }
+}
+
+#[test]
+fn soac_source_dependency_f_and_t_strings_still_infer_interpolation_operands() {
+    for prefix in ["f", "t"] {
+        let dependency = format!("VALUE = {prefix}'\\ud800{{missing_operand}}'\n");
+        let db = source_literal_dependency_database(
+            &dependency,
+            "from __future__ import strict\nfrom dependency import VALUE\nobserved = VALUE\n",
+        );
+        let file = system_path_to_file(&db, "/project/dependency.py").unwrap();
+        let diagnostics = ty_python_semantic::Db::check_file(&db, file);
+        let diagnostic = diagnostics.iter().find(|diagnostic| {
+            diagnostic.id().is_lint_named("unresolved-reference")
+        }).expect("interpolation expression is still analyzed");
+        let range = diagnostic.primary_span().unwrap().range().unwrap();
+        assert_eq!(&dependency[range], "missing_operand");
+        let facts = export_from(&db);
+        let observed = facts.global_bindings.iter().find(|binding| binding.name == "observed").unwrap();
+        assert!(!matches!(observed.value_type, StaticType::Literal(_)));
+    }
+}

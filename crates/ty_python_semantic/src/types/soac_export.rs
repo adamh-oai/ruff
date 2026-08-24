@@ -30,6 +30,8 @@ use ty_python_core::{
 };
 
 mod framework;
+mod source;
+pub(crate) use source::source_literals_supported;
 mod strict;
 pub(crate) use strict::register_lints;
 
@@ -134,6 +136,11 @@ fn export_soac_module_impl(
             if import.level == 0 && import.module.as_deref() == Some("__future__")
                 && import.names.iter().any(|alias| alias.name.as_str() == "strict"))
     });
+    if strict {
+        soac_source::validate_source_literals(source.as_str(), parsed.tokens()).map_err(|error| {
+            facts::ContractError::InvalidSourceIdentity(error.to_string())
+        })?;
+    }
     let module = facts::ModuleTypeFacts::new(
         module_name,
         source.as_bytes(),
