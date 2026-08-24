@@ -3335,3 +3335,65 @@ fn soac_export_pydantic_fields_keep_user_object_names_and_real_overrides() {
         diagnostic.suppressed || diagnostic.severity != DiagnosticSeverity::Error
     ));
 }
+
+
+#[test]
+fn soac_export_repeated_source_digests_refresh_after_same_size_dependency_changes() {
+    let source = "from __future__ import strict\nclass Base: pass\ndef decorate[T](value: T) -> T: return value\n# first\n";
+    let (mut db, system) = inheritance_database(source, false);
+    let main = "from __future__ import strict\nfrom base import Base, decorate\nclass Child(Base):\n    left: Base\n    right: Base\n@decorate\nclass Decorated: pass\ndef echo(left: Base, right: Base) -> Base: return left\n";
+    system.memory_file_system().write_file_all("/project/main.py", main).unwrap();
+    db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+        "/project/main.py".into(),
+    )]);
+
+    fn assert_digests(facts: &ModuleTypeFacts, source: &str) {
+        let expected = Fingerprint::digest(source);
+        let base = class(facts, "Child").bases[0].as_class().unwrap();
+        assert_eq!(base.source_digest, expected);
+        for name in ["left", "right"] {
+            let StaticType::NominalClass(reference) = &field(facts, "Child", name).value_type else {
+                panic!("field must keep the actual nominal source reference");
+            };
+            assert_eq!(reference, base);
+        }
+        let signature = &function(facts, "echo").signature;
+        assert_eq!(signature.parameters.len(), 2);
+        for value_type in signature.parameters.iter().map(|parameter| &parameter.value_type)
+            .chain([&signature.return_type])
+        {
+            let StaticType::NominalClass(reference) = value_type else {
+                panic!("signature must keep the actual nominal source reference");
+            };
+            assert_eq!(reference, base);
+        }
+        let decorators = &class(facts, "Decorated").decorators;
+        assert_eq!(decorators.len(), 1);
+        assert_eq!(decorators[0].definition.as_ref().unwrap().module, base.definition.module);
+        assert_eq!(decorators[0].source_digest, Some(expected));
+        let dependencies: Vec<_> = facts.consumed_dependencies.iter()
+            .filter(|dependency| dependency.module.module_name == "base").collect();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].module, base.definition.module);
+        assert_eq!(dependencies[0].source_digest, expected);
+        assert_eq!(dependencies[0].source_size as usize, source.len());
+    }
+
+    let initial = export_from(&db);
+    assert_digests(&initial, source);
+    assert_eq!(export_from(&db), initial, "repeated exports remain deterministic");
+    let changed = source.replace("# first", "# other");
+    assert_eq!(source.len(), changed.len());
+    system.memory_file_system().write_file_all("/project/base.py", &changed).unwrap();
+    db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+        "/project/base.py".into(),
+    )]);
+    let updated = export_from(&db);
+    assert_digests(&updated, &changed);
+    assert_ne!(updated, initial, "same file key and size do not preserve old digests");
+    system.memory_file_system().write_file_all("/project/base.py", source).unwrap();
+    db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+        "/project/base.py".into(),
+    )]);
+    assert_eq!(export_from(&db), initial);
+}

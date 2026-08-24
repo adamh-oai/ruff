@@ -148,6 +148,9 @@ fn export_soac_module_impl(
         policy,
     )?;
     let owner = module.module_body_identity();
+    let source_digests = RefCell::new(rustc_hash::FxHashMap::from_iter([
+        (file, module.source_digest),
+    ]));
     let mut exporter = Exporter {
         db,
         model: SemanticModel::new(db, program_file),
@@ -155,6 +158,7 @@ fn export_soac_module_impl(
         module,
         owner,
         dependencies: RefCell::new(BTreeMap::new()),
+        source_digests,
         invalid_dependency: Cell::new(false),
         used_suppressions: Vec::new(),
         attribute_receivers: BTreeMap::new(),
@@ -257,6 +261,11 @@ struct Exporter<'db> {
     module: facts::ModuleTypeFacts,
     owner: facts::SourceIdentity,
     dependencies: RefCell<BTreeMap<String, SoacSourceDependency>>,
+    /// Reuse exact source-byte digests within this immutable database borrow.
+    /// A new export owns a fresh cache, so no File key crosses a database
+    /// revision, independent project, or changed source observation. Paths,
+    /// module resolution and conflict checks still run at every reference.
+    source_digests: RefCell<rustc_hash::FxHashMap<File, facts::Fingerprint>>,
     invalid_dependency: Cell<bool>,
     used_suppressions: Vec<crate::suppression::FileSuppressionId>,
     /// Private semantic receivers indexed by their exact expression ranges.
@@ -446,6 +455,17 @@ impl<'db> Exporter<'db> {
         }
     }
 
+    fn source_digest(&self, file: File) -> facts::Fingerprint {
+        if let Some(digest) = self.source_digests.borrow().get(&file).copied() {
+            return digest;
+        }
+        // Release the cache borrow before querying source text. The source
+        // query and the surrounding exporter use the same immutable DB view.
+        let digest = facts::Fingerprint::digest(source_text(self.db, file).as_bytes());
+        self.source_digests.borrow_mut().insert(file, digest);
+        digest
+    }
+
     fn module_id(&self, file: ProgramFile<'db>) -> Option<facts::ModuleContentId> {
         if file.file(self.db) == self.model.file() {
             return Some(self.module.module.clone());
@@ -470,7 +490,7 @@ impl<'db> Exporter<'db> {
         let source_size = u32::try_from(source.len()).ok()?;
         let dependency = SoacSourceDependency {
             module: identity.clone(),
-            source_digest: facts::Fingerprint::digest(source.as_bytes()),
+            source_digest: self.source_digest(file.file(self.db)),
             source_size,
             path,
         };
@@ -563,9 +583,7 @@ impl<'db> Exporter<'db> {
         let class = class.as_static()?;
         Some(facts::ClassReference {
             definition: self.definition(class.definition(self.db))?,
-            source_digest: facts::Fingerprint::digest(
-                source_text(self.db, class.file(self.db)).as_bytes(),
-            ),
+            source_digest: self.source_digest(class.file(self.db)),
         })
     }
 
@@ -916,9 +934,9 @@ impl<'db> Exporter<'db> {
                     _ => facts::DecoratorKind::Unknown,
                 };
                 let source_digest = match callee_ty {
-                    Type::FunctionLiteral(function) => Some(facts::Fingerprint::digest(
-                        source_text(self.db, function.definition(self.db).file(self.db)).as_bytes(),
-                    )),
+                    Type::FunctionLiteral(function) => {
+                        Some(self.source_digest(function.definition(self.db).file(self.db)))
+                    }
                     Type::ClassLiteral(class) => {
                         self.class_reference(class).map(|class| class.source_digest)
                     }
