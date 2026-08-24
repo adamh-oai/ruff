@@ -1462,12 +1462,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             && let Some((owner_scope, owner_symbol)) =
                 self.forwarded_assignment_owner(file_scope_id, symbol)
         {
-            (
-                self.index
-                    .use_def_map(owner_scope)
-                    .end_of_scope_symbol_declarations(owner_symbol),
-                false,
-            )
+            let owner_use_def = self.index.use_def_map(owner_scope);
+            let declarations = if owner_scope.is_global() {
+                owner_use_def.end_of_scope_symbol_declarations(owner_symbol)
+            } else {
+                // The owning function may return the closure, making its end-of-scope path
+                // unreachable. Its cell still carries every reachable declaration after return.
+                owner_use_def.reachable_symbol_declarations(owner_symbol)
+            };
+            (declarations, false)
         } else {
             (use_def.declarations_at_binding(binding), true)
         };
@@ -1577,8 +1580,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// Returns the owner of an assignment redirected by `global` or `nonlocal`.
     ///
     /// `global` assignments target the module symbol, while `nonlocal` assignments target the
-    /// closest owning function-like scope. Local assignments and forwarding declarations whose
-    /// owner cannot be resolved return `None`.
+    /// closest owning function-like scope. An implicit class cell has no explicit declaration
+    /// constraining its contents; local assignments, implicit-cell assignments, and unresolved
+    /// forwarding declarations return `None`.
     ///
     /// ```python
     /// x = 0
@@ -1615,6 +1619,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         debug_assert!(scoped_symbol.is_nonlocal());
+
+        if scoped_symbol.name() == "__class__" && self.index.implicit_class_cell(scope).is_some() {
+            // The original class is the cell's initial value, not a declared type. In particular,
+            // an outer ordinary variable named `__class__` does not constrain this distinct cell.
+            return None;
+        }
 
         // Walk up parent scopes looking for the enclosing scope that defines this name.
         // `ancestor_scopes` includes the current scope, so skip that one.
@@ -10010,6 +10020,66 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         (place, constraint_keys)
     }
 
+    fn infer_implicit_class_cell(
+        &self,
+        cell: ty_python_core::ImplicitClassCell,
+    ) -> PlaceAndQualifiers<'db> {
+        let db = self.db();
+        let env = self.program_environment();
+        let definition = self.index.implicit_class_cell_definition(cell);
+        let Some(initial) = original_class_type(db, definition) else {
+            return Place::Undefined.into();
+        };
+        let mut union = UnionBuilder::new(db, env).recursively_defined(RecursivelyDefined::Yes);
+        union.add_in_place(Type::ClassLiteral(initial));
+        let mut definedness = Definedness::AlwaysDefined;
+        for scope in self.index.implicit_class_cell_write_scopes(cell) {
+            let symbol = self
+                .index
+                .place_table(*scope)
+                .symbol_id("__class__")
+                .expect("a recorded class-cell write must have an actual source symbol");
+            let bindings = self
+                .index
+                .use_def_map(*scope)
+                .reachable_bindings(symbol.into());
+            let constraints = bindings.reachability_constraints();
+            let predicates = bindings.predicates();
+            for binding in bindings {
+                if evaluate_reachability_with_cache(
+                    db,
+                    Some(self.reachability_cache()),
+                    constraints,
+                    predicates,
+                    binding.reachability_constraint,
+                )
+                .is_always_false()
+                {
+                    continue;
+                }
+                match binding.binding {
+                    DefinitionState::Defined(definition) => {
+                        let ty = binding_type(db, definition);
+                        union.add_in_place(binding.narrowing_constraint.narrow(
+                            db,
+                            env,
+                            ty,
+                            symbol.into(),
+                        ));
+                    }
+                    DefinitionState::Deleted => definedness = Definedness::PossiblyUndefined,
+                    // Each writing scope starts without a local assignment. That is not a
+                    // deletion of the shared cell, whose original class value is included above.
+                    DefinitionState::Undefined => {}
+                }
+            }
+        }
+        let Place::Defined(place) = Place::bound(union.build()) else {
+            unreachable!("bound constructs a defined place")
+        };
+        Place::Defined(place.with_definedness(definedness)).into()
+    }
+
     fn infer_place_load_source(
         &self,
         place_expr: PlaceExprRef,
@@ -10047,11 +10117,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 ConsideredDefinitions::AllReachable,
             ),
             PlaceLoadSourceKind::Implicit(implicit) => match implicit {
-                ImplicitPlaceLoad::DunderClass(definition) => original_class_type(db, definition)
-                    .map_or_else(
-                        || Place::Undefined.into(),
-                        |class| Place::bound(class).into(),
-                    ),
+                ImplicitPlaceLoad::DunderClass(cell) => self.infer_implicit_class_cell(cell),
                 ImplicitPlaceLoad::ClassBodySymbol(name) => {
                     let implicit = class_body_implicit_symbol(db, env, &name);
                     if implicit.place.is_definitely_bound() {

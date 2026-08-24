@@ -200,23 +200,120 @@ class C:
             __class__  # error: [unresolved-reference]
 ```
 
-## Known limitations
+## Explicit nonlocal declarations of the implicit cell
 
-The following uses need additional binding or annotation-scope producer support.
-
-### Explicit nonlocal declarations of the implicit cell
-
-The lookup can now reach the implicit cell, but declaration validation still requires an explicit
-enclosing binding. Both declarations below are valid in Python and remain a known limitation.
+The implicit cell is an owning closure binding, not a class namespace symbol. A direct method or a
+nested function can explicitly forward to it, even when the enclosing method never reads it.
 
 ```py
 class C:
     def method(self) -> None:
-        nonlocal __class__  # error: [invalid-syntax]
+        nonlocal __class__
 
         def nested() -> None:
-            nonlocal __class__  # error: [invalid-syntax]
+            nonlocal __class__
             reveal_type(__class__)  # revealed: <class 'C'>
+```
+
+## Nonlocal writes keep their actual cell owner
+
+Writes from sibling methods update the shared implicit cell. They do not update an outer variable
+or an unrelated class namespace attribute with the same spelling.
+
+```py
+def outer() -> None:
+    __class__: int = 7
+
+    class C:
+        __class__: bytes = b"namespace"
+
+        def read(self) -> None:
+            reveal_type(__class__)  # revealed: <class 'C'> | Literal["changed"]
+
+        def replace(self) -> None:
+            nonlocal __class__
+            __class__ = "changed"
+
+        def nested_replace(self) -> None:
+            def nested() -> None:
+                nonlocal __class__
+                __class__ = "changed"
+
+        reveal_type(__class__)  # revealed: Literal[b"namespace"]
+
+    reveal_type(__class__)  # revealed: Literal[7]
+```
+
+## Nearer explicit owners still constrain writes
+
+```py
+class C:
+    def method(self) -> None:
+        __class__: int = 1
+
+        def change() -> None:
+            nonlocal __class__
+            __class__ = "wrong"  # error: [invalid-assignment]
+
+    def global_method(self) -> None:
+        global __class__  # error: [unresolved-global]
+
+        def invalid() -> None:
+            nonlocal __class__  # error: [invalid-syntax]
+```
+
+## Distinct cell owners in the same outer function
+
+An implicit-cell write in one method cannot erase the declared type of a different method's local
+cell, including when both methods are unannotated.
+
+```py
+def outer() -> int:
+    __class__: int = 7
+
+    class Model:
+        def replace(self):
+            nonlocal __class__
+            __class__ = "changed"
+
+        def indirect(self):
+            __class__: int = 1
+
+            def replace():
+                nonlocal __class__
+                __class__ = b"nested"  # error: [invalid-assignment]
+
+            return replace
+
+    return __class__
+```
+
+## No nonlocal cell from namespace membership
+
+```py
+def unrelated() -> None:
+    nonlocal __class__  # error: [invalid-syntax]
+
+class C:
+    nonlocal __class__  # error: [invalid-syntax]
+    method = unrelated
+```
+
+## Known limitations
+
+The following uses need additional eager-cell or annotation-scope producer support.
+
+### Eager nested class-body forwarding
+
+The declaration below is valid Python. The outer cell exists but is initially empty while the
+nested class body executes, and the outer construction fills it afterward. This needs eager cell
+dataflow distinct from the callable-cell initial-value model; do not create a class namespace
+binding or assume the outer class value is already available.
+
+```py
+class C:
+    class D:
+        nonlocal __class__  # error: [invalid-syntax]
 ```
 
 ### Type alias annotation scopes

@@ -1625,6 +1625,17 @@ impl NestedBindingsDefinitionKind {
     ) -> impl Iterator<Item = (bool, BindingWithConstraintsIterator<'index, 'db>)> + 'index {
         self.nested_declarations.iter().filter_map(|declaration| {
             debug_assert!(declaration.is_bound);
+            if self.name == "__class__"
+                && !declaration.is_global()
+                && index
+                    .implicit_class_cell(declaration.file_scope_id)
+                    .is_some()
+            {
+                // Implicit class-cell writes have their own owner and source table. A synthetic
+                // proxy installed before an enclosing function finished cannot redirect them to
+                // that function's namespace or to an outer namesake.
+                return None;
+            }
             let symbol = index
                 .place_table(declaration.file_scope_id)
                 .symbol_id(&self.name)?;

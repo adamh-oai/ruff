@@ -821,3 +821,19 @@ def _():
             # scope.
             reveal_type(x)  # revealed: Literal["f2"] | int
 ```
+
+## A returned closure retains its owner's declared cell type
+
+The end of the owning function is unreachable after `return`, but its cell and declaration remain
+available to the returned function. A nonlocal assignment must still respect that declaration.
+
+```py
+def factory():
+    value: int = 1
+
+    def replace():
+        nonlocal value
+        value = "wrong"  # error: [invalid-assignment]
+
+    return replace
+```

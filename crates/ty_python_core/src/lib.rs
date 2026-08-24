@@ -44,6 +44,8 @@ pub use analysis_dialect::{AnalysisDialect, AnalysisPolicy};
 pub mod ast_ids;
 pub mod ast_node_ref;
 mod builder;
+mod class_cell;
+pub use class_cell::ImplicitClassCell;
 mod db;
 pub mod definition;
 pub mod expression;
@@ -324,6 +326,10 @@ pub struct SemanticIndex<'db> {
     /// Use-def map for each scope in this file.
     use_def_maps: FrozenIndexVec<FileScopeId, Arc<UseDefMap<'db>>>,
 
+    /// Actual scopes that write or delete a shared implicit class cell. These are not namespace
+    /// bindings and must not be propagated through ordinary `NestedBindings` definitions.
+    implicit_class_cell_writes: FrozenMap<ImplicitClassCell, Box<[FileScopeId]>>,
+
     /// Lookup table to map between node ids and ast nodes.
     ///
     /// Note: We should not depend on this map when analysing other files or
@@ -458,6 +464,9 @@ impl<'db> SemanticIndex<'db> {
     ) -> bool {
         let symbol = self.place_table(scope).symbol(symbol);
         let name = symbol.name();
+        if name == "__class__" && self.implicit_class_cell(scope).is_some() {
+            return false;
+        }
         // Note that `visible_ancestor_scopes` includes the starting scope itself.
         for (visible_scope_id, _) in self.visible_ancestor_scopes(scope) {
             if visible_scope_id.is_global() {
@@ -502,27 +511,36 @@ impl<'db> SemanticIndex<'db> {
         if current_scope.kind() != ScopeKind::Function {
             return None;
         }
-        let parent_scope_id = current_scope.parent()?;
-        let parent_scope = self.scope(parent_scope_id);
-
-        let class_scope = match parent_scope.kind() {
-            ScopeKind::Class => parent_scope,
-            ScopeKind::TypeParams => {
-                let class_scope_id = parent_scope.parent()?;
-                let potentially_class_scope = self.scope(class_scope_id);
-
-                match potentially_class_scope.kind() {
-                    ScopeKind::Class => potentially_class_scope,
-                    _ => return None,
-                }
-            }
-            _ => return None,
-        };
-
-        class_scope
+        let cell = ImplicitClassCell::for_callable_scope(&self.scopes, function_body_scope)?;
+        self.scope(cell.class_scope())
             .node()
             .as_class()
             .map(|node_ref| self.expect_single_definition(node_ref))
+    }
+
+    /// Resolve this scope's free/nonlocal `__class__` to its actual implicit cell, if any.
+    /// Explicit local and global owners take precedence; namespace membership is not ownership.
+    pub fn implicit_class_cell(&self, scope: FileScopeId) -> Option<ImplicitClassCell> {
+        ImplicitClassCell::resolve(&self.scopes, scope, |scope| {
+            self.place_table(scope)
+                .symbol_by_name("__class__")
+                .is_some_and(|symbol| symbol.is_local() || symbol.is_global())
+        })
+    }
+
+    pub fn implicit_class_cell_definition(&self, cell: ImplicitClassCell) -> Definition<'db> {
+        self.expect_single_definition(
+            self.scope(cell.class_scope())
+                .node()
+                .as_class()
+                .expect("implicit cell owner must be a class scope"),
+        )
+    }
+
+    pub fn implicit_class_cell_write_scopes(&self, cell: ImplicitClassCell) -> &[FileScopeId] {
+        self.implicit_class_cell_writes
+            .get(&cell)
+            .map_or(&[], Box::as_ref)
     }
 
     pub fn enclosing_lambda_statement(&self, lambda: ExpressionNodeKey) -> Option<Statement<'db>> {

@@ -23,7 +23,6 @@ use ty_module_resolver::{
     ImportingFile, ModuleName, ResolverEnvironment, resolve_module_for_import_from,
 };
 
-use crate::HasTrackedScope;
 use crate::ProgramFile;
 use crate::ast_ids::node_key::ExpressionNodeKey;
 use crate::ast_ids::{AstIdsBuilder, ScopedUseId};
@@ -71,6 +70,7 @@ use crate::{
     DefinitionsByNode, EvaluationMode, ExpressionsScopeMap, LoopHeader, LoopHeaderId,
     NarrowingAliasPredicate, PossiblyNarrowedPlaces, SemanticIndex, VisibleAncestorsIter,
 };
+use crate::{HasTrackedScope, ImplicitClassCell};
 
 use super::place::PlaceExprRef;
 
@@ -270,6 +270,7 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     ast_ids: IndexVec<FileScopeId, AstIdsBuilder>,
     // Box to avoid copying large builders when this index grows.
     use_def_maps: IndexVec<FileScopeId, Box<UseDefMapBuilder<'db>>>,
+    implicit_class_cell_writes: FxHashMap<ImplicitClassCell, Vec<FileScopeId>>,
     scopes_by_node: FxHashMap<NodeWithScopeKey, FileScopeId>,
     scopes_by_expression: ExpressionsScopeMapBuilder,
     definitions_by_node: FxHashMap<DefinitionNodeKey, Definitions<'db>>,
@@ -330,6 +331,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             ast_ids: IndexVec::new(),
             scope_ids_by_scope: IndexVec::new(),
             use_def_maps: IndexVec::new(),
+            implicit_class_cell_writes: FxHashMap::default(),
 
             scopes_by_expression: ExpressionsScopeMapBuilder::new(),
             scopes_by_node: FxHashMap::default(),
@@ -1027,6 +1029,37 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             }
         }
 
+        // A class supplies a distinct implicit cell to its methods and their lexical descendants.
+        // Resolve only declarations whose completed callable chain reaches this construction;
+        // the class body's own `nonlocal` still refers outside the class. This is late enough to
+        // preserve later local bindings in an enclosing method, and stops cell writes from leaking
+        // into an outer ordinary symbol with the same spelling.
+        if popped_scope_kind.is_class()
+            && let Some(declarations) = nested_global_or_nonlocal_declarations.get_mut("__class__")
+        {
+            declarations.retain(|declaration| {
+                if declaration.is_global() {
+                    return true;
+                }
+                let Some(cell) = self.implicit_class_cell(declaration.file_scope_id) else {
+                    return true;
+                };
+                if cell.class_scope() != popped_scope_id {
+                    return true;
+                }
+                if declaration.is_bound {
+                    self.implicit_class_cell_writes
+                        .entry(cell)
+                        .or_default()
+                        .push(declaration.file_scope_id);
+                }
+                false
+            });
+            if declarations.is_empty() {
+                nested_global_or_nonlocal_declarations.remove("__class__");
+            }
+        }
+
         // If the enclosing scope is the module scope, it's a semantic syntax error error to have
         // any remaining unresolved `nonlocal` declarations.
         if self.scope_stack.len() == 1 {
@@ -1080,6 +1113,16 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     fn current_place_table(&self) -> &PlaceTableBuilder {
         let scope_id = self.current_scope();
         &self.place_tables[scope_id]
+    }
+
+    fn implicit_class_cell(&self, scope: FileScopeId) -> Option<ImplicitClassCell> {
+        ImplicitClassCell::resolve(&self.scopes, scope, |scope| {
+            let table = &self.place_tables[scope];
+            table.symbol_id("__class__").is_some_and(|id| {
+                let symbol = table.symbol(id);
+                symbol.is_local() || symbol.is_global()
+            })
+        })
     }
 
     fn current_place_table_mut(&mut self) -> &mut PlaceTableBuilder {
@@ -1882,7 +1925,18 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             // skip synthesizing a definition for this symbol. (The reason we track these at all is
             // that we reuse some of the same machinery to report semantic syntax errors for
             // invalid `nonlocal`s, and those don't necessarily need a binding.)
-            declarations.retain(|d| d.is_bound);
+            declarations.retain(|d| {
+                d.is_bound
+                    // A finished callable's implicit-cell write is not a class namespace member.
+                    // Only resolve this case now: incomplete outer function scopes may still gain
+                    // a nearer explicit local binding later in their source.
+                    && !(name == "__class__"
+                        && !d.is_global()
+                        && self.scopes[self.current_scope()].kind().is_class()
+                        && self.implicit_class_cell(d.file_scope_id).is_some_and(|cell| {
+                            cell.class_scope() == self.current_scope()
+                        }))
+            });
             declarations.shrink_to_fit();
             if declarations.is_empty() {
                 continue;
@@ -3239,6 +3293,15 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 .use_def_maps
                 .into_iter()
                 .map(|builder| Arc::new(builder.finish()))
+                .collect(),
+            implicit_class_cell_writes: self
+                .implicit_class_cell_writes
+                .into_iter()
+                .map(|(cell, mut scopes)| {
+                    scopes.sort_unstable();
+                    scopes.dedup();
+                    (cell, scopes.into_boxed_slice())
+                })
                 .collect(),
             enclosing_lambda_statements: FrozenMap::from(self.enclosing_lambda_statements),
             collections_by_use: FrozenMap::from(self.collections_by_use),

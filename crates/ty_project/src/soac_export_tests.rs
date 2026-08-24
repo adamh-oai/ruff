@@ -213,6 +213,137 @@ fn soac_implicit_class_cell_does_not_grant_nonlexical_or_unbound_names() {
 }
 
 #[test]
+fn soac_nonlocal_class_cell_has_no_namespace_binding() {
+    let source = r#"from __future__ import strict
+def factory():
+    class Model:
+        def reader(self):
+            def read():
+                nonlocal __class__
+                return __class__
+            return read
+        def replace(self, value):
+            nonlocal __class__
+            __class__ = value
+        def erase(self):
+            nonlocal __class__
+            del __class__
+        def direct(self):
+            return __class__
+    return Model
+"#;
+    let facts = export(source);
+    assert_eq!(
+        facts,
+        export_from(&database(source, AnalysisDialect::SoacStrictV1, true))
+    );
+    assert!(
+        facts
+            .global_bindings
+            .iter()
+            .all(|binding| binding.name != "__class__")
+    );
+    let owner = class(&facts, "factory.<locals>.Model");
+    assert_eq!(owner.participation, ParticipationProposal::Candidate);
+    assert!(
+        owner
+            .class_members
+            .iter()
+            .all(|member| member.name != "__class__")
+    );
+    assert!(
+        owner
+            .instance_fields
+            .iter()
+            .all(|field| field.name != "__class__")
+    );
+    for name in ["reader", "replace", "erase", "direct"] {
+        let method = function(&facts, &format!("factory.<locals>.Model.{name}"));
+        assert_eq!(
+            method.signature.return_annotation_origin,
+            AnnotationOrigin::Absent
+        );
+    }
+    let ordinary = source.replace("from __future__ import strict", "# ordinary source");
+    let db = database(&ordinary, AnalysisDialect::Python, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    assert!(ty_python_semantic::Db::check_file(&db, file).is_empty());
+}
+
+#[test]
+fn soac_nonlocal_class_cell_does_not_write_an_outer_namesake() {
+    let source = r#"from __future__ import strict
+def outer() -> int:
+    __class__: int = 7
+    class Model:
+        def replace(self):
+            nonlocal __class__
+            __class__ = "changed"
+        def indirect(self):
+            def replace():
+                nonlocal __class__
+                __class__ = b"nested"
+            return replace
+    return __class__
+"#;
+    let facts = export(source);
+    assert!(
+        facts
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != DiagnosticSeverity::Error)
+    );
+    let invalid = source.replace(
+        "            def replace():",
+        "            __class__: int = 1\n            def replace():",
+    );
+    let db = database(&invalid, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let program_file = ty_python_semantic::Db::program_file(&db, file);
+    let index = ty_python_core::semantic_index(&db, program_file);
+    let parsed = ruff_db::parsed::parsed_module(&db, program_file.python_file(&db)).load(&db);
+    let local_owner = index
+        .scope_ids()
+        .find(|scope| scope.name(&db, &parsed) == "indirect")
+        .unwrap()
+        .file_scope_id(&db);
+    let nested = index
+        .scope_ids()
+        .find(|scope| index.scope(scope.file_scope_id(&db)).parent() == Some(local_owner))
+        .unwrap()
+        .file_scope_id(&db);
+    assert!(index.implicit_class_cell(local_owner).is_none());
+    assert!(index.implicit_class_cell(nested).is_none());
+    let facts =
+        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    assert!(
+        facts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error),
+        "{invalid}\n{:?}",
+        facts.diagnostics
+    );
+}
+
+#[test]
+fn soac_implicit_class_cell_preserves_a_generic_methods_type_parameter_owner() {
+    let source = "class Model:\n    def method[__class__](self):\n        return __class__\n";
+    let db = database(source, AnalysisDialect::Python, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let program_file = ty_python_semantic::Db::program_file(&db, file);
+    let index = ty_python_core::semantic_index(&db, program_file);
+    let scope = index
+        .scope_ids()
+        .find(|scope| scope.node(&db).scope_kind() == ty_python_core::scope::ScopeKind::Function)
+        .unwrap()
+        .file_scope_id(&db);
+    assert!(index.class_definition_of_method(scope).is_some());
+    assert!(index.implicit_class_cell(scope).is_none());
+    assert!(ty_python_semantic::Db::check_file(&db, file).is_empty());
+}
+
+#[test]
 fn soac_lambda_identities_follow_lexical_definition_scopes() {
     let source = r#"from __future__ import strict
 module_list = [lambda: module_index for module_index in range(2)]

@@ -84,10 +84,9 @@
 use ruff_python_ast::{self as ast, name::Name};
 use smallvec::SmallVec;
 use ty_python_core::ast_ids::{HasScopedUseId, ScopedUseId};
-use ty_python_core::definition::Definition;
 use ty_python_core::narrowing_constraints::ConstraintKey;
 use ty_python_core::place::{PlaceExpr, PlaceExprRef, ScopedPlaceId};
-use ty_python_core::scope::{NodeWithScopeKind, ScopeId, ScopeKind};
+use ty_python_core::scope::{ScopeId, ScopeKind};
 use ty_python_core::symbol::{ScopedSymbolId, Symbol};
 use ty_python_core::{
     AncestorsIter, BindingWithConstraintsIterator, EnclosingSnapshotResult, FileScopeId,
@@ -197,19 +196,15 @@ impl<'db> Iterator for PlaceLoadResolution<'db, '_> {
                 PlaceLoadResolutionNode::DecideResolutionPath => {
                     self.next_node = Some(self.decide_resolution_path());
                 }
-                PlaceLoadResolutionNode::DunderClassSource {
-                    definition,
-                    enclosing_scopes,
-                } => {
-                    self.next_node = Some(PlaceLoadResolutionNode::EnclosingScopeSource(
-                        enclosing_scopes,
+                PlaceLoadResolutionNode::DunderClassSource { cell } => {
+                    // An empty closure cell raises; it never falls back to an outer/global name.
+                    self.next_node = Some(PlaceLoadResolutionNode::Failure(
+                        PlaceLoadFailure::UnboundFree,
                     ));
 
                     return Some(PlaceLoadResolutionStep::Source(
                         PlaceLoadConstraints::unnarrowed_source(
-                            PlaceLoadSourceKind::Implicit(ImplicitPlaceLoad::DunderClass(
-                                definition,
-                            )),
+                            PlaceLoadSourceKind::Implicit(ImplicitPlaceLoad::DunderClass(cell)),
                             PlaceLoadSourceRole::Ordinary,
                         ),
                     ));
@@ -379,12 +374,9 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
 
         if let PlaceExprRef::Symbol(symbol) = place_expr
             && symbol.name() == "__class__"
-            && let Some(definition) = self.context.dunder_class_cell_definition(file_scope)
+            && let Some(cell) = self.context.index.implicit_class_cell(file_scope)
         {
-            PlaceLoadResolutionNode::DunderClassSource {
-                definition,
-                enclosing_scopes: scopes,
-            }
+            PlaceLoadResolutionNode::DunderClassSource { cell }
         } else {
             PlaceLoadResolutionNode::EnclosingScopeSource(scopes)
         }
@@ -422,34 +414,6 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
                     .parents(place_expr)
                     .any(|root| enclosing_place_table.place(root).is_bound())
             };
-
-            // An enclosing method/lambda/generator can supply its implicit class cell even when
-            // its body never reads the name itself. Resolve that cell at its lexical boundary,
-            // after any nearer enclosing scope was considered, not by searching for a class.
-            // Explicit bindings/declarations (including unbound ones and forwarded writes) and
-            // globals still take precedence. A read-only nonlocal declaration can forward this
-            // same implicit cell to a nested scope.
-            if is_lexical_enclosing_scope
-                && place_expr
-                    .as_symbol()
-                    .is_some_and(|symbol| symbol.name() == "__class__")
-                && !enclosing_place.is_some_and(|place| {
-                    place.as_symbol().is_some_and(|symbol| {
-                        symbol.is_bound() || symbol.is_declared() || symbol.is_global()
-                    })
-                })
-                && let Some(definition) = self
-                    .context
-                    .dunder_class_cell_definition(enclosing_file_scope)
-            {
-                return (
-                    PlaceLoadResolutionNode::Failure(PlaceLoadFailure::UnboundFree),
-                    Some(PlaceLoadConstraints::unnarrowed_source(
-                        PlaceLoadSourceKind::Implicit(ImplicitPlaceLoad::DunderClass(definition)),
-                        PlaceLoadSourceRole::Ordinary,
-                    )),
-                );
-            }
 
             let mut eagerly_undefined = false;
             if self.context.uses_enclosing_snapshots() {
@@ -784,7 +748,7 @@ pub(crate) enum ImplicitPlaceLoad<'db> {
     ///     def method(self):
     ///         return __class__
     /// ```
-    DunderClass(Definition<'db>),
+    DunderClass(ty_python_core::ImplicitClassCell),
     /// An implicit symbol supplied directly in a class body, e.g.:
     ///
     /// ```py
@@ -1030,21 +994,6 @@ impl<'db> PlaceLoadResolutionContext<'db, '_> {
         let scope = self.scope.file_scope_id(self.db);
         !scope.is_global() && self.index.symbol_is_global_in_scope(symbol, scope)
     }
-
-    fn dunder_class_cell_definition(self, scope: FileScopeId) -> Option<Definition<'db>> {
-        if let Some(definition) = self.index.class_definition_of_method(scope) {
-            return Some(definition);
-        }
-
-        if !matches!(
-            self.index.scope(scope).node(),
-            NodeWithScopeKind::Lambda(_) | NodeWithScopeKind::GeneratorExpression(_)
-        ) {
-            return None;
-        }
-        let class = self.index.parent_scope(scope)?.node().as_class()?;
-        Some(self.index.expect_single_definition(class))
-    }
 }
 
 /// A node in the acyclic graph traversed by a [`PlaceLoadResolution`].
@@ -1061,10 +1010,9 @@ enum PlaceLoadResolutionNode<'db> {
     /// Decide whether resolution ends, continues through enclosing scopes, or moves to the module
     /// scope.
     DecideResolutionPath,
-    /// The implicit `__class__` source, followed by enclosing scopes.
+    /// The implicit `__class__` source, with no global fallback if the cell is empty.
     DunderClassSource {
-        definition: Definition<'db>,
-        enclosing_scopes: AncestorsIter<'db>,
+        cell: ty_python_core::ImplicitClassCell,
     },
     /// A source from the remaining enclosing scopes, if one exists.
     EnclosingScopeSource(AncestorsIter<'db>),
