@@ -49,6 +49,25 @@ pub type WhichResult = std::result::Result<SystemPathBuf, WhichError>;
 ///
 /// Abstracting the system also enables tests to use a more efficient in-memory file system.
 pub trait System: Debug + Sync + Send {
+    /// Read a cached import-resolution listing. Systems that authenticate
+    /// analysis inputs can defer recording until a concrete query is consumed.
+    fn read_directory_for_import_resolution<'a>(
+        &'a self,
+        path: &SystemPath,
+    ) -> Result<Box<dyn Iterator<Item = Result<DirectoryEntry>> + 'a>> {
+        self.read_directory(path)
+    }
+
+    /// Observe exactly the cached directory view used by a resolver query.
+    /// The default OS/editor systems need no extra bookkeeping.
+    fn observe_directory_query(
+        &self,
+        _path: &SystemPath,
+        _filter: &DirectoryFilter,
+        _entries: &mut dyn Iterator<Item = (&str, FileType)>,
+    ) {
+    }
+
     /// Reads the metadata of the file or directory at `path`.
     ///
     /// This function will traverse symbolic links to query information about the destination file.
@@ -226,6 +245,27 @@ pub trait System: Debug + Sync + Send {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
     fn dyn_clone(&self) -> Box<dyn System>;
+}
+
+/// Structured directory queries consumed by the module resolver, not a global
+/// filesystem exclusion list. A direct import into any directory still works.
+#[derive(Debug, Clone)]
+pub enum DirectoryFilter {
+    All,
+    Name(String),
+    Prefix(String),
+    Suffix(String),
+}
+
+impl DirectoryFilter {
+    pub fn includes(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Name(selected) => name == selected,
+            Self::Prefix(prefix) => name.starts_with(prefix),
+            Self::Suffix(suffix) => name.ends_with(suffix),
+        }
+    }
 }
 
 /// System trait for non-readonly systems.

@@ -451,3 +451,39 @@ fn soac_export_generator_lambdas_are_not_synchronous_functions() {
         FunctionKind::Generator
     );
 }
+
+#[test]
+fn soac_export_explicit_interpreter_paths_do_not_guess_from_an_uninstalled_prefix() {
+    let system = TestSystem::default();
+    system.memory_file_system().write_files_all([
+        ("/project/ty.toml", "[environment]\npython-version = '3.15'\npython = '/wrong-prefix'\n"),
+        ("/project/main.py", "from __future__ import strict\nfrom selected import Value\ndef identity(value: Value) -> Value: return value\n"),
+        ("/selected/python3.15/site-packages/selected.py", "class Value: pass\n"),
+        ("/wrong-prefix/lib/python3.12/site-packages/selected.py", "class Wrong: pass\n"),
+    ]).unwrap();
+    let metadata =
+        ProjectMetadata::discover(ruff_db::system::SystemPath::new("/project"), &system).unwrap();
+    let db = ProjectDatabase::fallible_with_python_environment(
+        metadata,
+        system,
+        AnalysisDialect::SoacStrictV1,
+        crate::metadata::PythonEnvironmentPaths {
+            site_packages: vec![SystemPathBuf::from("/selected/python3.15/site-packages")],
+            real_stdlib: None,
+        },
+    )
+    .unwrap();
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let export = export_soac_module(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    assert!(export.dependencies.iter().any(|dependency| dependency.path
+        == ty_python_semantic::SoacDependencyPath::System(
+            "/selected/python3.15/site-packages/selected.py".into()
+        )));
+    assert!(
+        !export
+            .facts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    );
+}

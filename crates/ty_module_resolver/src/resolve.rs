@@ -530,8 +530,16 @@ fn search_path_may_contain_stub_package(db: &dyn Db, search_path: &SearchPath) -
         return false;
     };
 
-    directory_listing(db, path)
-        .is_ok_and(|listing| listing.iter().any(|(name, _)| name.ends_with("-stubs")))
+    directory_listing(db, path).is_ok_and(|listing| {
+        listing
+            .iter_filtered(
+                db,
+                path,
+                ruff_db::system::DirectoryFilter::Suffix("-stubs".into()),
+            )
+            .next()
+            .is_some()
+    })
 }
 
 /// Get the search-paths for desperate resolution of absolute imports in this file.
@@ -977,9 +985,15 @@ pub(crate) fn dynamic_resolution_paths<'db>(
         // The Python documentation specifies that `.pth` files in `site-packages`
         // are processed in alphabetical order. `DirectoryListing` is already sorted.
         // https://docs.python.org/3/library/site.html#module-site
-        let pth_files = listing.iter().filter(|(name, file_type)| {
-            !file_type.is_directory() && SystemPath::new(name).extension() == Some("pth")
-        });
+        let pth_files = listing
+            .iter_filtered(
+                db,
+                site_packages_dir,
+                ruff_db::system::DirectoryFilter::Suffix(".pth".into()),
+            )
+            .filter(|(name, file_type)| {
+                !file_type.is_directory() && SystemPath::new(name).extension() == Some("pth")
+            });
 
         for (name, _) in pth_files {
             let path = site_packages_dir.join(name);
@@ -1688,7 +1702,7 @@ fn candidate_may_exist(
 
     // Other suffixes are harmless false positives; the normal probes still determine whether the
     // module exists.
-    listing.contains_name_with_prefix(module_name)
+    listing.contains_name_with_prefix(context.db, &parent, module_name)
 }
 
 type ResolvedNames = Vec<ModuleResolutionCandidate>;

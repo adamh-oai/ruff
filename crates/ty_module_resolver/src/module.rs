@@ -218,7 +218,7 @@ fn all_submodule_names_for_package<'db>(
                     );
                 })
                 .ok()?
-                .iter()
+                .iter(db, parent_directory)
                 .filter(|(name, ty)| {
                     let path = SystemPath::new(name);
                     is_submodule(

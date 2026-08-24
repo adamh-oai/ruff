@@ -188,6 +188,7 @@ impl Options {
         system: &dyn System,
         vendored: &VendoredFileSystem,
         strategy: &Strategy,
+        explicit_environment: Option<&super::PythonEnvironmentPaths>,
     ) -> Result<
         (ProgramSettings, Vec<ProgramSettingsDiagnostic>),
         Strategy::Error<ToProgramSettingsError>,
@@ -209,63 +210,79 @@ impl Options {
                 default
             });
 
-        let python_environment = match self.python_environment(context.configuration_root(), system)
+        let (python_environment, site_packages_paths, real_stdlib_path) = if let Some(environment) =
+            explicit_environment
         {
-            Ok(None) => PythonEnvironment::discover(context.project_root(), system)
-                .map_err(ToProgramSettingsError::PythonEnvironmentDiscovery),
-            configured => configured.map_err(ToProgramSettingsError::PythonEnvironment),
-        };
-
-        // If in safe-mode, fallback to None if this fails instead of erroring.
-        let python_environment = strategy
-            .fallback_opt(python_environment, |_| {
-                tracing::debug!("Default settings failed to discover local Python environment");
-            })?
-            .flatten();
-
-        let self_environment = self_environment_search_paths(
-            python_environment
-                .as_ref()
-                .map(ty_python_semantic::PythonEnvironment::origin)
-                .cloned(),
-            system,
-        );
-
-        let site_packages_paths = if let Some(python_environment) = python_environment.as_ref() {
-            let site_packages_paths = python_environment
-                .site_packages_paths(system)
-                .map_err(ToProgramSettingsError::SitePackagesDiscovery);
-            let site_packages_paths = strategy.fallback(site_packages_paths, |_| {
-                tracing::debug!("Default settings failed to discover site-packages directory");
-                SitePackagesPaths::default()
-            })?;
-            match self_environment {
-                // When ty is installed in a virtual environment (e.g., `uvx --with ...`),
-                // the self-environment takes priority over the discovered environment.
-                Some((self_site_packages, true)) => {
-                    self_site_packages.concatenate(site_packages_paths)
-                }
-                // When ty is installed in a system Python, do not include the system
-                // Python's site-packages if there's a discovered project environment.
-                Some((_, false)) | None => site_packages_paths,
-            }
+            let paths = environment
+                .site_packages
+                .iter()
+                .filter(|path| system.is_directory(path))
+                .fold(SitePackagesPaths::default(), |paths, path| {
+                    paths.concatenate(SitePackagesPaths::from([path.clone()]))
+                });
+            (None, paths, environment.real_stdlib.clone())
         } else {
-            tracing::debug!("No virtual environment found");
-            self_environment.map(|(paths, _)| paths).unwrap_or_default()
-        };
+            let python_environment =
+                match self.python_environment(context.configuration_root(), system) {
+                    Ok(None) => PythonEnvironment::discover(context.project_root(), system)
+                        .map_err(ToProgramSettingsError::PythonEnvironmentDiscovery),
+                    configured => configured.map_err(ToProgramSettingsError::PythonEnvironment),
+                };
 
-        let real_stdlib_path = python_environment.as_ref().and_then(|python_environment| {
-            // For now this is considered non-fatal, we don't Need this for anything.
-            python_environment
-                .real_stdlib_path(system)
-                .map_err(|err| {
-                    tracing::info!(
-                        "No real stdlib found, stdlib goto-definition \
+            // If in safe-mode, fallback to None if this fails instead of erroring.
+            let python_environment = strategy
+                .fallback_opt(python_environment, |_| {
+                    tracing::debug!("Default settings failed to discover local Python environment");
+                })?
+                .flatten();
+
+            let self_environment = self_environment_search_paths(
+                python_environment
+                    .as_ref()
+                    .map(ty_python_semantic::PythonEnvironment::origin)
+                    .cloned(),
+                system,
+            );
+
+            let site_packages_paths = if let Some(python_environment) = python_environment.as_ref()
+            {
+                let site_packages_paths = python_environment
+                    .site_packages_paths(system)
+                    .map_err(ToProgramSettingsError::SitePackagesDiscovery);
+                let site_packages_paths = strategy.fallback(site_packages_paths, |_| {
+                    tracing::debug!("Default settings failed to discover site-packages directory");
+                    SitePackagesPaths::default()
+                })?;
+                match self_environment {
+                    // When ty is installed in a virtual environment (e.g., `uvx --with ...`),
+                    // the self-environment takes priority over the discovered environment.
+                    Some((self_site_packages, true)) => {
+                        self_site_packages.concatenate(site_packages_paths)
+                    }
+                    // When ty is installed in a system Python, do not include the system
+                    // Python's site-packages if there's a discovered project environment.
+                    Some((_, false)) | None => site_packages_paths,
+                }
+            } else {
+                tracing::debug!("No virtual environment found");
+                self_environment.map(|(paths, _)| paths).unwrap_or_default()
+            };
+
+            let real_stdlib_path = python_environment.as_ref().and_then(|python_environment| {
+                // For now this is considered non-fatal, we don't Need this for anything.
+                python_environment
+                    .real_stdlib_path(system)
+                    .map_err(|err| {
+                        tracing::info!(
+                            "No real stdlib found, stdlib goto-definition \
                         may have degraded quality: {err}"
-                    );
-                })
-                .ok()
-        });
+                        );
+                    })
+                    .ok()
+            });
+
+            (python_environment, site_packages_paths, real_stdlib_path)
+        };
 
         let python_version = configured_python_version
             .map(PythonVersionResolution::Configured)

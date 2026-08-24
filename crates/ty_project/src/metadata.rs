@@ -30,6 +30,15 @@ pub mod python_version;
 pub mod settings;
 pub mod value;
 
+/// Search paths from an explicitly queried interpreter. Offline consumers can
+/// supply these rather than guessing an installed interpreter from sys.prefix,
+/// which is ambiguous for an uninstalled CPython source build.
+#[derive(Debug, Clone)]
+pub struct PythonEnvironmentPaths {
+    pub site_packages: Vec<SystemPathBuf>,
+    pub real_stdlib: Option<SystemPathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, get_size2::GetSize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct ProjectMetadata {
@@ -577,12 +586,26 @@ impl MergedOptions<'_> {
         (ProgramSettings, Vec<ProgramSettingsDiagnostic>),
         Strategy::Error<ToProgramSettingsError>,
     > {
+        self.to_program_settings_with_environment(system, vendored, strategy, None)
+    }
+
+    pub(crate) fn to_program_settings_with_environment<Strategy: MisconfigurationStrategy>(
+        &self,
+        system: &dyn System,
+        vendored: &VendoredFileSystem,
+        strategy: &Strategy,
+        environment: Option<&PythonEnvironmentPaths>,
+    ) -> Result<
+        (ProgramSettings, Vec<ProgramSettingsDiagnostic>),
+        Strategy::Error<ToProgramSettingsError>,
+    > {
         self.options.to_program_settings(
             OptionsContext::Project(self.metadata.root()),
             self.metadata.name(),
             system,
             vendored,
             strategy,
+            environment,
         )
     }
 

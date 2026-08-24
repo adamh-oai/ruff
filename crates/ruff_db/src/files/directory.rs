@@ -3,7 +3,7 @@ use compact_str::CompactString;
 use super::private::FileStatus;
 use super::{File, FilePath};
 use crate::Db;
-use crate::system::{FileType, SystemPath};
+use crate::system::{DirectoryFilter, FileType, SystemPath};
 
 /// A cached snapshot of the direct children in a directory.
 ///
@@ -13,15 +13,36 @@ pub struct DirectoryListing(Box<[(CompactString, FileType)]>);
 
 impl DirectoryListing {
     /// Returns the type of the entry named `name`, if present.
-    fn file_type(&self, name: &str) -> Option<FileType> {
-        self.0
+    fn file_type(&self, db: &dyn Db, directory: &SystemPath, name: &str) -> Option<FileType> {
+        let file_type = self
+            .0
             .binary_search_by(|(candidate, _)| candidate.as_str().cmp(name))
             .ok()
-            .map(|index| self.0[index].1)
+            .map(|index| self.0[index].1);
+        db.system().observe_directory_query(
+            directory,
+            &DirectoryFilter::Name(name.into()),
+            &mut file_type.map(|kind| (name, kind)).into_iter(),
+        );
+        file_type
     }
 
     /// Returns whether any entry name starts with `prefix`.
-    pub fn contains_name_with_prefix(&self, prefix: &str) -> bool {
+    pub fn contains_name_with_prefix(
+        &self,
+        db: &dyn Db,
+        directory: &SystemPath,
+        prefix: &str,
+    ) -> bool {
+        db.system().observe_directory_query(
+            directory,
+            &DirectoryFilter::Prefix(prefix.into()),
+            &mut self
+                .0
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .map(|(name, kind)| (name.as_str(), *kind)),
+        );
         let index = self
             .0
             .partition_point(|(candidate, _)| candidate.as_str() < prefix);
@@ -32,7 +53,7 @@ impl DirectoryListing {
 
     /// Returns whether `name` resolves to a file, following symbolic links.
     pub fn entry_is_file(&self, db: &dyn Db, directory: &SystemPath, name: &str) -> bool {
-        match self.file_type(name) {
+        match self.file_type(db, directory, name) {
             Some(FileType::File) => true,
             Some(FileType::Directory) | None => false,
             Some(FileType::Symlink) => super::system_path_to_file(db, directory.join(name)).is_ok(),
@@ -41,7 +62,7 @@ impl DirectoryListing {
 
     /// Returns whether `name` resolves to a directory, following symbolic links.
     pub fn entry_is_directory(&self, db: &dyn Db, directory: &SystemPath, name: &str) -> bool {
-        match self.file_type(name) {
+        match self.file_type(db, directory, name) {
             Some(FileType::Directory) => true,
             Some(FileType::File) | None => false,
             Some(FileType::Symlink) => db.system().is_directory(&directory.join(name)),
@@ -49,9 +70,32 @@ impl DirectoryListing {
     }
 
     /// Iterates over the entries in the directory in name order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, FileType)> {
+    pub fn iter<'a>(
+        &'a self,
+        db: &dyn Db,
+        directory: &SystemPath,
+    ) -> impl Iterator<Item = (&'a str, FileType)> + use<'a> {
+        self.iter_filtered(db, directory, DirectoryFilter::All)
+    }
+
+    pub fn iter_filtered<'a>(
+        &'a self,
+        db: &dyn Db,
+        directory: &SystemPath,
+        filter: DirectoryFilter,
+    ) -> impl Iterator<Item = (&'a str, FileType)> + use<'a> {
+        db.system().observe_directory_query(
+            directory,
+            &filter,
+            &mut self
+                .0
+                .iter()
+                .filter(|(name, _)| filter.includes(name))
+                .map(|(name, kind)| (name.as_str(), *kind)),
+        );
         self.0
             .iter()
+            .filter(move |(name, _)| filter.includes(name))
             .map(|(name, file_type)| (name.as_str(), *file_type))
     }
 }
@@ -120,7 +164,7 @@ fn directory_listing_query(
 
     let mut entries = db
         .system()
-        .read_directory(path)?
+        .read_directory_for_import_resolution(path)?
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let file_type = entry.file_type();
@@ -149,11 +193,14 @@ mod tests {
         let path = SystemPath::new("src");
         let listing = directory_listing(&db, path).unwrap();
         assert_eq!(
-            listing.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            listing
+                .iter(&db, path)
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
             ["a.py", "z.py"]
         );
-        assert!(listing.contains_name_with_prefix("a"));
-        assert!(!listing.contains_name_with_prefix("b"));
+        assert!(listing.contains_name_with_prefix(&db, path, "a"));
+        assert!(!listing.contains_name_with_prefix(&db, path, "b"));
 
         Ok(())
     }
@@ -165,7 +212,7 @@ mod tests {
         assert_eq!(
             directory_listing(&db, SystemPath::new("/"))
                 .unwrap()
-                .iter()
+                .iter(&db, SystemPath::new("/"))
                 .next(),
             None
         );

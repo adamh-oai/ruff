@@ -249,11 +249,13 @@ impl ProjectDatabase {
                     metadata.try_add_project_root(self);
                     let merged_options = metadata.to_merged_options();
 
-                    let program_settings_diagnostics = match merged_options.to_program_settings(
-                        self.system(),
-                        self.vendored(),
-                        &FallibleStrategy,
-                    ) {
+                    let program_settings_diagnostics = match merged_options
+                        .to_program_settings_with_environment(
+                            self.system(),
+                            self.vendored(),
+                            &FallibleStrategy,
+                            self.python_environment_paths(),
+                        ) {
                         Ok((program_settings, diagnostics)) => {
                             project.update_program(self, program_settings);
                             diagnostics
@@ -320,10 +322,11 @@ impl ProjectDatabase {
         if result.custom_stdlib_changed {
             let metadata = project.metadata(self);
             let merged_options = metadata.to_merged_options();
-            match merged_options.to_program_settings(
+            match merged_options.to_program_settings_with_environment(
                 self.system(),
                 self.vendored(),
                 &FallibleStrategy,
+                self.python_environment_paths(),
             ) {
                 Ok((program_settings, program_settings_diagnostics)) => {
                     let mut settings_diagnostics =

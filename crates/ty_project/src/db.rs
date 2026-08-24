@@ -26,6 +26,11 @@ mod changes;
 pub trait Db: SemanticDb {
     fn project(&self) -> Project;
 
+    /// Immutable interpreter paths selected by an explicit offline consumer.
+    fn python_environment_paths(&self) -> Option<&crate::metadata::PythonEnvironmentPaths> {
+        None
+    }
+
     fn dyn_clone(&self) -> Box<dyn Db>;
 }
 
@@ -54,6 +59,7 @@ pub struct ProjectDatabase {
     // Immutable for the lifetime of this database and all its snapshots. Choosing
     // another dialect requires a new database, including its vendored file set.
     analysis_dialect: AnalysisDialect,
+    python_environment_paths: Option<crate::metadata::PythonEnvironmentPaths>,
 
     // IMPORTANT: Never return clones of `system` outside `ProjectDatabase` (only return references)
     // or the "trick" to get a mutable `Arc` in `Self::system_mut` is no longer guaranteed to work.
@@ -93,6 +99,25 @@ impl ProjectDatabase {
             project_metadata,
             system,
             analysis_dialect,
+            None,
+            &FallibleStrategy,
+        )
+    }
+
+    pub fn fallible_with_python_environment<S>(
+        project_metadata: ProjectMetadata,
+        system: S,
+        analysis_dialect: AnalysisDialect,
+        environment: crate::metadata::PythonEnvironmentPaths,
+    ) -> anyhow::Result<Self>
+    where
+        S: System + 'static + Send + Sync + RefUnwindSafe,
+    {
+        Self::new(
+            project_metadata,
+            system,
+            analysis_dialect,
+            Some(environment),
             &FallibleStrategy,
         )
     }
@@ -106,6 +131,7 @@ impl ProjectDatabase {
             project_metadata,
             system,
             AnalysisDialect::Python,
+            None,
             &UseDefaultStrategy,
         );
         db
@@ -132,6 +158,7 @@ impl ProjectDatabase {
         project_metadata: ProjectMetadata,
         system: S,
         analysis_dialect: AnalysisDialect,
+        python_environment_paths: Option<crate::metadata::PythonEnvironmentPaths>,
         strategy: &Strategy,
     ) -> Result<Self, Strategy::Error<anyhow::Error>>
     where
@@ -140,6 +167,7 @@ impl ProjectDatabase {
         let mut db = Self {
             project: None,
             analysis_dialect,
+            python_environment_paths,
             storage: salsa::Storage::new(if tracing::enabled!(tracing::Level::TRACE) {
                 Some(Box::new({
                     move |event: Event| {
@@ -166,8 +194,13 @@ impl ProjectDatabase {
 
         let merged_options = project_metadata.to_merged_options();
 
-        let (program_settings, program_settings_diagnostics) = strategy
-            .to_anyhow(merged_options.to_program_settings(db.system(), db.vendored(), strategy))?;
+        let (program_settings, program_settings_diagnostics) =
+            strategy.to_anyhow(merged_options.to_program_settings_with_environment(
+                db.system(),
+                db.vendored(),
+                strategy,
+                db.python_environment_paths(),
+            ))?;
 
         // This must be called before `from_metadata`, or the `SearchPath` root
         // will take precedence over the `Project` root, resulting in
@@ -643,6 +676,10 @@ impl salsa::Database for ProjectDatabase {}
 
 #[salsa::db]
 impl Db for ProjectDatabase {
+    fn python_environment_paths(&self) -> Option<&crate::metadata::PythonEnvironmentPaths> {
+        self.python_environment_paths.as_ref()
+    }
+
     fn project(&self) -> Project {
         self.project.unwrap()
     }

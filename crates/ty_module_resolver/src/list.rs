@@ -101,7 +101,7 @@ fn list_modules_in<'db>(
             let Ok(listing) = directory_listing(db, system_search_path) else {
                 return vec![];
             };
-            for (name, file_type) in listing.iter() {
+            for (name, file_type) in listing.iter(db, system_search_path) {
                 let path = system_search_path.join(name);
                 lister.add_path(&path.as_path().into(), file_type.into());
             }

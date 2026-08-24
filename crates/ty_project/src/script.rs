@@ -236,6 +236,7 @@ fn resolve_script_program_settings(
         db.system(),
         db.vendored(),
         &FallibleStrategy,
+        db.python_environment_paths(),
     ) {
         Ok(settings) => settings,
         Err(error) => {
@@ -257,6 +258,7 @@ fn resolve_script_program_settings(
                 db.system(),
                 db.vendored(),
                 &UseDefaultStrategy,
+                db.python_environment_paths(),
             );
             settings
         }
