@@ -34,7 +34,21 @@ impl ImplicitClassCell {
                     parent
                 }
             }
-            NodeWithScopeKind::Lambda(_) | NodeWithScopeKind::GeneratorExpression(_) => parent,
+            NodeWithScopeKind::Lambda(_) | NodeWithScopeKind::GeneratorExpression(_) => {
+                // Eager comprehensions keep lexical target scopes, but a delayed
+                // callable inside them can still capture the containing class's
+                // cell. `resolve` checks explicit owners in every skipped scope.
+                let mut parent = parent;
+                while matches!(
+                    scopes[parent].node(),
+                    NodeWithScopeKind::ListComprehension(_)
+                        | NodeWithScopeKind::SetComprehension(_)
+                        | NodeWithScopeKind::DictComprehension(_)
+                ) {
+                    parent = scopes[parent].parent()?;
+                }
+                parent
+            }
             _ => return None,
         };
         scopes[class_scope]
@@ -81,8 +95,8 @@ impl ImplicitClassCell {
                     .then_some(Self { class_scope })
             });
             if let Some(cell) = cell {
-                // A generic method's type parameter scope may explicitly own the same name.
-                // Check that intervening lexical scope before reaching the class cell.
+                // Generic method type parameters and intervening comprehension targets may
+                // explicitly own the same name. Check them before reaching the class cell.
                 let mut parent = scope.parent();
                 while let Some(parent_id) = parent {
                     if parent_id == cell.class_scope {

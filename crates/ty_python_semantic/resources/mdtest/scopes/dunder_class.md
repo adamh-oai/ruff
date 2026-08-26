@@ -56,6 +56,86 @@ class C:
     ]
 ```
 
+## Delayed callables inside eager comprehensions
+
+An eager comprehension has its own lexical scope, but does not prevent a nested lambda or generator
+expression from capturing the containing class's implicit cell. Only the callable's delayed body
+uses that cell; the comprehension itself still executes during class construction.
+
+```py
+class C:
+    list_callbacks = [
+        lambda: reveal_type(__class__)  # revealed: <class 'C'>
+        for _ in range(2)
+    ]
+    set_callbacks = {
+        lambda: reveal_type(__class__)  # revealed: <class 'C'>
+        for _ in range(2)
+    }
+    dict_callbacks = {
+        item: lambda: reveal_type(__class__)  # revealed: <class 'C'>
+        for item in range(2)
+    }
+    nested_callbacks = [
+        [lambda: reveal_type(__class__) for _ in range(2)]  # revealed: <class 'C'>
+        for _ in range(2)
+    ]
+    generators = [
+        (reveal_type(__class__) for _ in range(2))  # revealed: <class 'C'>
+        for _ in range(2)
+    ]
+
+    def owner(self):
+        return __class__
+```
+
+## Intervening explicit owners still take precedence
+
+Comprehension targets and lambda parameters are explicit lexical bindings. A nested callable reads
+those bindings instead of the class's implicit cell, even through another comprehension.
+
+```py
+class C:
+    target_shadow = [
+        lambda: reveal_type(__class__)  # revealed: int
+        for __class__ in range(2)
+    ]
+    nested_target_shadow = [
+        [lambda: reveal_type(__class__) for _ in range(2)]  # revealed: int
+        for __class__ in range(2)
+    ]
+    parameter_shadow = [
+        lambda __class__: reveal_type(__class__)  # revealed: Unknown
+        for _ in range(2)
+    ]
+```
+
+## Eager evaluations do not gain the delayed cell
+
+Comprehension bodies, their first iterables, and lambda defaults are evaluated while the class body
+executes. They do not gain access to the implicit cell merely because a delayed callable also
+appears in the expression.
+
+```py
+class C:
+    nested_eager = [
+        [__class__ for _ in range(2)]  # error: [unresolved-reference]
+        for _ in range(2)
+    ]
+    first_iterable = [
+        lambda: None
+        for _ in (__class__,)  # error: [unresolved-reference]
+    ]
+    lambda_defaults = [
+        lambda value=__class__: value  # error: [unresolved-reference]
+        for _ in range(2)
+    ]
+    generator_first_iterable = [
+        (value for value in (__class__,))  # error: [unresolved-reference]
+        for _ in range(2)
+    ]
+```
+
 ## Class bodies and method defaults
 
 The cell is not available directly in the class body or while evaluating a method's default
@@ -218,8 +298,8 @@ class C:
 
 ## Nonlocal writes keep their actual cell owner
 
-Writes from sibling methods update the shared implicit cell. They do not update an outer variable
-or an unrelated class namespace attribute with the same spelling.
+Writes from sibling methods update the shared implicit cell. They do not update an outer variable or
+an unrelated class namespace attribute with the same spelling.
 
 ```py
 def outer() -> None:
@@ -302,9 +382,9 @@ class C:
 
 ## Eager nested class-body forwarding
 
-The declaration below is valid Python. The outer cell exists but is initially empty while the
-nested class body executes, and the outer construction fills it afterward. A preceding direct write
-can fill that cell, but the nested class's methods still receive their own separate implicit cell.
+The declaration below is valid Python. The outer cell exists but is initially empty while the nested
+class body executes, and the outer construction fills it afterward. A preceding direct write can
+fill that cell, but the nested class's methods still receive their own separate implicit cell.
 
 ```py
 class C:
