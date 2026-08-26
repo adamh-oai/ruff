@@ -1146,7 +1146,7 @@ impl<'db> Exporter<'db> {
         contract: &facts::StaticType,
         output: &mut Vec<facts::NominalBindingFact>,
     ) -> bool {
-        if !contract.has_supported_boundary_shape() {
+        if !contract.has_supported_value_shape() {
             return false;
         }
         if matches!(expression, ast::Expr::NoneLiteral(_))

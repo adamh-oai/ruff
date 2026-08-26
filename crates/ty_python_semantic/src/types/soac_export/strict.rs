@@ -589,7 +589,7 @@ impl<'db> StrictChecker<'_, 'db> {
             && self
                 .exporter
                 .value_type(field_type)
-                .has_supported_boundary_shape()
+                .has_supported_value_shape()
             && !self.exporter.value_type(value).contains_uncertainty()
             && !value.is_assignable_to(db, &self.exporter.env, field_type)
         {
