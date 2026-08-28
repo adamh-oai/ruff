@@ -9,11 +9,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use ruff_db::diagnostic::Severity;
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
+use ruff_db::system::SystemPathBuf;
 use ruff_python_ast::{
     self as ast,
     visitor::{self, Visitor},
@@ -73,15 +75,130 @@ pub struct SoacModuleExport {
     pub dependencies: Vec<SoacSourceDependency>,
 }
 
+/// Resolved source rules, keyed by canonical source path. The caller binds
+/// this complete catalog to its authenticated analysis environment. Files not
+/// present in the catalog remain ordinary Python, regardless of their text.
+pub type SoacSourcePolicies = BTreeMap<SystemPathBuf, facts::ResolvedStrictPolicy>;
+
+/// All caches belong to one export and one immutable policy catalog. Policy
+/// changes therefore cannot reuse a classification from a previous export or
+/// a different source owner. Local proposals are computed without recursively
+/// checking foreign classes; the separate MRO walk handles inheritance cycles.
+struct ExportContext<'policy> {
+    policies: &'policy SoacSourcePolicies,
+    local_proposals: RefCell<rustc_hash::FxHashMap<File, Option<Rc<facts::ModuleTypeFacts>>>>,
+    base_candidates: RefCell<rustc_hash::FxHashMap<(File, TextRange), bool>>,
+    visiting_bases: RefCell<rustc_hash::FxHashSet<(File, TextRange)>>,
+}
+
+impl<'policy> ExportContext<'policy> {
+    fn new(policies: &'policy SoacSourcePolicies) -> Self {
+        Self {
+            policies,
+            local_proposals: RefCell::new(rustc_hash::FxHashMap::default()),
+            base_candidates: RefCell::new(rustc_hash::FxHashMap::default()),
+            visiting_bases: RefCell::new(rustc_hash::FxHashSet::default()),
+        }
+    }
+
+    fn source_policy(&self, db: &dyn Db, file: File) -> Option<&facts::ResolvedStrictPolicy> {
+        let FilePath::System(path) = file.path(db) else {
+            return None;
+        };
+        self.policies.get(path.as_ref()).or_else(|| {
+            db.system()
+                .canonicalize_path(path)
+                .ok()
+                .and_then(|path| self.policies.get(&path))
+        })
+    }
+
+    fn local_proposal<'db>(
+        &self,
+        db: &'db dyn Db,
+        file: ProgramFile<'db>,
+    ) -> Option<Rc<facts::ModuleTypeFacts>> {
+        if !self
+            .source_policy(db, file.file(db))
+            .is_some_and(facts::ResolvedStrictPolicy::is_selected)
+        {
+            return None;
+        }
+        if let Some(proposal) = self.local_proposals.borrow().get(&file.file(db)) {
+            return proposal.clone();
+        }
+        let module = file_to_module(db, file.resolver_file(db))?;
+        let proposal =
+            export_soac_module_impl(db, file.file(db), module.name(db).as_str(), self, false)
+                .ok()
+                .map(|export| Rc::new(export.facts));
+        self.local_proposals
+            .borrow_mut()
+            .insert(file.file(db), proposal.clone());
+        proposal
+    }
+
+    fn class_proposal<'db>(
+        &self,
+        db: &'db dyn Db,
+        class: StaticClassLiteral<'db>,
+    ) -> Option<facts::ClassTypeFact> {
+        let file = class.program_file(db);
+        let proposal = self.local_proposal(db, file)?;
+        if proposal.source_dialect != facts::SourceDialect::SoacStrict
+            || proposal.diagnostics.iter().any(|diagnostic| {
+                !diagnostic.suppressed && diagnostic.severity == facts::DiagnosticSeverity::Error
+            })
+        {
+            return None;
+        }
+        let parsed = parsed_module(db, file.python_file(db)).load(db);
+        let range = source_range(class.definition(db).kind(db).full_range(&parsed));
+        proposal
+            .classes
+            .iter()
+            .find(|proposal| proposal.identity.source_range == range)
+            .cloned()
+    }
+
+    fn base_is_candidate<'db>(&self, db: &'db dyn Db, class: StaticClassLiteral<'db>) -> bool {
+        let parsed = parsed_module(db, class.program_file(db).python_file(db)).load(db);
+        let key = (
+            class.file(db),
+            class.definition(db).kind(db).full_range(&parsed),
+        );
+        if let Some(candidate) = self.base_candidates.borrow().get(&key) {
+            return *candidate;
+        }
+        if !self.visiting_bases.borrow_mut().insert(key) {
+            return false;
+        }
+        let candidate = self.class_proposal(db, class).is_some_and(|proposal| {
+            proposal.participation == facts::ParticipationProposal::Candidate
+        }) && class.try_mro(db, None).is_ok()
+            && class.iter_mro(db, None).skip(1).all(|base| match base {
+                ClassBase::Class(base) if base.known(db) == Some(KnownClass::Object) => true,
+                ClassBase::Class(base) => base
+                    .class_literal(db)
+                    .as_static()
+                    .is_some_and(|base| self.base_is_candidate(db, base)),
+                _ => false,
+            });
+        self.visiting_bases.borrow_mut().remove(&key);
+        self.base_candidates.borrow_mut().insert(key, candidate);
+        candidate
+    }
+}
+
 /// Export just the checker predictions. Artifact producers should prefer
 /// [`export_soac_module`] so they also obtain the actual dependency source paths.
 pub fn export_soac_module_facts(
     db: &dyn Db,
     file: File,
     module_name: &str,
-    policy: facts::ResolvedStrictPolicy,
+    policies: &SoacSourcePolicies,
 ) -> Result<facts::ModuleTypeFacts, facts::ContractError> {
-    export_soac_module(db, file, module_name, policy).map(|export| export.facts)
+    export_soac_module(db, file, module_name, policies).map(|export| export.facts)
 }
 
 /// Export checker predictions and their external source dependencies.
@@ -97,17 +214,17 @@ pub fn export_soac_module(
     db: &dyn Db,
     file: File,
     module_name: &str,
-    policy: facts::ResolvedStrictPolicy,
+    policies: &SoacSourcePolicies,
 ) -> Result<SoacModuleExport, facts::ContractError> {
-    export_soac_module_impl(db, file, module_name, policy, true)
+    export_soac_module_impl(db, file, module_name, &ExportContext::new(policies), true)
 }
 
 fn export_soac_module_impl(
     db: &dyn Db,
     file: File,
     module_name: &str,
-    policy: facts::ResolvedStrictPolicy,
-    resolve_external_bases: bool,
+    context: &ExportContext<'_>,
+    resolve_external_classes: bool,
 ) -> Result<SoacModuleExport, facts::ContractError> {
     let program_file = db.program_file(file);
     if program_file.analysis_policy(db).dialect != AnalysisDialect::SoacStrictV1 {
@@ -131,11 +248,13 @@ fn export_soac_module_impl(
             "source is not valid in the selected checker dialect and Python version".into(),
         ));
     }
-    let strict = soac_source::has_strict_future(parsed.suite());
+    let policy = context.source_policy(db, file).cloned().unwrap_or_default();
+    let strict = policy.is_selected();
     if strict {
         soac_source::validate_source_literals(source.as_str(), parsed.tokens())
             .map_err(|error| facts::ContractError::InvalidSourceIdentity(error.to_string()))?;
     }
+    validate_class_overrides(&policy, parsed.suite())?;
     let module = facts::ModuleTypeFacts::new(
         module_name,
         source.as_bytes(),
@@ -153,6 +272,7 @@ fn export_soac_module_impl(
     )]));
     let mut exporter = Exporter {
         db,
+        context,
         model: SemanticModel::new(db, program_file),
         env: ProgramEnvironment::from_file(program_file),
         module,
@@ -162,7 +282,7 @@ fn export_soac_module_impl(
         invalid_dependency: Cell::new(false),
         used_suppressions: Vec::new(),
         attribute_receivers: BTreeMap::new(),
-        resolve_external_bases,
+        resolve_external_classes,
     };
     exporter.globals(program_file);
     exporter.visit_body(parsed.suite());
@@ -254,8 +374,9 @@ fn export_soac_module_impl(
     })
 }
 
-struct Exporter<'db> {
+struct Exporter<'db, 'context> {
     db: &'db dyn Db,
+    context: &'context ExportContext<'context>,
     model: SemanticModel<'db>,
     env: ProgramEnvironment<'db>,
     module: facts::ModuleTypeFacts,
@@ -271,62 +392,34 @@ struct Exporter<'db> {
     /// Private semantic receivers indexed by their exact expression ranges.
     /// They do not escape into the owned proposal DTO.
     attribute_receivers: BTreeMap<facts::SourceRange, Type<'db>>,
-    /// The incremental base query first computes local proposals using this
-    /// same classifier, then combines the actual semantic MRO recursively.
-    /// Disabling this step internally avoids unrelated classes in an imported
-    /// module introducing artificial recursion into the selected base query.
-    resolve_external_bases: bool,
+    /// Local proposals omit foreign class checks so unrelated imports and
+    /// annotations cannot introduce cycles into the separate MRO proof.
+    resolve_external_classes: bool,
 }
 
-/// Class location is not evidence that its bindings remain mutable. Reuse the
-/// complete semantic classifier and suppression normalization for the defining
-/// file, then require candidate proposals throughout the real resolved MRO.
-/// The query publishes only a logical proposal, never runtime base authority.
-#[salsa::tracked(
-    returns(copy),
-    cycle_initial=|_, _, _| false,
-    heap_size=ruff_memory_usage::heap_size,
-)]
-fn external_strict_base_is_candidate<'db>(db: &'db dyn Db, class: StaticClassLiteral<'db>) -> bool {
-    let file = class.program_file(db);
-    let Some(module) = file_to_module(db, file.resolver_file(db)) else {
-        return false;
-    };
-    // The four-argument public export API has only the importing file's
-    // effective policy. Do not apply that policy to another file's transform.
-    // External dataclasses remain dynamic until an explicit per-file adapter
-    // policy context is available. Plain strict classes need no such adapter.
-    let mut policy = facts::ResolvedStrictPolicy::default();
-    policy.adapters.dataclasses = facts::StdlibDataclassPolicy::Dynamic;
-    let Ok(export) =
-        export_soac_module_impl(db, file.file(db), module.name(db).as_str(), policy, false)
-    else {
-        return false;
-    };
-    if export.facts.source_dialect != facts::SourceDialect::SoacStrict
-        || export.facts.diagnostics.iter().any(|diagnostic| {
-            !diagnostic.suppressed && diagnostic.severity == facts::DiagnosticSeverity::Error
-        })
-    {
-        return false;
+fn validate_class_overrides(
+    policy: &facts::ResolvedStrictPolicy,
+    body: &[ast::Stmt],
+) -> Result<(), facts::ContractError> {
+    struct Classes(BTreeSet<facts::SourceRange>);
+    impl<'ast> Visitor<'ast> for Classes {
+        fn visit_stmt(&mut self, statement: &'ast ast::Stmt) {
+            if let ast::Stmt::ClassDef(class) = statement {
+                self.0.insert(source_range(class.range()));
+            }
+            visitor::walk_stmt(self, statement);
+        }
     }
-    let parsed = parsed_module(db, file.python_file(db)).load(db);
-    let definition_range = source_range(class.definition(db).kind(db).full_range(&parsed));
-    if !export.facts.classes.iter().any(|proposal| {
-        proposal.identity.source_range == definition_range
-            && proposal.participation == facts::ParticipationProposal::Candidate
-    }) || class.try_mro(db, None).is_err()
-    {
-        return false;
+    let mut classes = Classes(BTreeSet::new());
+    classes.visit_body(body);
+    for rule in &policy.class_overrides {
+        if !classes.0.remove(&rule.class_range) {
+            return Err(facts::ContractError::InvalidPolicy(
+                "class rule must name one distinct class definition in the actual source".into(),
+            ));
+        }
     }
-    class.iter_mro(db, None).skip(1).all(|base| match base {
-        ClassBase::Class(base) if base.known(db) == Some(KnownClass::Object) => true,
-        ClassBase::Class(base) => base
-            .class_literal(db)
-            .as_static()
-            .is_some_and(|base| external_strict_base_is_candidate(db, base)),
-        _ => false,
-    })
+    Ok(())
 }
 
 fn source_range(range: TextRange) -> facts::SourceRange {
@@ -386,18 +479,18 @@ fn unknown_signature() -> facts::CallableSignature {
     }
 }
 
-impl<'db> Exporter<'db> {
+impl<'db> Exporter<'db, '_> {
     /// Conservative resolved import closure. A dependency can determine a
     /// builtin-valued fact without leaving a nominal source reference in the
     /// exported type (for example `from configuration import NUMBER`). Resolve
     /// those imports inside the actual checker program as well.
     fn collect_import_dependencies(&self, file: ProgramFile<'db>) {
-        struct Imports<'a, 'db> {
-            exporter: &'a Exporter<'db>,
+        struct Imports<'a, 'db, 'context> {
+            exporter: &'a Exporter<'db, 'context>,
             model: SemanticModel<'db>,
             files: Vec<ProgramFile<'db>>,
         }
-        impl<'db> Imports<'_, 'db> {
+        impl<'db> Imports<'_, 'db, '_> {
             fn module(&mut self, module: Option<ty_module_resolver::Module<'db>>) {
                 if let Some(file) = module.and_then(|module| module.file(self.exporter.db)) {
                     self.files
@@ -410,7 +503,7 @@ impl<'db> Exporter<'db> {
                 }
             }
         }
-        impl<'ast> Visitor<'ast> for Imports<'_, '_> {
+        impl<'ast> Visitor<'ast> for Imports<'_, '_, '_> {
             fn visit_stmt(&mut self, statement: &'ast ast::Stmt) {
                 match statement {
                     ast::Stmt::Import(import) => {
@@ -1024,7 +1117,7 @@ impl<'db> Exporter<'db> {
                 .entry(member.member.name.to_string())
                 .or_insert_with(|| facts::GlobalBindingFact {
                     name: member.member.name.to_string(),
-                    mutability: if self.module.source_dialect == facts::SourceDialect::SoacStrict {
+                    mutability: if self.module.language_policy.strict_assign {
                         facts::GlobalMutability::FinalAfterSeal
                     } else {
                         facts::GlobalMutability::Unknown
@@ -1467,6 +1560,12 @@ impl<'db> Exporter<'db> {
         }
         if self.module.source_dialect != facts::SourceDialect::SoacStrict {
             reasons.insert(facts::DynamicClassReason::UnresolvedAnalysis);
+        } else if !self
+            .module
+            .language_policy
+            .checked_attributes(identity.source_range)
+        {
+            reasons.insert(facts::DynamicClassReason::PolicyOptOut);
         }
         let metaclass_ty = class.metaclass(db);
         let metaclass = match metaclass_ty {
@@ -1488,11 +1587,11 @@ impl<'db> Exporter<'db> {
         for base in class.iter_mro(db, None).skip(1) {
             if let ClassBase::Class(base) = base {
                 if let Some(reference) = self.base_reference(base.class_literal(db)) {
-                    if self.resolve_external_bases
+                    if self.resolve_external_classes
                         && base.known(db) != Some(KnownClass::Object)
                         && base.class_literal(db).as_static().is_none_or(|base| {
                             base.file(db) != self.model.program_file().file(db)
-                                && !external_strict_base_is_candidate(db, base)
+                                && !self.context.base_is_candidate(db, base)
                         })
                     {
                         reasons.insert(facts::DynamicClassReason::MutableBase);
@@ -1565,10 +1664,7 @@ impl<'db> Exporter<'db> {
                 } else {
                     facts::TransformKind::UnsupportedFramework
                 };
-                if kind != facts::TransformKind::StdlibDataclass
-                    || self.module.language_policy.adapters.dataclasses
-                        == facts::StdlibDataclassPolicy::Dynamic
-                {
+                if kind != facts::TransformKind::StdlibDataclass {
                     reasons.insert(facts::DynamicClassReason::FrameworkManaged);
                 }
                 let options = class.dataclass_params(db).map(|params| {
@@ -1849,6 +1945,15 @@ impl<'db> Exporter<'db> {
                 }
             });
             if let Some(function) = function {
+                // Native construction currently authenticates only a direct,
+                // getter-only builtin property producer. Setter/deleter
+                // chains retain their ordinary descriptor behavior and must
+                // decline before any class contract is installed.
+                if let Type::PropertyInstance(property) = ty
+                    && (property.setter(db).is_some() || property.deleter(db).is_some())
+                {
+                    reasons.insert(facts::DynamicClassReason::UnsupportedDescriptor);
+                }
                 let signature = self.signature(&function.last_definition_signature(db), 0);
                 let declared_final = function.has_known_decorator(db, FunctionDecorators::FINAL);
                 let binding = if matches!(ty, Type::PropertyInstance(_)) {
@@ -2385,7 +2490,7 @@ impl<'db> Exporter<'db> {
     }
 }
 
-impl<'ast> Visitor<'ast> for Exporter<'_> {
+impl<'ast> Visitor<'ast> for Exporter<'_, '_> {
     fn visit_stmt(&mut self, statement: &'ast ast::Stmt) {
         match statement {
             ast::Stmt::ClassDef(node) => {

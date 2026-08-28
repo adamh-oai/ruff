@@ -1,15 +1,23 @@
 //! Strict lint tests use real ty project inference, not rendered diagnostic matching.
 
-use super::soac_export_tests::{database, database_with_options};
+use super::soac_export_tests::{
+    database, database_with_options, inheritance_database, selected_policy, source_policies,
+};
 use ruff_db::files::system_path_to_file;
 use soac_contracts::*;
 use ty_python_core::AnalysisDialect;
-use ty_python_semantic::export_soac_module_facts;
+use ty_python_semantic::{SoacSourcePolicies, export_soac_module_facts};
 
 fn analyze(source: &str, policy: ResolvedStrictPolicy) -> ModuleTypeFacts {
     let db = database(source, AnalysisDialect::SoacStrictV1, false);
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    export_soac_module_facts(&db, file, "main", policy).unwrap()
+    let mut policies = source_policies();
+    if policy.is_selected() {
+        policies.insert("/project/main.py".into(), policy);
+    } else {
+        policies.remove(ruff_db::system::SystemPath::new("/project/main.py"));
+    }
+    export_soac_module_facts(&db, file, "main", &policies).unwrap()
 }
 
 fn codes(facts: &ModuleTypeFacts) -> Vec<DiagnosticCode> {
@@ -32,8 +40,7 @@ fn soac_strict_absent_global_declarations_export_unknown_mutable_bindings() {
         .filter(|diagnostic| diagnostic.id().is_lint_named("unresolved-global"))
         .collect();
     assert_eq!(unresolved.len(), 3);
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     for name in ["value", "caught", "group"] {
         let binding = facts
             .global_bindings
@@ -95,7 +102,7 @@ fn soac_strict_absent_global_rule_requires_actual_source_opt_in() {
         _ => DiagnosticSeverity::Information,
     };
     let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+        export_soac_module_facts(&db, file, "main", &SoacSourcePolicies::default()).unwrap();
     assert_eq!(facts.source_dialect, SourceDialect::OrdinaryPython);
     assert!(facts.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == DiagnosticCode::CheckerError
@@ -125,8 +132,7 @@ fn soac_strict_absent_global_rule_keeps_unresolved_reads_and_assignment_errors()
             "missing {code}"
         );
     }
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     for diagnostic in diagnostics.iter().filter(|diagnostic| {
         diagnostic.id().is_lint_named("invalid-assignment")
             || diagnostic.id().is_lint_named("unresolved-reference")
@@ -155,7 +161,7 @@ fn soac_strict_absent_global_rule_does_not_accept_invalid_nonlocal_scope() {
     let db = database(source, AnalysisDialect::SoacStrictV1, false);
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
     assert!(matches!(
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()),
+        export_soac_module_facts(&db, file, "main", &source_policies()),
         Err(ContractError::InvalidSourceIdentity(_))
     ));
 }
@@ -171,8 +177,7 @@ fn soac_strict_framework_attribute_fallback_preserves_original_metaclass_source(
         .filter(|diagnostic| diagnostic.id().is_lint_named("unresolved-attribute"))
         .collect();
     assert_eq!(unresolved.len(), 2);
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     for name in ["Meta", "C"] {
         assert!(facts.classes.iter().any(|class| {
             class.identity.lexical_qualname == name
@@ -220,7 +225,7 @@ fn soac_strict_framework_attribute_fallback_preserves_original_metaclass_source(
 #[test]
 fn soac_strict_framework_attribute_fallback_demotes_consuming_calls_and_attributes() {
     let source = "from __future__ import strict\ndef decorate(cls): return cls\n@decorate\nclass Framework: pass\nclass Child(Framework): pass\ndef consume(value: int) -> int: return value\nINSTANCE = Child()\nRESULT = INSTANCE.missing()\nOTHER = consume(INSTANCE.payload)\nTYPE = INSTANCE.payload.__class__\n";
-    let facts = analyze(source, ResolvedStrictPolicy::default());
+    let facts = analyze(source, selected_policy());
     let child = facts
         .classes
         .iter()
@@ -298,8 +303,7 @@ fn soac_strict_framework_attribute_fallback_preserves_real_errors() {
         .filter(|diagnostic| diagnostic.severity() == ruff_db::diagnostic::Severity::Error)
         .collect();
     assert!(errors.len() >= 5);
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     for error in errors {
         let range = error.primary_span().unwrap().range().unwrap();
         let range = SourceRange::new(range.start().to_u32(), range.end().to_u32());
@@ -338,9 +342,8 @@ fn soac_strict_framework_attribute_fallback_is_not_ordinary_ty_policy() {
                 })
         );
         if dialect == AnalysisDialect::SoacStrictV1 {
-            let facts =
-                export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default())
-                    .unwrap();
+            let facts = export_soac_module_facts(&db, file, "main", &SoacSourcePolicies::default())
+                .unwrap();
             assert_eq!(facts.source_dialect, SourceDialect::OrdinaryPython);
             assert!(facts.diagnostics.iter().any(|diagnostic| {
                 diagnostic.code == DiagnosticCode::CheckerError
@@ -357,7 +360,7 @@ fn soac_strict_framework_attribute_fallback_is_deterministic_between_databases()
     let export = |unrelated| {
         let db = database(source, AnalysisDialect::SoacStrictV1, unrelated);
         let file = system_path_to_file(&db, "/project/main.py").unwrap();
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap()
+        export_soac_module_facts(&db, file, "main", &source_policies()).unwrap()
     };
     let facts = export(false);
     assert_eq!(facts, export(true));
@@ -370,7 +373,7 @@ fn soac_strict_framework_attribute_fallback_is_deterministic_between_databases()
 #[test]
 fn soac_strict_framework_attribute_fallback_does_not_follow_any_or_ignores() {
     let source = "from __future__ import strict\nfrom typing import Any\nclass Ignored:\n    def unavailable(self):\n        return self.missing  # ty: ignore[unresolved-attribute]\nRESULT = Ignored.other\ndef any_value(value: Any): return value.missing()\n";
-    let facts = analyze(source, ResolvedStrictPolicy::default());
+    let facts = analyze(source, selected_policy());
     let ignored = facts
         .classes
         .iter()
@@ -404,7 +407,7 @@ fn soac_strict_framework_attribute_fallback_does_not_follow_any_or_ignores() {
 fn soac_strict_globals_follow_lexical_mutability_and_sealing() {
     let facts = analyze(
         "from __future__ import strict\nLIMIT = 1\nLIMIT = 2\nglobal mutable_count\nmutable_count = 0\nnamespace = globals()\nglobals()['LIMIT'] = 3\ndef allowed():\n    global mutable_count, added_mutable\n    mutable_count += 1\n    globals()['new_name'] = 1\ndef invalid():\n    namespace['LIMIT'] = 4\n    del globals()['LIMIT']\n    globals().update(LIMIT=5)\n",
-        ResolvedStrictPolicy::default(),
+        selected_policy(),
     );
     assert_eq!(
         facts
@@ -453,7 +456,7 @@ fn soac_strict_globals_follow_lexical_mutability_and_sealing() {
 fn soac_strict_globals_use_resolved_callable_and_module_provenance() {
     let facts = analyze(
         "from __future__ import strict\nimport external_strict as external\nLIMIT = 1\ndef holder(): pass\ndef invalid():\n    holder.__globals__['LIMIT'] = 2\n    external.LIMIT = 3\n    external.__dict__['LIMIT'] = 4\n    vars(external)['LIMIT'] = 5\n    external.mutable = 6\ndef ordinary():\n    def globals() -> dict[str, int]: return {}\n    globals()['LIMIT'] = 2\ndef uncertain(condition):\n    alias = globals() if condition else {}\n    alias['LIMIT'] = 1\n",
-        ResolvedStrictPolicy::default(),
+        selected_policy(),
     );
     assert_eq!(
         codes(&facts)
@@ -468,7 +471,7 @@ fn soac_strict_globals_use_resolved_callable_and_module_provenance() {
 fn soac_strict_method_classvar_and_class_writes_include_builtin_setters() {
     let facts = analyze(
         "from __future__ import strict\nfrom typing import ClassVar\nclass C:\n    value: int\n    shared: ClassVar[int] = 0\n    def method(self) -> int: return 1\ndef invalid(value: C):\n    value.method = lambda: 1\n    value.shared = 1\n    setattr(value, 'method', lambda: 1)\n    object.__setattr__(value, 'shared', 2)\n    C.method = lambda self: 1\n    del C.value\n    value.__dict__['method'] = lambda: 1\n",
-        ResolvedStrictPolicy::default(),
+        selected_policy(),
     );
     assert_eq!(
         codes(&facts)
@@ -497,7 +500,7 @@ fn soac_strict_method_classvar_and_class_writes_include_builtin_setters() {
 fn soac_strict_self_store_cannot_create_permission_to_shadow_a_method() {
     let facts = analyze(
         "from __future__ import strict\nclass C:\n    def method(self) -> int: return 1\n    def change(self):\n        self.method = lambda: 1\n",
-        ResolvedStrictPolicy::default(),
+        selected_policy(),
     );
     assert!(codes(&facts).contains(&DiagnosticCode::StrictInstanceMethodShadow));
 }
@@ -506,25 +509,27 @@ fn soac_strict_self_store_cannot_create_permission_to_shadow_a_method() {
 fn soac_strict_declared_fields_override_inherited_non_data_methods() {
     let facts = analyze(
         "from __future__ import strict\nfrom typing import Callable\nclass Base:\n    def method(self) -> int: return 1\nclass Child(Base):\n    method: Callable[[], int]\ndef allowed(value: Child):\n    value.method = lambda: 2\n",
-        ResolvedStrictPolicy::default(),
+        selected_policy(),
     );
     assert!(!codes(&facts).contains(&DiagnosticCode::StrictInstanceMethodShadow));
 }
 
 #[test]
 fn soac_strict_checked_field_rule_is_gated_by_shared_policy() {
-    let source = "from __future__ import strict\nclass C:\n    value: int\ndef invalid(value: C):\n    value.value = 'wrong'\n";
-    let default = analyze(source, ResolvedStrictPolicy::default());
+    let source = "class C:\n    value: int\ndef invalid(value: C):\n    value.value = 'wrong'\n";
+    let default = analyze(
+        source,
+        ResolvedStrictPolicy {
+            strict_assign: true,
+            ..ResolvedStrictPolicy::default()
+        },
+    );
     assert!(!codes(&default).contains(&DiagnosticCode::StrictIncompatibleFieldWrite));
-    let mut policy = ResolvedStrictPolicy::default();
-    policy.checked_fields = CheckedFieldPolicy::SupportedAnnotations;
-    let checked = analyze(source, policy);
+    let checked = analyze(source, selected_policy());
     assert!(codes(&checked).contains(&DiagnosticCode::StrictIncompatibleFieldWrite));
 
     let source = "from __future__ import strict\nclass C:\n    def __init__(self, source: int):\n        self.inferred = source\n        self.explicit: int = source\ndef invalid(value: C):\n    value.inferred = 'ordinary inferred field'\n    value.explicit = 'wrong'\n";
-    let mut policy = ResolvedStrictPolicy::default();
-    policy.checked_fields = CheckedFieldPolicy::SupportedAnnotations;
-    let checked = analyze(source, policy);
+    let checked = analyze(source, selected_policy());
     let diagnostics = checked
         .diagnostics
         .iter()
@@ -543,9 +548,225 @@ fn soac_strict_checked_field_rule_is_gated_by_shared_policy() {
 }
 
 #[test]
+fn soac_strict_global_writes_use_declaring_source_assignment_policy() {
+    let source = "import external_strict as external\nLIMIT = 1\ndef change():\n    globals()['LIMIT'] = 2\n    external.LIMIT = 3\n";
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let mut policies = source_policies();
+    policies
+        .get_mut(ruff_db::system::SystemPath::new("/project/main.py"))
+        .unwrap()
+        .strict_assign = false;
+    let foreign = export_soac_module_facts(&db, file, "main", &policies).unwrap();
+    let writes: Vec<_> = foreign
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::StrictFinalGlobalRebind)
+        .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].related_definitions[0].module.module_name,
+        "external_strict"
+    );
+    assert!(
+        foreign
+            .global_bindings
+            .iter()
+            .all(|binding| binding.mutability == GlobalMutability::Unknown)
+    );
+    policies
+        .get_mut(ruff_db::system::SystemPath::new(
+            "/project/external_strict.py",
+        ))
+        .unwrap()
+        .strict_assign = false;
+    let unrestricted = export_soac_module_facts(&db, file, "main", &policies).unwrap();
+    assert!(!codes(&unrestricted).contains(&DiagnosticCode::StrictFinalGlobalRebind));
+    assert_eq!(unrestricted.module, foreign.module);
+}
+
+#[test]
+fn soac_strict_field_only_selection_keeps_absent_global_diagnostics() {
+    let source = "class C:\n    value: int\ndef bind():\n    global absent\n    absent = 1\n";
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let checker = ty_python_semantic::Db::check_file(&db, file);
+    let unresolved = checker
+        .iter()
+        .find(|diagnostic| diagnostic.id().is_lint_named("unresolved-global"))
+        .unwrap();
+    let range = unresolved.primary_span().unwrap().range().unwrap();
+    let range = SourceRange::new(range.start().to_u32(), range.end().to_u32());
+    let expected_severity = match unresolved.severity() {
+        ruff_db::diagnostic::Severity::Error | ruff_db::diagnostic::Severity::Fatal => {
+            DiagnosticSeverity::Error
+        }
+        ruff_db::diagnostic::Severity::Warning => DiagnosticSeverity::Warning,
+        _ => DiagnosticSeverity::Information,
+    };
+    let policy = ResolvedStrictPolicy {
+        checked_attr: true,
+        ..ResolvedStrictPolicy::default()
+    };
+    let mut policies = source_policies();
+    policies.insert("/project/main.py".into(), policy);
+    let facts = export_soac_module_facts(&db, file, "main", &policies).unwrap();
+    assert_eq!(facts.source_dialect, SourceDialect::SoacStrict);
+    assert!(facts.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source_range == range
+            && diagnostic.code == DiagnosticCode::CheckerError
+            && diagnostic.severity == expected_severity
+            && !diagnostic.suppressed
+    }));
+    assert!(!codes(&facts).contains(&DiagnosticCode::StrictUncheckedDynamicType));
+    assert!(
+        facts
+            .global_bindings
+            .iter()
+            .all(|binding| binding.mutability == GlobalMutability::Unknown)
+    );
+}
+
+#[test]
+fn soac_strict_imported_field_checks_survive_writer_defaults_and_child_opt_out() {
+    let base = "class Base:\n    payload: int\n";
+    let source = "from base import Base\nclass Child(Base): pass\ndef direct(value: Base):\n    value.payload = 'wrong'\ndef inherited(value: Child):\n    object.__setattr__(value, 'payload', 'wrong')\n";
+    let (mut db, system) = inheritance_database(base, false);
+    system
+        .memory_file_system()
+        .write_file_all("/project/main.py", source)
+        .unwrap();
+    db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+        "/project/main.py".into(),
+    )]);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let mut policies = source_policies();
+    let initial = export_soac_module_facts(&db, file, "main", &policies).unwrap();
+    let child_range = initial
+        .classes
+        .iter()
+        .find(|class| class.identity.lexical_qualname == "Child")
+        .unwrap()
+        .identity
+        .source_range;
+    for main_policy in [
+        ResolvedStrictPolicy {
+            strict_assign: true,
+            ..ResolvedStrictPolicy::default()
+        },
+        ResolvedStrictPolicy {
+            class_overrides: vec![ClassPolicyOverride {
+                class_range: child_range,
+                checked_attr: false,
+            }],
+            ..selected_policy()
+        },
+    ] {
+        policies.insert("/project/main.py".into(), main_policy);
+        let facts = export_soac_module_facts(&db, file, "main", &policies).unwrap();
+        let writes: Vec<_> = facts
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::StrictIncompatibleFieldWrite)
+            .collect();
+        assert_eq!(writes.len(), 2);
+        assert!(writes.iter().all(|diagnostic| {
+            diagnostic.related_definitions.len() == 1
+                && diagnostic.related_definitions[0].module.module_name == "base"
+        }));
+        assert!(
+            matches!(&facts.classes[0].participation, ParticipationProposal::Dynamic(reasons)
+            if reasons.contains(&DynamicClassReason::PolicyOptOut))
+        );
+    }
+    policies.insert("/project/main.py".into(), selected_policy());
+    policies
+        .get_mut(ruff_db::system::SystemPath::new("/project/base.py"))
+        .unwrap()
+        .checked_attr = false;
+    let disabled_owner = export_soac_module_facts(&db, file, "main", &policies).unwrap();
+    assert!(!codes(&disabled_owner).contains(&DiagnosticCode::StrictIncompatibleFieldWrite));
+    let ordinary_errors = |facts: &ModuleTypeFacts| {
+        facts
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::CheckerError)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(!ordinary_errors(&initial).is_empty());
+    assert_eq!(ordinary_errors(&disabled_owner), ordinary_errors(&initial));
+}
+
+#[test]
+fn soac_strict_inherited_field_diagnostics_do_not_assume_dynamic_write_routing() {
+    for (child, dynamic_reason, reaches_storage) in [
+        ("class Child(Base): pass\n", None, true),
+        (
+            "class Child(Base):\n    def __setattr__(self, name: str, value: object) -> None:\n        object.__setattr__(self, name, 0)\n",
+            Some(DynamicClassReason::CustomAttributeHooks),
+            false,
+        ),
+        (
+            "class Child(Base):\n    @property\n    def payload(self) -> int: return 0\n",
+            None,
+            false,
+        ),
+        (
+            "class Child(Base):\n    @property\n    def payload(self) -> int: return 0\n    @payload.setter\n    def payload(self, value: str) -> None: pass\n",
+            Some(DynamicClassReason::UnsupportedDescriptor),
+            false,
+        ),
+        (
+            "class Child(Base):\n    @property\n    def payload(self) -> int: return 0\n    @payload.deleter\n    def payload(self) -> None: pass\n",
+            Some(DynamicClassReason::UnsupportedDescriptor),
+            false,
+        ),
+    ] {
+        let source = format!(
+            "from base import Base\n{child}def write(value: Child):\n    setattr(value, 'payload', 'accepted by the hook')\n"
+        );
+        let (mut db, system) = inheritance_database("class Base:\n    payload: int\n", false);
+        system
+            .memory_file_system()
+            .write_file_all("/project/main.py", &source)
+            .unwrap();
+        db.apply_changes(&[crate::watch::ChangeEvent::file_content_changed(
+            "/project/main.py".into(),
+        )]);
+        let file = system_path_to_file(&db, "/project/main.py").unwrap();
+        let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
+        let proposal = facts
+            .classes
+            .iter()
+            .find(|class| class.identity.lexical_qualname == "Child")
+            .unwrap();
+        if let Some(reason) = dynamic_reason {
+            assert!(
+                matches!(&proposal.participation, ParticipationProposal::Dynamic(reasons)
+                    if reasons.contains(&reason)),
+                "{child}: {:?}",
+                proposal.participation,
+            );
+        } else {
+            assert_eq!(
+                proposal.participation,
+                ParticipationProposal::Candidate,
+                "{child}"
+            );
+        }
+        assert_eq!(
+            codes(&facts).contains(&DiagnosticCode::StrictIncompatibleFieldWrite),
+            reaches_storage,
+            "{child}",
+        );
+    }
+}
+
+#[test]
 fn soac_strict_finality_and_overrides_use_checker_class_and_callable_queries() {
     let source = "from __future__ import strict\nfrom typing import final\n@final\nclass FinalBase: pass\nclass BadSubclass(FinalBase): pass\nclass Base:\n    @final\n    def method(self, x: int) -> str: return ''\nclass BadOverride(Base):\n    def method(self, x: str) -> str: return x\nclass OpenBase:\n    def method(self, x: int) -> object: return x\nclass Compatible(OpenBase):\n    def method(self, x: object) -> str: return ''\n";
-    let enforced = analyze(source, ResolvedStrictPolicy::default());
+    let enforced = analyze(source, selected_policy());
     assert!(codes(&enforced).contains(&DiagnosticCode::StrictFinalClassSubclass));
     assert!(codes(&enforced).contains(&DiagnosticCode::StrictFinalMethodOverride));
     assert_eq!(
@@ -555,18 +776,22 @@ fn soac_strict_finality_and_overrides_use_checker_class_and_callable_queries() {
             .count(),
         1
     );
-    let mut policy = ResolvedStrictPolicy::default();
-    policy.typing_final_policy = TypingFinalPolicy::Advisory;
-    let advisory = analyze(source, policy);
-    assert!(!codes(&advisory).contains(&DiagnosticCode::StrictFinalClassSubclass));
-    assert!(!codes(&advisory).contains(&DiagnosticCode::StrictFinalMethodOverride));
+    let ordinary = analyze(source, ResolvedStrictPolicy::default());
+    assert!(!codes(&ordinary).contains(&DiagnosticCode::StrictFinalClassSubclass));
+    assert!(!codes(&ordinary).contains(&DiagnosticCode::StrictFinalMethodOverride));
+    assert!(
+        ordinary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::CheckerError)
+    );
 }
 
 #[test]
 fn soac_strict_automatic_dynamic_fallback_does_not_reject_framework_mutations() {
     let facts = analyze(
         "from __future__ import strict\nclass Meta(type): pass\nclass Dynamic(metaclass=Meta):\n    def method(self) -> int: return 1\nclass Child(Dynamic): pass\ndef allowed(value: Child):\n    value.method = lambda: 2\n    Dynamic.method = lambda self: 3\n",
-        ResolvedStrictPolicy::default(),
+        selected_policy(),
     );
     assert!(codes(&facts).is_empty());
     assert!(
@@ -585,7 +810,7 @@ fn soac_strict_automatic_dynamic_fallback_does_not_reject_framework_mutations() 
 fn soac_strict_final_base_barriers_also_apply_to_dynamic_children() {
     let facts = analyze(
         "from __future__ import strict\nfrom typing import final\nclass Meta(type): pass\n@final\nclass FinalBase: pass\nclass DynamicChild(FinalBase, metaclass=Meta): pass\nclass Base:\n    @final\n    def method(self) -> int: return 1\nclass DynamicOverride(Base, metaclass=Meta):\n    def method(self) -> int: return 2\n",
-        ResolvedStrictPolicy::default(),
+        selected_policy(),
     );
     assert_eq!(
         codes(&facts)
@@ -607,7 +832,7 @@ fn soac_strict_final_base_barriers_also_apply_to_dynamic_children() {
 #[test]
 fn soac_strict_lints_are_registered_and_ignored_rules_retain_uncertainty() {
     let source = "from __future__ import strict\nclass C:\n    def method(self) -> int: return 1\ndef ignored(value: C):\n    value.method = lambda: 2  # ty: ignore[strict-instance-method-shadow]\n";
-    let facts = analyze(source, ResolvedStrictPolicy::default());
+    let facts = analyze(source, selected_policy());
     assert!(facts.diagnostics.iter().any(|diagnostic| diagnostic.code
         == DiagnosticCode::StrictInstanceMethodShadow
         && diagnostic.suppressed));
@@ -618,8 +843,7 @@ fn soac_strict_lints_are_registered_and_ignored_rules_retain_uncertainty() {
         "[rules]\nstrict-final-global-rebind = 'ignore'\n",
     );
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     assert!(facts.diagnostics.iter().any(|diagnostic| diagnostic.code
         == DiagnosticCode::StrictFinalGlobalRebind
         && diagnostic.suppressed));
@@ -644,8 +868,7 @@ fn soac_strict_used_ignore_is_not_reported_unused_by_export() {
         "[rules]\nunused-ignore-comment = 'error'\n",
     );
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     assert!(facts.diagnostics.iter().any(|diagnostic| diagnostic.code
         == DiagnosticCode::StrictFinalGlobalRebind
         && diagnostic.suppressed));
@@ -672,8 +895,7 @@ fn soac_strict_used_ignore_is_not_reported_unused_by_export() {
         "[rules]\nunused-ignore-comment = 'error'\n",
     );
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     assert!(
         facts
             .diagnostics

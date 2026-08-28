@@ -126,10 +126,10 @@ fn mutable_globals(db: &dyn Db, file: ProgramFile<'_>) -> BTreeSet<String> {
 }
 
 pub(super) fn reconcile_absent_global_diagnostic(
-    exporter: &mut Exporter<'_>,
+    exporter: &mut Exporter<'_, '_>,
     diagnostic: &Diagnostic,
 ) -> bool {
-    if exporter.module.source_dialect != facts::SourceDialect::SoacStrict
+    if !exporter.module.language_policy.strict_assign
         || diagnostic.id().as_lint() != Some(UNRESOLVED_GLOBAL.name())
     {
         return false;
@@ -172,22 +172,8 @@ pub(super) fn reconcile_absent_global_diagnostic(
     true
 }
 
-fn is_strict(db: &dyn Db, file: ProgramFile<'_>) -> bool {
-    if file.analysis_policy(db).dialect != AnalysisDialect::SoacStrictV1 {
-        return false;
-    }
-    let parsed = parsed_module(db, file.python_file(db)).load(db);
-    if !parsed.errors().is_empty() || !semantic_index(db, file).semantic_syntax_errors().is_empty()
-    {
-        return false;
-    }
-    parsed.suite().iter().any(|statement| matches!(statement,
-        ast::Stmt::ImportFrom(import) if import.level == 0 && import.module.as_deref() == Some("__future__")
-            && import.names.iter().any(|alias| alias.name.as_str() == "strict")))
-}
-
-pub(super) fn check(exporter: &mut Exporter<'_>, body: &[ast::Stmt]) {
-    if exporter.module.source_dialect == facts::SourceDialect::SoacStrict {
+pub(super) fn check(exporter: &mut Exporter<'_, '_>, body: &[ast::Stmt]) {
+    if exporter.module.language_policy.strict_assign {
         let mutable = mutable_globals(exporter.db, exporter.model.program_file());
         for name in mutable {
             if let Some(binding) = exporter
@@ -253,14 +239,14 @@ pub(super) fn check(exporter: &mut Exporter<'_>, body: &[ast::Stmt]) {
     .visit_body(body);
 }
 
-struct StrictChecker<'a, 'db> {
-    exporter: &'a mut Exporter<'db>,
+struct StrictChecker<'a, 'db, 'context> {
+    exporter: &'a mut Exporter<'db, 'context>,
     /// A general function can run after module sealing. Module/class-body
     /// initialization is deliberately not mislabeled as a sealed execution.
     deferred_depth: usize,
 }
 
-impl<'db> StrictChecker<'_, 'db> {
+impl<'db> StrictChecker<'_, 'db, '_> {
     fn report(
         &mut self,
         code: facts::DiagnosticCode,
@@ -417,7 +403,11 @@ impl<'db> StrictChecker<'_, 'db> {
         // during module-body execution. General functions must be valid after
         // sealing regardless of whether a particular call happens during init.
         if self.deferred_depth == 0
-            || !is_strict(db, file)
+            || !self
+                .exporter
+                .context
+                .source_policy(db, file.file(db))
+                .is_some_and(|policy| policy.strict_assign)
             || mutable_globals(db, file).contains(name)
         {
             return;
@@ -440,42 +430,141 @@ impl<'db> StrictChecker<'_, 'db> {
         );
     }
 
-    fn participating(&self, class: ClassLiteral<'db>) -> Option<facts::ClassTypeFact> {
+    fn class_proposal(&self, class: ClassLiteral<'db>) -> Option<facts::ClassTypeFact> {
         let reference = self.exporter.class_reference(class)?;
+        if reference.definition.module == self.exporter.module.module {
+            return self
+                .exporter
+                .module
+                .classes
+                .iter()
+                .find(|class| class.identity == reference.definition)
+                .cloned();
+        }
+        let class = class.as_static()?;
+        if !self.exporter.resolve_external_classes {
+            return None;
+        }
         self.exporter
-            .module
-            .classes
-            .iter()
-            .find(|class| {
-                class.identity == reference.definition
-                    && class.participation == facts::ParticipationProposal::Candidate
-            })
-            .cloned()
+            .context
+            .class_proposal(self.exporter.db, class)
+    }
+
+    fn participating(&self, class: ClassLiteral<'db>) -> Option<facts::ClassTypeFact> {
+        let proposal = self.class_proposal(class)?;
+        if proposal.participation != facts::ParticipationProposal::Candidate {
+            return None;
+        }
+        if proposal.identity.module != self.exporter.module.module
+            && !self
+                .exporter
+                .context
+                .base_is_candidate(self.exporter.db, class.as_static()?)
+        {
+            return None;
+        }
+        Some(proposal)
     }
 
     fn inherited_method(
         &self,
-        owner: &facts::ClassTypeFact,
+        class: ClassLiteral<'db>,
         name: &str,
     ) -> Option<facts::MethodTypeFact> {
-        std::iter::once(&owner.identity)
-            .chain(
-                owner
-                    .inheritance
-                    .linearized_bases
-                    .iter()
-                    .filter_map(facts::BaseReference::as_class)
-                    .map(|base| &base.definition),
-            )
-            .find_map(|identity| {
-                self.exporter
-                    .module
-                    .classes
-                    .iter()
-                    .find(|class| &class.identity == identity)
-                    .and_then(|class| class.methods.iter().find(|method| method.name == name))
-                    .cloned()
+        class
+            .as_static()?
+            .iter_mro(self.exporter.db, None)
+            .filter_map(ClassBase::into_class)
+            .find_map(|base| {
+                self.participating(base.class_literal(self.exporter.db))?
+                    .methods
+                    .into_iter()
+                    .find(|method| method.name == name)
             })
+    }
+
+    fn checked_field_write(
+        &mut self,
+        class: ClassLiteral<'db>,
+        name: &str,
+        value: Type<'db>,
+        range: TextRange,
+    ) {
+        let db = self.exporter.db;
+        // An opted-out plain child still uses its ancestor's constrained
+        // storage. Custom hooks and descriptors can transform or consume a
+        // source assignment without storing its value there. The runtime
+        // checks those actual writes; this diagnostic must not guess routing.
+        if self.participating(class).is_none()
+            && !self.class_proposal(class).is_some_and(|proposal| {
+                matches!(&proposal.participation, facts::ParticipationProposal::Dynamic(reasons)
+                    if reasons.len() == 1 && reasons.contains(&facts::DynamicClassReason::PolicyOptOut))
+            })
+        {
+            return;
+        }
+        let Some(class) = class.as_static() else {
+            return;
+        };
+        let receiver = Type::instance(db, &self.exporter.env, class.default_specialization(db));
+        if receiver
+            .class_member(db, &self.exporter.env, name)
+            .place
+            .ignore_possibly_undefined()
+            .is_some_and(|ty| self.exporter.descriptor(ty).kind != facts::DescriptorKind::None)
+        {
+            // Even an admitted getter-only property remains a data descriptor:
+            // its ordinary setter raises without writing the ancestor's field.
+            // Do not turn that operation into a speculative storage diagnostic.
+            return;
+        }
+        if self.exporter.value_type(value).contains_uncertainty() {
+            return;
+        }
+        let mut incompatible_owners = Vec::new();
+        // Every installed ancestor predicate remains in force. In particular,
+        // opting a child out cannot disable the declaring base's field checks,
+        // and a writer's module defaults cannot enable or weaken those checks.
+        for base in class.iter_mro(db, None).filter_map(ClassBase::into_class) {
+            let Some(owner) = self.participating(base.class_literal(db)) else {
+                continue;
+            };
+            let Some(policy) = self
+                .exporter
+                .context
+                .source_policy(db, base.class_literal(db).file(db))
+            else {
+                continue;
+            };
+            if !owner
+                .required_field_bindings(policy)
+                .iter()
+                .any(|field| field.name == name)
+            {
+                continue;
+            }
+            let receiver = Type::instance(db, &self.exporter.env, base);
+            let field = receiver.instance_member(db, &self.exporter.env, name);
+            if matches!(field.place, Place::Defined(place) if place.origin.is_declared())
+                && let Some(field_type) = field.place.ignore_possibly_undefined()
+                && self
+                    .exporter
+                    .value_type(field_type)
+                    .has_supported_value_shape()
+                && !value.is_assignable_to(db, &self.exporter.env, field_type)
+            {
+                incompatible_owners.push(owner.identity);
+            }
+        }
+        if !incompatible_owners.is_empty() {
+            self.report(
+                facts::DiagnosticCode::StrictIncompatibleFieldWrite,
+                &STRICT_INCOMPATIBLE_FIELD_WRITE,
+                range,
+                incompatible_owners,
+                format!("Value written to `{name}` is incompatible with the declaring class's checked-field policy"),
+            );
+        }
     }
 
     fn attribute_write(
@@ -517,7 +606,11 @@ impl<'db> StrictChecker<'_, 'db> {
         let Type::NominalInstance(instance) = receiver else {
             return;
         };
-        let Some(owner) = self.participating(instance.class_literal(db, &self.exporter.env)) else {
+        let class = instance.class_literal(db, &self.exporter.env);
+        if !delete && let Some(value) = value {
+            self.checked_field_write(class, name, value, range);
+        }
+        let Some(owner) = self.participating(class) else {
             return;
         };
         let member = receiver.class_member(db, &self.exporter.env, name);
@@ -531,7 +624,6 @@ impl<'db> StrictChecker<'_, 'db> {
             );
             return;
         }
-        let field = receiver.instance_member(db, &self.exporter.env, name);
         // A declared instance field intentionally takes precedence over an
         // inherited non-data method. Inferred stores alone cannot authorize
         // shadowing: they are the mutation this rule is supposed to diagnose.
@@ -563,7 +655,7 @@ impl<'db> StrictChecker<'_, 'db> {
                     })
             });
         if !declared_field
-            && let Some(method) = self.inherited_method(&owner, name)
+            && let Some(method) = self.inherited_method(class, name)
             && matches!(
                 method.binding,
                 facts::MethodBinding::Instance
@@ -579,22 +671,6 @@ impl<'db> StrictChecker<'_, 'db> {
                 format!("Instance mutation of `{name}` would shadow a protected strict method"),
             );
             return;
-        }
-        if !delete
-            && self.exporter.module.language_policy.checked_fields
-                == facts::CheckedFieldPolicy::SupportedAnnotations
-            && let Some(value) = value
-            && matches!(field.place, Place::Defined(place) if place.origin.is_declared())
-            && let Some(field_type) = field.place.ignore_possibly_undefined()
-            && self
-                .exporter
-                .value_type(field_type)
-                .has_supported_value_shape()
-            && !self.exporter.value_type(value).contains_uncertainty()
-            && !value.is_assignable_to(db, &self.exporter.env, field_type)
-        {
-            self.report(facts::DiagnosticCode::StrictIncompatibleFieldWrite, &STRICT_INCOMPATIBLE_FIELD_WRITE, range,
-                vec![owner.identity], format!("Value written to `{name}` is incompatible with the enabled strict checked-field policy"));
         }
     }
 
@@ -723,14 +799,11 @@ impl<'db> StrictChecker<'_, 'db> {
             return;
         };
         let owner = self.participating(class.into());
-        let enforce_final = self.exporter.module.language_policy.typing_final_policy
-            == facts::TypingFinalPolicy::EnforceForParticipatingClasses;
         for base in class.explicit_bases(db) {
             let Some(base) = base.to_class_type(db) else {
                 continue;
             };
-            if enforce_final
-                && base.is_final(db)
+            if base.is_final(db)
                 && let Some(base_owner) = self.participating(base.class_literal(db))
             {
                 self.report(
@@ -772,7 +845,7 @@ impl<'db> StrictChecker<'_, 'db> {
                 .first_reachable_definition
                 .kind(db)
                 .target_range(&parsed);
-            if enforce_final && method.declared_final {
+            if method.declared_final {
                 self.report(
                     facts::DiagnosticCode::StrictFinalMethodOverride,
                     &STRICT_FINAL_METHOD_OVERRIDE,
@@ -819,7 +892,7 @@ impl<'db> StrictChecker<'_, 'db> {
     }
 }
 
-impl<'ast> Visitor<'ast> for StrictChecker<'_, '_> {
+impl<'ast> Visitor<'ast> for StrictChecker<'_, '_, '_> {
     fn visit_stmt(&mut self, statement: &'ast ast::Stmt) {
         match statement {
             ast::Stmt::Assign(assign) => {

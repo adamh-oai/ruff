@@ -49,8 +49,8 @@ pub use types::ide_support::{
     type_hierarchy_supertypes,
 };
 pub use types::soac_export::{
-    SoacDependencyPath, SoacModuleExport, SoacSourceDependency, export_soac_module,
-    export_soac_module_facts,
+    SoacDependencyPath, SoacModuleExport, SoacSourceDependency, SoacSourcePolicies,
+    export_soac_module, export_soac_module_facts,
 };
 pub use types::{
     DisplaySettings, FixtureBinding, ProgramEnvironment, TypeQualifiers,

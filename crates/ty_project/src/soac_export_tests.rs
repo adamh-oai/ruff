@@ -4,7 +4,7 @@ use ruff_db::files::system_path_to_file;
 use ruff_db::system::{SystemPathBuf, TestSystem};
 use soac_contracts::*;
 use ty_python_core::AnalysisDialect;
-use ty_python_semantic::{export_soac_module, export_soac_module_facts};
+use ty_python_semantic::{SoacSourcePolicies, export_soac_module, export_soac_module_facts};
 
 use crate::{ProjectDatabase, ProjectMetadata};
 
@@ -51,9 +51,34 @@ pub(super) fn database_with_options(
     db
 }
 
-fn export_proposal_from(db: &ProjectDatabase) -> ModuleTypeFacts {
+pub(super) fn selected_policy() -> ResolvedStrictPolicy {
+    ResolvedStrictPolicy {
+        strict_assign: true,
+        checked_attr: true,
+        class_overrides: Vec::new(),
+    }
+}
+
+pub(super) fn source_policies() -> SoacSourcePolicies {
+    // Fixture owners are selected explicitly, never inferred from source text.
+    // The ordinary/external fixtures and typeshed remain outside the catalog.
+    ["main", "external_strict", "base", "bridge"]
+        .into_iter()
+        .map(|name| {
+            (
+                SystemPathBuf::from(format!("/project/{name}.py")),
+                selected_policy(),
+            )
+        })
+        .collect()
+}
+
+fn export_proposal_with_policies(
+    db: &ProjectDatabase,
+    policies: &SoacSourcePolicies,
+) -> ModuleTypeFacts {
     let file = system_path_to_file(db, "/project/main.py").unwrap();
-    let exported = export_soac_module(db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let exported = export_soac_module(db, file, "main", policies).unwrap();
     let mut facts = exported.facts;
     facts.consumed_dependencies = exported
         .dependencies
@@ -73,12 +98,20 @@ fn export_proposal_from(db: &ProjectDatabase) -> ModuleTypeFacts {
     facts.canonicalized().unwrap()
 }
 
-fn export_from(db: &ProjectDatabase) -> ModuleTypeFacts {
-    let facts = export_proposal_from(db);
+fn export_proposal_from(db: &ProjectDatabase) -> ModuleTypeFacts {
+    export_proposal_with_policies(db, &source_policies())
+}
+
+fn export_with_policies(db: &ProjectDatabase, policies: &SoacSourcePolicies) -> ModuleTypeFacts {
+    let facts = export_proposal_with_policies(db, policies);
     let file = system_path_to_file(db, "/project/main.py").unwrap();
     let source = ruff_db::source::source_text(db, file);
     validate_module_facts(&facts, Some(source.as_bytes())).unwrap();
     facts
+}
+
+fn export_from(db: &ProjectDatabase) -> ModuleTypeFacts {
+    export_with_policies(db, &source_policies())
 }
 
 fn export(source: &str) -> ModuleTypeFacts {
@@ -519,7 +552,7 @@ fn soac_nominal_field_bindings_keep_external_declarations_and_invalidate_with_so
         )
     );
     let base_file = system_path_to_file(&db, "/project/base.py").unwrap();
-    let base = export_soac_module(&db, base_file, "base", ResolvedStrictPolicy::default())
+    let base = export_soac_module(&db, base_file, "base", &source_policies())
         .unwrap()
         .facts;
     let inherited = field(&facts, "Child", "inherited")
@@ -682,8 +715,7 @@ fn soac_implicit_class_cell_does_not_grant_nonlexical_or_unbound_names() {
             false,
         );
         let file = system_path_to_file(&db, "/project/main.py").unwrap();
-        let facts =
-            export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+        let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
         assert!(
             facts
                 .diagnostics
@@ -796,8 +828,7 @@ def outer() -> int:
         .file_scope_id(&db);
     assert!(index.implicit_class_cell(local_owner).is_none());
     assert!(index.implicit_class_cell(nested).is_none());
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     assert!(
         facts
             .diagnostics
@@ -922,8 +953,7 @@ class Outer:
 "#;
     let db = database(source, AnalysisDialect::SoacStrictV1, false);
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     assert!(
         facts
             .diagnostics
@@ -1206,8 +1236,7 @@ def concatenated(value: "Record" "ing"): pass
 "#;
     let db = database(source, AnalysisDialect::SoacStrictV1, false);
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     assert!(facts.nominal_bindings.is_empty());
     assert!(
         facts.diagnostics.iter().any(
@@ -1815,8 +1844,7 @@ fn soac_dataclass_init_receiver_follows_all_semantic_field_names() {
         );
         let db = database(&source, AnalysisDialect::SoacStrictV1, false);
         let file = system_path_to_file(&db, "/project/main.py").unwrap();
-        let facts =
-            export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+        let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
         assert!(
             facts.diagnostics.iter().all(|diagnostic| {
                 diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
@@ -2015,8 +2043,7 @@ fn soac_dataclass_init_receiver_preserves_real_name_conflicts_and_unnamed_labels
         false,
     );
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     let init = class(&facts, "Conflict")
         .methods
         .iter()
@@ -2218,8 +2245,7 @@ class Deleted:
             .as_lint()
             .is_some_and(|name| name.as_str() == "invalid-method-override")
     }));
-    let deleted =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let deleted = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     assert!(
         deleted
             .diagnostics
@@ -2258,8 +2284,7 @@ class Deleted:
         false,
     );
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let facts =
-        export_soac_module_facts(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let facts = export_soac_module_facts(&db, file, "main", &source_policies()).unwrap();
     assert!(
         facts
             .diagnostics
@@ -2663,18 +2688,134 @@ fn soac_export_ignored_diagnostics_demote_affected_class_but_not_unrelated_class
 }
 
 #[test]
-fn soac_export_requires_explicit_dialect_and_does_not_infer_strictness_from_text() {
+fn soac_export_requires_explicit_dialect_and_resolved_source_selection() {
     let ordinary = database("class Ordinary: pass\n", AnalysisDialect::Python, false);
     let file = system_path_to_file(&ordinary, "/project/main.py").unwrap();
-    assert!(
-        export_soac_module_facts(&ordinary, file, "main", ResolvedStrictPolicy::default()).is_err()
+    assert!(export_soac_module_facts(&ordinary, file, "main", &source_policies()).is_err());
+    for source in [
+        "'from __future__ import strict'\nclass Ordinary: pass\n",
+        "from __future__ import strict\nclass Ordinary: pass\n",
+        "class Ordinary: pass\n",
+    ] {
+        let db = database(source, AnalysisDialect::SoacStrictV1, false);
+        let facts = export_with_policies(&db, &SoacSourcePolicies::default());
+        assert_eq!(facts.source_dialect, SourceDialect::OrdinaryPython);
+        assert!(matches!(
+            class(&facts, "Ordinary").participation,
+            ParticipationProposal::Dynamic(_)
+        ));
+        assert!(
+            facts
+                .global_bindings
+                .iter()
+                .all(|binding| binding.mutability == GlobalMutability::Unknown)
+        );
+        let selected = export_from(&db);
+        assert_eq!(selected.source_dialect, SourceDialect::SoacStrict);
+        assert_eq!(
+            class(&selected, "Ordinary").participation,
+            ParticipationProposal::Candidate
+        );
+        assert_eq!(selected.source_digest, Fingerprint::digest(source));
+        assert_eq!(selected.module, facts.module);
+        assert_eq!(
+            class(&selected, "Ordinary").identity,
+            class(&facts, "Ordinary").identity
+        );
+    }
+}
+
+#[test]
+fn soac_export_class_rules_use_exact_definitions_not_lexical_or_name_inheritance() {
+    let source = "class Outer:\n    class Inner:\n        value: int\nclass Repeated:\n    first: int\nclass Repeated:\n    second: int\n";
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let initial = export_from(&db);
+    let first_repeated = initial
+        .classes
+        .iter()
+        .find(|class| {
+            class.identity.lexical_qualname == "Repeated"
+                && class
+                    .instance_fields
+                    .iter()
+                    .any(|field| field.name == "first")
+        })
+        .unwrap();
+    let mut policies = source_policies();
+    policies
+        .get_mut(ruff_db::system::SystemPath::new("/project/main.py"))
+        .unwrap()
+        .class_overrides = vec![
+        ClassPolicyOverride {
+            class_range: class(&initial, "Outer").identity.source_range,
+            checked_attr: false,
+        },
+        ClassPolicyOverride {
+            class_range: first_repeated.identity.source_range,
+            checked_attr: false,
+        },
+    ];
+    let changed = export_with_policies(&db, &policies);
+    for identity in [&class(&initial, "Outer").identity, &first_repeated.identity] {
+        let actual = changed
+            .classes
+            .iter()
+            .find(|class| &class.identity == identity)
+            .unwrap();
+        assert!(
+            matches!(&actual.participation, ParticipationProposal::Dynamic(reasons)
+            if reasons.contains(&DynamicClassReason::PolicyOptOut))
+        );
+    }
+    assert_eq!(
+        class(&changed, "Outer.Inner").participation,
+        ParticipationProposal::Candidate
     );
-    let facts = export("'from __future__ import strict'\nclass Ordinary: pass\n");
-    assert_eq!(facts.source_dialect, SourceDialect::OrdinaryPython);
-    assert!(matches!(
-        class(&facts, "Ordinary").participation,
-        ParticipationProposal::Dynamic(_)
-    ));
+    let second_repeated = changed
+        .classes
+        .iter()
+        .find(|class| {
+            class.identity.lexical_qualname == "Repeated"
+                && class
+                    .instance_fields
+                    .iter()
+                    .any(|field| field.name == "second")
+        })
+        .unwrap();
+    assert_eq!(
+        second_repeated.participation,
+        ParticipationProposal::Candidate
+    );
+    assert_eq!(changed.module, initial.module);
+    assert_eq!(
+        changed.language_policy,
+        policies[ruff_db::system::SystemPath::new("/project/main.py")]
+    );
+    assert_eq!(export_from(&db), initial);
+}
+
+#[test]
+fn soac_export_class_opt_in_selects_fields_without_module_assignment_rules() {
+    let source = "LIMIT = 1\nclass Selected:\n    value: int\nclass Ordinary:\n    value: int\n";
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let initial = export_from(&db);
+    let policy = ResolvedStrictPolicy {
+        class_overrides: vec![ClassPolicyOverride {
+            class_range: class(&initial, "Selected").identity.source_range,
+            checked_attr: true,
+        }],
+        ..ResolvedStrictPolicy::default()
+    };
+    let policies = SoacSourcePolicies::from([("/project/main.py".into(), policy.clone())]);
+    let facts = export_with_policies(&db, &policies);
+    let selected = class(&facts, "Selected");
+    assert_eq!(facts.source_dialect, SourceDialect::SoacStrict);
+    assert_eq!(selected.participation, ParticipationProposal::Candidate);
+    assert_eq!(selected.required_field_bindings(&policy).len(), 1);
+    assert!(
+        matches!(&class(&facts, "Ordinary").participation, ParticipationProposal::Dynamic(reasons)
+        if reasons.contains(&DynamicClassReason::PolicyOptOut))
+    );
     assert!(
         facts
             .global_bindings
@@ -2684,11 +2825,40 @@ fn soac_export_requires_explicit_dialect_and_does_not_infer_strictness_from_text
 }
 
 #[test]
+fn soac_export_rejects_non_definition_and_duplicate_class_rule_ranges() {
+    let source = "class Selected:\n    value: int\n";
+    let db = database(source, AnalysisDialect::SoacStrictV1, false);
+    let file = system_path_to_file(&db, "/project/main.py").unwrap();
+    let initial = export_from(&db);
+    let exact = class(&initial, "Selected").identity.source_range;
+    for ranges in [
+        vec![SourceRange::new(exact.start, exact.end - 1)],
+        vec![exact, exact],
+    ] {
+        let policy = ResolvedStrictPolicy {
+            class_overrides: ranges
+                .into_iter()
+                .map(|class_range| ClassPolicyOverride {
+                    class_range,
+                    checked_attr: true,
+                })
+                .collect(),
+            ..ResolvedStrictPolicy::default()
+        };
+        let policies = SoacSourcePolicies::from([("/project/main.py".into(), policy)]);
+        assert!(matches!(
+            export_soac_module(&db, file, "main", &policies),
+            Err(ContractError::InvalidPolicy(_))
+        ));
+    }
+}
+
+#[test]
 fn soac_export_reports_actual_dependency_sources_not_import_alias_spelling() {
     let source = "from __future__ import strict\nfrom external import Foreign as Alias\ndef use(value: Alias) -> int:\n    return value.method()\n";
     let db = database(source, AnalysisDialect::SoacStrictV1, false);
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let exported = export_soac_module(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let exported = export_soac_module(&db, file, "main", &source_policies()).unwrap();
     let external = exported
         .dependencies
         .iter()
@@ -2752,7 +2922,7 @@ fn soac_export_tracks_imports_even_when_values_normalize_to_builtin_types() {
         false,
     );
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let exported = export_soac_module(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let exported = export_soac_module(&db, file, "main", &source_policies()).unwrap();
     for name in ["configuration_values", "nested_values"] {
         assert!(
             exported
@@ -2828,7 +2998,7 @@ fn soac_export_explicit_interpreter_paths_do_not_guess_from_an_uninstalled_prefi
     )
     .unwrap();
     let file = system_path_to_file(&db, "/project/main.py").unwrap();
-    let export = export_soac_module(&db, file, "main", ResolvedStrictPolicy::default()).unwrap();
+    let export = export_soac_module(&db, file, "main", &source_policies()).unwrap();
     assert!(export.dependencies.iter().any(|dependency| dependency.path
         == ty_python_semantic::SoacDependencyPath::System(
             "/selected/python3.15/site-packages/selected.py".into()
@@ -2842,7 +3012,10 @@ fn soac_export_explicit_interpreter_paths_do_not_guess_from_an_uninstalled_prefi
     );
 }
 
-fn inheritance_database(base: &str, unrelated_first: bool) -> (ProjectDatabase, TestSystem) {
+pub(super) fn inheritance_database(
+    base: &str,
+    unrelated_first: bool,
+) -> (ProjectDatabase, TestSystem) {
     let system = TestSystem::default();
     system.memory_file_system().write_files_all([
         ("/project/ty.toml", "[environment]\npython-version = '3.15'\n"),
@@ -3067,8 +3240,7 @@ fn soac_export_external_strict_bases_are_semantic_proposals_not_mutable_by_locat
         .find(|base| base.definition.module.module_name == "base")
         .unwrap();
     let base_file = system_path_to_file(&first, "/project/base.py").unwrap();
-    let base =
-        export_soac_module(&first, base_file, "base", ResolvedStrictPolicy::default()).unwrap();
+    let base = export_soac_module(&first, base_file, "base", &source_policies()).unwrap();
     assert_eq!(ancestor.definition, base.facts.classes[0].identity);
     assert_eq!(ancestor.source_digest, Fingerprint::digest(source));
     assert!(
@@ -3090,16 +3262,12 @@ fn soac_export_external_strict_bases_are_semantic_proposals_not_mutable_by_locat
 #[test]
 fn soac_export_external_strict_bases_propagate_real_dynamic_classification() {
     for source in [
-        "class Base: pass\n",
         "from __future__ import strict\nclass Meta(type): pass\nclass Base(metaclass=Meta): pass\n",
         "from __future__ import strict\ndef dynamic[T](value: T) -> T: return value\n@dynamic\nclass Base: pass\n",
         "from __future__ import strict\nclass Base:\n    value: int = 'bad'  # ty: ignore[invalid-assignment]\n",
         "from __future__ import strict\nfrom ordinary import Foreign\nclass Base(Foreign): pass\n",
         "from __future__ import strict\nclass Base:\n    def __getattr__(self, name: str) -> int: return 1\n",
         "from __future__ import strict\nclass Descriptor:\n    def __get__(self, instance, owner): return 1\nclass Base:\n    item = Descriptor()\n",
-        // The caller does not know a different file's adapter policy. The
-        // importer must not authorize that transform with its own policy.
-        "from __future__ import strict\nfrom dataclasses import dataclass\n@dataclass\nclass Base:\n    value: int = 1\n",
     ] {
         let (db, _) = inheritance_database(source, false);
         let facts = export_from(&db);
@@ -3116,6 +3284,52 @@ fn soac_export_external_strict_bases_propagate_real_dynamic_classification() {
             "{source}"
         );
     }
+}
+
+#[test]
+fn soac_export_external_dataclass_uses_declaring_source_rules_without_stale_policy_queries() {
+    let source = "from dataclasses import dataclass\n@dataclass\nclass Base:\n    value: int = 1\n";
+    let (db, _) = inheritance_database(source, false);
+    let initial = export_from(&db);
+    assert_eq!(
+        class(&initial, "Child").participation,
+        ParticipationProposal::Candidate
+    );
+    let file = system_path_to_file(&db, "/project/base.py").unwrap();
+    let base = export_soac_module_facts(&db, file, "base", &source_policies()).unwrap();
+    let base_class = class(&base, "Base");
+    assert_eq!(
+        base_class.transform.as_ref().unwrap().kind,
+        TransformKind::StdlibDataclass
+    );
+    let mut policies = source_policies();
+    policies
+        .get_mut(ruff_db::system::SystemPath::new("/project/base.py"))
+        .unwrap()
+        .class_overrides
+        .push(ClassPolicyOverride {
+            class_range: base_class.identity.source_range,
+            checked_attr: false,
+        });
+    let excluded = export_with_policies(&db, &policies);
+    assert!(
+        matches!(&class(&excluded, "Child").participation, ParticipationProposal::Dynamic(reasons)
+        if reasons.contains(&DynamicClassReason::MutableBase))
+    );
+    assert_eq!(excluded.module, initial.module);
+    assert_eq!(
+        excluded.consumed_dependencies,
+        initial.consumed_dependencies
+    );
+    assert_eq!(export_from(&db), initial);
+
+    policies.remove(ruff_db::system::SystemPath::new("/project/base.py"));
+    let ordinary_base = export_with_policies(&db, &policies);
+    assert!(
+        matches!(&class(&ordinary_base, "Child").participation, ParticipationProposal::Dynamic(reasons)
+        if reasons.contains(&DynamicClassReason::MutableBase))
+    );
+    assert_eq!(export_from(&db), initial);
 }
 
 #[test]
@@ -3138,7 +3352,7 @@ fn soac_export_external_base_source_changes_invalidate_transitive_queries() {
         ParticipationProposal::Candidate
     );
     for changed in [
-        "class Base: pass\n",
+        "class Meta(type): pass\nclass Base(metaclass=Meta): pass\n",
         "from __future__ import strict\ndef dynamic[T](value: T) -> T: return value\n@dynamic\nclass Base: pass\n",
     ] {
         system
@@ -3186,7 +3400,7 @@ def accept(value: Literal['\ud800']) -> Literal['\ud800']: return value"#,
         let source = format!("from __future__ import strict\n{body}\n");
         let db = database(&source, AnalysisDialect::SoacStrictV1, false);
         let file = system_path_to_file(&db, "/project/main.py").unwrap();
-        let error = export_soac_module(&db, file, "main", ResolvedStrictPolicy::default())
+        let error = export_soac_module(&db, file, "main", &source_policies())
             .expect_err("unsupported source must not produce a proposal");
         assert!(matches!(&error, ContractError::InvalidSourceIdentity(_)));
         assert!(

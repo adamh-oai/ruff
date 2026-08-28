@@ -11,7 +11,7 @@ use ruff_db::diagnostic::{Diagnostic, UnifiedFile};
 use super::*;
 use crate::types::diagnostic::UNRESOLVED_ATTRIBUTE;
 
-impl<'db> Exporter<'db> {
+impl<'db> Exporter<'db, '_> {
     pub(super) fn framework_attribute_fallback(
         &mut self,
         diagnostic: &Diagnostic,
