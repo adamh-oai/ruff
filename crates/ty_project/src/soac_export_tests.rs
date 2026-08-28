@@ -1230,7 +1230,7 @@ class Recording: pass
 def factory(): return Recording
 def unsupported(value: "list[Recording]"): pass
 def dynamic(value: "factory()"): pass
-def escaped(value: "Recor\x64ing"): pass
+def escaped(value: "Recor\x64ing"): pass  # spellchecker:disable-line
 def raw(value: r"Recording"): pass
 def concatenated(value: "Record" "ing"): pass
 "#;
@@ -2511,6 +2511,159 @@ fn soac_export_uses_checker_dataclass_fields_options_and_synthesized_signature()
             .iter()
             .any(|parameter| parameter.name == "shared")
     );
+}
+
+#[test]
+fn soac_dataclass_any_defaults_use_actual_namespace_bindings() {
+    let facts = export(
+        r#"# soac: module(strict_assign=true, checked_attr=true)
+from dataclasses import dataclass
+from typing import Any, ClassVar
+
+class Descriptor:
+    def __get__(self, instance: object | None, owner: type) -> int:
+        return 1
+    def __set__(self, instance: object, value: Any) -> None:
+        pass
+
+def choose() -> bool:
+    return True
+
+def unknown_value() -> Any:
+    return None
+
+@dataclass(slots=True)
+class NoDefault:
+    payload: Any
+    shared: ClassVar[int]
+
+@dataclass(slots=True)
+class NoneDefault:
+    payload: Any = None
+
+@dataclass(slots=True)
+class IntDefault:
+    payload: Any = 7
+
+@dataclass(slots=True)
+class DescriptorDefault:
+    payload: Any = Descriptor()
+
+@dataclass(slots=True)
+class UnknownDefault:
+    payload: Any = unknown_value()
+
+@dataclass(slots=True)
+class ConditionalDefault:
+    if choose():
+        payload: Any = None
+
+@dataclass(slots=True)
+class AmbiguousDefault:
+    payload: Any = None
+    if choose():
+        payload = 7
+
+@dataclass(slots=True)
+class ConditionalExpressionDefault:
+    payload: Any = None if choose() else Descriptor()
+"#,
+    );
+    assert!(
+        facts.diagnostics.iter().all(
+            |diagnostic| diagnostic.severity != DiagnosticSeverity::Error || diagnostic.suppressed
+        )
+    );
+    let no_default = class(&facts, "NoDefault");
+    assert_eq!(no_default.participation, ParticipationProposal::Candidate);
+    assert_eq!(
+        no_default.dictionary,
+        ClassDictionarySemantics::ExplicitSlots
+    );
+    let payload = field(&facts, "NoDefault", "payload");
+    assert_eq!(payload.annotation_origin, AnnotationOrigin::Explicit);
+    assert_eq!(payload.value_type, StaticType::Any);
+    assert_eq!(payload.default, DefaultFact::Missing);
+    assert!(payload.annotation_definition.is_some());
+    assert!(
+        no_default
+            .required_field_bindings(&facts.language_policy)
+            .is_empty()
+    );
+    let shared = field(&facts, "NoDefault", "shared");
+    assert_eq!(shared.field_kind, FieldKind::ClassVariable);
+    assert_eq!(shared.write_policy, FieldWritePolicy::ClassVariableRejected);
+    assert_eq!(shared.default, DefaultFact::Missing);
+    assert!(shared.annotation_definition.is_some());
+    assert!(
+        no_default
+            .class_members
+            .iter()
+            .all(|member| member.name != "payload" && member.name != "shared"),
+        "annotation-only names are fields, not fabricated namespace values"
+    );
+    for (name, expected_value) in [
+        ("NoneDefault", StaticType::None),
+        (
+            "IntDefault",
+            StaticType::Literal(LiteralValue::Int("7".into())),
+        ),
+    ] {
+        let proposal = class(&facts, name);
+        assert_eq!(
+            proposal.participation,
+            ParticipationProposal::Candidate,
+            "{name}"
+        );
+        assert_eq!(proposal.dictionary, ClassDictionarySemantics::ExplicitSlots);
+        let declaration = field(&facts, name, "payload");
+        assert_eq!(declaration.annotation_origin, AnnotationOrigin::Explicit);
+        assert_eq!(declaration.value_type, StaticType::Any);
+        assert!(
+            proposal
+                .required_field_bindings(&facts.language_policy)
+                .is_empty()
+        );
+        let member = proposal
+            .class_members
+            .iter()
+            .find(|member| member.name == "payload")
+            .unwrap();
+        assert_eq!(member.kind, ClassMemberKind::ShadowableDefault);
+        assert_eq!(member.descriptor.kind, DescriptorKind::None);
+        assert_eq!(member.value_type, expected_value);
+        assert_eq!(member.definition, declaration.annotation_definition);
+    }
+    for name in [
+        "DescriptorDefault",
+        "UnknownDefault",
+        "ConditionalDefault",
+        "AmbiguousDefault",
+        "ConditionalExpressionDefault",
+    ] {
+        let proposal = class(&facts, name);
+        assert!(
+            matches!(&proposal.participation, ParticipationProposal::Dynamic(reasons)
+                if reasons.contains(&DynamicClassReason::UnsupportedDescriptor)),
+            "{name}"
+        );
+        assert_eq!(field(&facts, name, "payload").value_type, StaticType::Any);
+        let member = proposal
+            .class_members
+            .iter()
+            .find(|member| member.name == "payload")
+            .unwrap();
+        assert_eq!(member.kind, ClassMemberKind::Descriptor);
+        assert_eq!(
+            member.descriptor.kind,
+            if name == "DescriptorDefault" {
+                DescriptorKind::Data
+            } else {
+                DescriptorKind::Unknown
+            },
+            "{name}"
+        );
+    }
 }
 
 #[test]

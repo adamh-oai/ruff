@@ -1538,6 +1538,46 @@ impl<'db> Exporter<'db, '_> {
         }
     }
 
+    /// A field declaration describes values written later, not the object
+    /// currently installed in the class namespace. In particular ty may widen
+    /// even an annotated assignment's binding type to Any. Recover the RHS
+    /// only for one definitely-bound assignment with a concrete value kind;
+    /// unknown, conditional and ambiguous bindings keep their existing facts.
+    fn class_namespace_assignment(
+        &self,
+        scope: ScopeId<'db>,
+        name: &str,
+    ) -> Option<(Type<'db>, Definition<'db>)> {
+        let places = place_table(self.db, scope);
+        let symbol = places.symbol_id(name)?;
+        let use_def = use_def_map(self.db, scope);
+        let bindings = use_def.end_of_scope_symbol_bindings(symbol);
+        let environment = ProgramEnvironment::from_scope(scope);
+        if !place_from_bindings(self.db, &environment, bindings.clone())
+            .place
+            .is_definitely_bound()
+        {
+            return None;
+        }
+        let mut definitions = bindings.filter_map(|binding| binding.binding.definition());
+        let definition = definitions.next()?;
+        if definitions.next().is_some() {
+            return None;
+        }
+        let DefinitionKind::AnnotatedAssignment(assignment) = definition.kind(self.db) else {
+            return None;
+        };
+        let parsed = parsed_module(self.db, definition.python_file(self.db)).load(self.db);
+        let value = assignment.value(&parsed)?;
+        let model = SemanticModel::new(self.db, definition.program_file(self.db));
+        let ty = value.inferred_type(&model)?;
+        matches!(
+            ty,
+            Type::NominalInstance(_) | Type::LiteralValue(_) | Type::KnownInstance(_)
+        )
+        .then_some((ty, definition))
+    }
+
     fn class(&mut self, node: &ast::StmtClassDef) -> Option<facts::SourceIdentity> {
         let db = self.db;
         let definition = node.definition(&self.model);
@@ -1906,6 +1946,7 @@ impl<'db> Exporter<'db, '_> {
         let mut class_members = BTreeMap::new();
         let class_places = place_table(db, class.body_scope(db));
         let class_bindings = use_def_map(db, class.body_scope(db));
+        let class_environment = ProgramEnvironment::from_scope(class.body_scope(db));
         for member in all_end_of_scope_members(db, class.body_scope(db)) {
             if class_places
                 .symbol_id(member.member.name.as_str())
@@ -1936,7 +1977,23 @@ impl<'db> Exporter<'db, '_> {
                 continue;
             }
             let name = member.member.name.to_string();
-            let ty = member.member.ty;
+            if class_places.symbol_id(&name).is_some_and(|symbol| {
+                place_from_bindings(
+                    db,
+                    &class_environment,
+                    class_bindings.end_of_scope_symbol_bindings(symbol),
+                )
+                .place
+                .is_undefined()
+            }) {
+                // An annotation alone installs no namespace value. Its field
+                // fact still records storage, ClassVar protection and origin.
+                // Possibly bound names retain their conservative metadata.
+                continue;
+            }
+            let (ty, binding_definition) = self
+                .class_namespace_assignment(class.body_scope(db), &name)
+                .unwrap_or((member.member.ty, member.first_reachable_definition));
             let function = ty.as_function_literal().or_else(|| {
                 if let Type::PropertyInstance(property) = ty {
                     property.getter(db).and_then(Type::as_function_literal)
@@ -2001,7 +2058,7 @@ impl<'db> Exporter<'db, '_> {
                         },
                         uncertainty: uncertainty(&value_type),
                         value_type,
-                        definition: self.definition(member.first_reachable_definition),
+                        definition: self.definition(binding_definition),
                         descriptor,
                     });
             }
