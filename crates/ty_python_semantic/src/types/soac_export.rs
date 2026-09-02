@@ -146,9 +146,10 @@ impl<'policy> ExportContext<'policy> {
         let file = class.program_file(db);
         let proposal = self.local_proposal(db, file)?;
         if proposal.source_dialect != facts::SourceDialect::SoacStrict
-            || proposal.diagnostics.iter().any(|diagnostic| {
-                !diagnostic.suppressed && diagnostic.severity == facts::DiagnosticSeverity::Error
-            })
+            || proposal
+                .diagnostics
+                .iter()
+                .any(facts::StrictDiagnostic::blocks_admission)
         {
             return None;
         }
