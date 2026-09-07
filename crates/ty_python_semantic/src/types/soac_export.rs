@@ -1135,7 +1135,7 @@ impl<'db> Exporter<'db, '_> {
         let definition = node.definition(&self.model);
         let identity = self.definition(definition)?;
         let function = infer_definition_types(self.db, definition).function_type(definition);
-        let mut signature = function
+        let signature = function
             .map(|function| self.signature(&function.last_definition_signature(self.db), 0))
             .unwrap_or_else(unknown_signature);
         let decorators = self.decorators(&node.decorator_list);
@@ -1158,13 +1158,27 @@ impl<'db> Exporter<'db, '_> {
             (false, true) => facts::FunctionKind::Generator,
             (true, true) => facts::FunctionKind::AsyncGenerator,
         };
-        if function_kind != facts::FunctionKind::Synchronous {
-            // The schema does not turn an annotated generator element or async
-            // body result into a synchronous checked return contract.
-            signature
-                .uncertainty
-                .insert(facts::UncertaintyReason::UnsupportedType);
+        // The public signature returns a coroutine/generator object. Native
+        // completion obligations describe the body result, using the checker's
+        // semantic projection rather than interpreting generic spellings.
+        let raw_return = function.map(|function| {
+            function
+                .last_definition_raw_signature(
+                    self.db,
+                    super::signatures::ReturnCallableTypeVarScope::Public,
+                )
+                .return_ty
+        });
+        let completion_type = match function_kind {
+            facts::FunctionKind::Synchronous => Some(signature.return_type.clone()),
+            facts::FunctionKind::Coroutine => raw_return.map(|ty| self.value_type(ty)),
+            facts::FunctionKind::Generator => raw_return
+                .filter(|ty| self.has_generator_completion(*ty))
+                .and_then(|ty| ty.generator_return_type(self.db, &self.env))
+                .map(|ty| self.value_type(ty)),
+            facts::FunctionKind::AsyncGenerator => None,
         }
+        .unwrap_or(facts::StaticType::Unknown);
         let mut nominal_bindings = Vec::new();
         for (index, parameter) in node.parameters.iter().enumerate() {
             if let Some(annotation) = parameter.annotation()
@@ -1188,14 +1202,15 @@ impl<'db> Exporter<'db, '_> {
         if let Some(annotation) = node.returns.as_deref()
             && signature.return_annotation_origin == facts::AnnotationOrigin::Explicit
         {
-            self.nominal_annotation_leaves(
+            self.completion_nominal_annotation_leaves(
                 &self.model,
                 &facts::NominalBindingOwner::Function {
                     function: identity.clone(),
                     annotation: facts::AnnotationTarget::Return,
                 },
                 annotation,
-                &signature.return_type,
+                &completion_type,
+                function_kind == facts::FunctionKind::Generator,
                 &mut nominal_bindings,
             );
         }
@@ -1204,10 +1219,79 @@ impl<'db> Exporter<'db, '_> {
             identity: identity.clone(),
             function_kind,
             signature,
+            completion_type,
             decorators,
             uncertainty: function_uncertainty,
         });
         Some(identity)
+    }
+
+    fn has_generator_completion(&self, ty: Type<'db>) -> bool {
+        match ty {
+            Type::TypeAlias(alias) => self.has_generator_completion(alias.value_type(self.db)),
+            Type::Union(union) => union
+                .elements(self.db)
+                .iter()
+                .all(|ty| self.has_generator_completion(*ty)),
+            Type::NominalInstance(instance) => instance
+                .class(self.db, &self.env)
+                .iter_mro(self.db)
+                .any(|base| {
+                    base.into_class()
+                        .is_some_and(|class| class.is_known(self.db, KnownClass::Generator))
+                }),
+            Type::ProtocolInstance(protocol) => {
+                protocol.class_origin(self.db).is_some_and(|class| {
+                    class.iter_mro(self.db).any(|base| {
+                        base.into_class()
+                            .is_some_and(|class| class.is_known(self.db, KnownClass::Generator))
+                    })
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn completion_nominal_annotation_leaves(
+        &self,
+        model: &SemanticModel<'db>,
+        owner: &facts::NominalBindingOwner,
+        expression: &ast::Expr,
+        contract: &facts::StaticType,
+        generator: bool,
+        output: &mut Vec<facts::NominalBindingFact>,
+    ) {
+        if !generator {
+            self.nominal_annotation_leaves(model, owner, expression, contract, output);
+            return;
+        }
+        match expression {
+            ast::Expr::StringLiteral(string) => {
+                if let Some((parsed, model)) = model.enter_string_annotation(string) {
+                    self.completion_nominal_annotation_leaves(
+                        &model,
+                        owner,
+                        parsed.expr(),
+                        contract,
+                        true,
+                        output,
+                    );
+                }
+            }
+            ast::Expr::Subscript(subscript)
+                if matches!(subscript.value.inferred_type(model),
+                    Some(Type::ClassLiteral(class)) if class.known(self.db) == Some(KnownClass::Generator)) =>
+            {
+                if let ast::Expr::Tuple(tuple) = subscript.slice.as_ref()
+                    && tuple.elts.len() == 3
+                {
+                    self.nominal_annotation_leaves(model, owner, &tuple.elts[2], contract, output);
+                }
+            }
+            // More complex aliases need an explicit runtime operand plan.
+            // Missing required nominal leaves remain fail-closed at binding.
+            _ => {}
+        }
     }
 
     /// The signature and each leaf's type come from real checker inference;
@@ -2629,6 +2713,7 @@ impl<'ast> Visitor<'ast> for Exporter<'_, '_> {
                         facts::FunctionKind::Synchronous
                     },
                     uncertainty: signature.uncertainty.clone(),
+                    completion_type: signature.return_type.clone(),
                     signature,
                     decorators: Vec::new(),
                 });

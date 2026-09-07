@@ -134,6 +134,57 @@ fn function<'a>(facts: &'a ModuleTypeFacts, name: &str) -> &'a FunctionTypeFact 
         .unwrap()
 }
 
+#[test]
+fn soac_function_completion_types_preserve_async_and_generator_contracts() {
+    let facts = export(
+        r#"
+from typing import Any, AsyncGenerator, Generator, Iterator
+class Target: pass
+def plain() -> int: return 1
+async def coroutine() -> Target: return Target()
+def generator() -> Generator[str, None, int]:
+    yield "ready"
+    return 1
+def nominal_generator() -> Generator[str, None, Target]:
+    yield "ready"
+    return Target()
+def dynamic_generator() -> Generator[str, None, Any]:
+    yield "ready"
+def iterator() -> Iterator[str]:
+    yield "ready"
+async def async_generator() -> AsyncGenerator[str, None]:
+    yield "ready"
+"#,
+    );
+    let integer = StaticType::NominalBuiltin {
+        builtin: BuiltinType::Int,
+        allow_subclasses: true,
+    };
+    assert_eq!(function(&facts, "plain").completion_type, integer);
+    assert_eq!(function(&facts, "generator").completion_type, integer);
+    for name in ["coroutine", "nominal_generator"] {
+        let item = function(&facts, name);
+        assert!(matches!(item.completion_type, StaticType::NominalClass(_)));
+        assert_ne!(item.signature.return_type, item.completion_type);
+        let leaves: Vec<_> = facts
+            .nominal_bindings
+            .iter()
+            .filter(|binding| {
+                binding.owner.as_function() == Some((&item.identity, AnnotationTarget::Return))
+            })
+            .collect();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].name, "Target");
+    }
+    assert_eq!(
+        function(&facts, "dynamic_generator").completion_type,
+        StaticType::Any
+    );
+    for name in ["iterator", "async_generator"] {
+        assert_eq!(function(&facts, name).completion_type, StaticType::Unknown);
+    }
+}
+
 fn function_owns_binding(binding: &NominalBindingFact, function: &FunctionTypeFact) -> bool {
     binding
         .owner
@@ -3909,7 +3960,7 @@ def install():
 }
 
 #[test]
-fn soac_export_sys_modules_reads_stay_nullable_in_semantics_and_sites() {
+fn soac_export_sys_modules_reads_stay_nullable_and_errors_discard_optional_sites() {
     use ruff_python_ast::Stmt;
     use ty_python_semantic::types::Type;
     use ty_python_semantic::{HasType, SemanticModel};
@@ -3978,11 +4029,10 @@ def invoke(name):
         .iter()
         .find(|site| &site.identity.enclosing_function == reader && site.name == "__name__")
         .unwrap();
-    let StaticType::Union(alternatives) = &site.receiver_type else {
-        panic!("export must retain the actual nullable receiver");
-    };
-    assert!(alternatives.contains(&StaticType::None));
-    assert!(site.uncertainty.contains(&UncertaintyReason::OpenWorld));
+    // The semantic nullable union above remains intact. An ordinary error
+    // discards optional site predictions while preserving the diagnostic.
+    assert_eq!(site.receiver_type, StaticType::Unknown);
+    assert!(site.uncertainty.contains(&UncertaintyReason::Unknown));
     assert!(
         facts
             .diagnostics
@@ -3991,7 +4041,7 @@ def invoke(name):
                 && diagnostic.severity == DiagnosticSeverity::Error
                 && diagnostic.source_range == site.identity.expression_range
                 && !diagnostic.suppressed),
-        "the nullable module-attribute error must remain blocking"
+        "the nullable module-attribute error must remain visible"
     );
 
     let invoker = &function(&facts, "invoke").identity;
@@ -4008,10 +4058,7 @@ def invoke(name):
         vec![CallableTargetFact::Dynamic]
     );
     let actual_source = ruff_db::source::source_text(&db, file);
-    assert!(matches!(
-        validate_module_facts(&facts, Some(actual_source.as_bytes())),
-        Err(ContractError::BlockingDiagnostic(_))
-    ));
+    validate_module_facts(&facts, Some(actual_source.as_bytes())).unwrap();
 }
 
 #[test]
@@ -4059,10 +4106,7 @@ def invalid():
                 3
             );
             let actual_source = ruff_db::source::source_text(&db, file);
-            assert!(matches!(
-                validate_module_facts(&facts, Some(actual_source.as_bytes())),
-                Err(ContractError::BlockingDiagnostic(_))
-            ));
+            validate_module_facts(&facts, Some(actual_source.as_bytes())).unwrap();
         }
     }
 }
@@ -4113,10 +4157,7 @@ def invalid(sys: Namespace, registry: dict[str, ModuleType]):
                 2
             );
             let actual_source = ruff_db::source::source_text(&db, file);
-            assert!(matches!(
-                validate_module_facts(&facts, Some(actual_source.as_bytes())),
-                Err(ContractError::BlockingDiagnostic(_))
-            ));
+            validate_module_facts(&facts, Some(actual_source.as_bytes())).unwrap();
         }
     }
 }
